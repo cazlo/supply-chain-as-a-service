@@ -1,0 +1,30 @@
+# K8s-native smoke (pypi/npm/cargo) on a build-worker runner.
+#
+# Trusted lane, manual dispatch only: it drives the cluster via the runner's
+# `act-runner-smoke` ServiceAccount (in-cluster kubeconfig) to helm-install the
+# vendored chart into the fixed `ak-smoke` namespace, run the native client Jobs
+# over cluster HTTP, then uninstall the release. It is NOT wired to pull_request
+# because it has cluster write access; keep it off untrusted branches.
+#
+# The backend image is the current vendored revision, already published to the
+# public Harbor `library` project, so the cluster pulls it without a secret. A
+# later push-stage lane can build a fresh per-PR image into artifact-keeper-ci and
+# point BACKEND_IMAGE_* at it instead.
+
+name: smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  source-smoke:
+    runs-on: artifact-keeper-builder
+    steps:
+      - name: Check out the vendored sources
+        uses: actions/checkout@v4
+
+      - name: k8s-native smoke (pypi/npm/cargo)
+        run: make source-smoke
+        env:
+          BACKEND_IMAGE_REPO: oci.cazlab.link/library/artifact-keeper-ci-backend
+          BACKEND_IMAGE_TAG: ea6f5ed

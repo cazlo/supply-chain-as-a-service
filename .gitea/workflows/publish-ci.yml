@@ -1,0 +1,42 @@
+# Trusted, manual build/publish lane. Repository Actions secrets are exposed to
+# this job, so it must never run for pull_request or an unreviewed branch.
+
+name: publish-ci
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-publish-smoke:
+    runs-on: artifact-keeper-builder
+    steps:
+      - name: Check out the vendored sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Build and publish backend + web
+        run: make ci-publish
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Retain the build record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-record-${{ gitea.sha }}
+          path: .artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Smoke the freshly published backend
+        run: |
+          set -a
+          . .artifacts/images.env
+          set +a
+          export BACKEND_IMAGE_REPO="${BACKEND_IMAGE}"
+          export BACKEND_IMAGE_TAG="${BACKEND_TAG}@${BACKEND_DIGEST}"
+          make source-smoke
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}

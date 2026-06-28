@@ -35,3 +35,11 @@ lint/render the vendored chart without modifying the imported trees. Run
 `make source-smoke` for the k8s-native smoke gate (ephemeral chart install plus
 the vendored pypi, npm, and cargo client Jobs; needs kubectl + helm + a cluster),
 or `make source-smoke-compose` for the cluster-free Docker Compose equivalent.
+
+`make ci-publish` is the trusted manual publish lane. It builds the backend and
+web runtime images, imports and exports the retained Harbor BuildKit cache,
+attaches BuildKit SBOM and mode-max provenance attestations, pushes a
+source-derived immutable tag, and writes image digests plus build inputs to
+`.artifacts/build-record.json`. It requires `HARBOR_REGISTRY`,
+`HARBOR_USERNAME`, and `HARBOR_PASSWORD`; keep those values in repository
+Actions secrets rather than source control.

@@ -1,4 +1,7 @@
-.PHONY: source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose vendor-check vendor-status vendor-update
+.PHONY: ci-publish source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose vendor-check vendor-status vendor-update
+
+ci-publish:
+	ci/build-images.sh
 
 source-check:
 	ci/check-clean-snapshots.sh all

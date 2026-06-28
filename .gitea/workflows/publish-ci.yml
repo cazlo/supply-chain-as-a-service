@@ -1,8 +1,15 @@
-# Primary build/publish lane. Runs on every PR (and on manual dispatch) so all
-# proposed changes get a full build, chart-lint, push-to-Harbor, and k8s smoke
-# before merging. Backend and web are independent jobs so the two
-# repository-scoped runners build in parallel; only the backend job continues
-# into the registry smoke.
+# Primary build/publish lane. Runs on every PR (and on manual dispatch).
+#
+# Two modes, decided by the `gate` job:
+#   * publish  (humans / workflow_dispatch): build -> push -> Trivy scan ->
+#     cosign sign -> verify-before-smoke -> k8s smoke. Harbor + cosign secrets
+#     are referenced only by these steps.
+#   * validate (bot-authored PRs, e.g. the upstream-sync bot): secretless build
+#     and chart-lint only. Untrusted/auto-generated source never receives Harbor
+#     push/signing secrets and is never deployed without human review.
+#
+# Backend and web are independent jobs so the two repository-scoped runners build
+# in parallel; only the backend job continues into the registry smoke.
 
 name: publish-ci
 
@@ -18,13 +25,43 @@ on:
       - ".gitea/workflows/publish-ci.yml"
 
 jobs:
+  gate:
+    runs-on: artifact-keeper-builder
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - name: Decide publish vs validate-only
+        id: decide
+        env:
+          EVENT: ${{ gitea.event_name }}
+          PR_AUTHOR: ${{ gitea.event.pull_request.user.login }}
+          # The machine identity whose PRs must not auto-publish or deploy.
+          BOT_LOGIN: supply-chain-sync
+        run: |
+          if [[ "${EVENT}" == "pull_request" && "${PR_AUTHOR}" == "${BOT_LOGIN}" ]]; then
+            echo "publish=false" >>"${GITEA_OUTPUT}"
+            echo "::notice::bot-authored PR by ${PR_AUTHOR}: validate-only, no publish or deploy"
+          else
+            echo "publish=true" >>"${GITEA_OUTPUT}"
+          fi
+
   backend-build-smoke:
+    needs: gate
     runs-on: artifact-keeper-builder
     steps:
       - name: Check out the vendored sources
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # ---- validate-only path (bot PRs): no secrets, no push ----
+      - name: Validate backend and chart (no publish)
+        if: needs.gate.outputs.publish != 'true'
+        run: |
+          make source-check-backend
+          make source-check-chart
+
+      # ---- publish path (humans / manual dispatch) ----
       - name: Build and publish backend
+        if: needs.gate.outputs.publish == 'true'
         run: ci/build-images.sh backend
         env:
           BUILD_OUTPUT_DIR: /tmp/artifact-keeper-backend-record
@@ -32,9 +69,33 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
 
-      # Host-mode actions execute from the action cache, not necessarily the
-      # checkout directory. Use an absolute path so upload-artifact sees it.
+      # The runners are daemonless (no `docker run`); cosign/trivy are native
+      # binaries. Install them here until they are baked into the runner image
+      # (apps/gitea-runners/runner-image), at which point this is a no-op.
+      - name: Set up cosign and trivy
+        if: needs.gate.outputs.publish == 'true'
+        run: ci/setup-image-tools.sh
+
+      - name: Scan the backend image (Trivy)
+        if: needs.gate.outputs.publish == 'true'
+        run: ci/scan-image.sh /tmp/artifact-keeper-backend-record/backend-record.json
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Sign the backend image (cosign)
+        if: needs.gate.outputs.publish == 'true'
+        run: ci/sign-image.sh /tmp/artifact-keeper-backend-record/backend-record.json
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+
       - name: Retain the backend build record
+        if: needs.gate.outputs.publish == 'true'
         # Gitea 1.26 implements the v3 artifact protocol; v4 detects the
         # self-hosted endpoint as GHES and refuses to upload.
         uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
@@ -44,14 +105,14 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Lint and dry-run the vendored Helm chart
-        run: make source-check-chart
-
-      - name: Smoke the freshly published backend by digest
+      - name: Verify signature, then smoke the backend by digest
+        if: needs.gate.outputs.publish == 'true'
         run: |
           set -a
           . /tmp/artifact-keeper-backend-record/images.env
           set +a
+          # Verify-before-deploy: refuse to smoke an image the lab did not sign.
+          ci/verify-image.sh "${BACKEND_IMAGE}@${BACKEND_DIGEST}"
           export BACKEND_IMAGE_REPO="${BACKEND_IMAGE}"
           export BACKEND_IMAGE_TAG="${BACKEND_TAG}@${BACKEND_DIGEST}"
           make source-smoke
@@ -61,12 +122,20 @@ jobs:
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
 
   web-build:
+    needs: gate
     runs-on: artifact-keeper-builder
     steps:
       - name: Check out the vendored sources
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # ---- validate-only path (bot PRs): no secrets, no push ----
+      - name: Validate web (no publish)
+        if: needs.gate.outputs.publish != 'true'
+        run: make source-check-web
+
+      # ---- publish path (humans / manual dispatch) ----
       - name: Build and publish web
+        if: needs.gate.outputs.publish == 'true'
         run: ci/build-images.sh web
         env:
           BUILD_OUTPUT_DIR: /tmp/artifact-keeper-web-record
@@ -74,7 +143,30 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
 
+      - name: Set up cosign and trivy
+        if: needs.gate.outputs.publish == 'true'
+        run: ci/setup-image-tools.sh
+
+      - name: Scan the web image (Trivy)
+        if: needs.gate.outputs.publish == 'true'
+        run: ci/scan-image.sh /tmp/artifact-keeper-web-record/web-record.json
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Sign the web image (cosign)
+        if: needs.gate.outputs.publish == 'true'
+        run: ci/sign-image.sh /tmp/artifact-keeper-web-record/web-record.json
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+
       - name: Retain the web build record
+        if: needs.gate.outputs.publish == 'true'
         uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
         with:
           name: web-build-record-${{ gitea.sha }}

@@ -36,10 +36,11 @@ lint/render the vendored chart without modifying the imported trees. Run
 the vendored pypi, npm, and cargo client Jobs; needs kubectl + helm + a cluster),
 or `make source-smoke-compose` for the cluster-free Docker Compose equivalent.
 
-`make ci-publish` is the trusted manual publish lane. It builds the backend and
-web runtime images, imports and exports the retained Harbor BuildKit cache,
-attaches BuildKit SBOM and mode-max provenance attestations, pushes a
-source-derived immutable tag, and writes image digests plus build inputs to
-`.artifacts/build-record.json`. It requires `HARBOR_REGISTRY`,
+`make ci-publish` is the local equivalent of the trusted manual publish lane.
+The Gitea workflow runs backend and web as independent parallel jobs so the two
+builders can share the work. Each imports and exports its retained Harbor
+BuildKit cache, attaches BuildKit SBOM and mode-max provenance attestations,
+pushes a source-derived tag, and writes the immutable image digest plus build
+inputs to its retained build record. The command requires `HARBOR_REGISTRY`,
 `HARBOR_USERNAME`, and `HARBOR_PASSWORD`; keep those values in repository
 Actions secrets rather than source control.

@@ -1,4 +1,4 @@
-.PHONY: ci-publish source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose vendor-check vendor-status vendor-update
+.PHONY: ci-publish source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose vendor-check vendor-status vendor-update vendor-sync
 
 ci-publish:
 	ci/build-images.sh
@@ -33,3 +33,8 @@ vendor-update:
 	@test -n "$(NAME)" || (echo "NAME is required" >&2; exit 2)
 	@test -n "$(REF)" || (echo "REF is required" >&2; exit 2)
 	ci/subtree-sync.sh update "$(NAME)" "$(REF)" "$(or $(TAG),-)"
+
+# Local dry-run of the scheduled sync: import fast-forward upstreams without
+# pushing or opening a PR. Needs GITEA_SERVER/GITEA_TOKEN in the environment.
+vendor-sync:
+	DRY_RUN=1 ci/upstream-sync.sh

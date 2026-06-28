@@ -1,0 +1,56 @@
+# Scheduled vendored-upstream sync. Runs as the supply-chain-sync bot: imports
+# fast-forward upstream commits and opens/updates a single pull request. The PR
+# is validate-only in publish-ci (no push/sign/scan/deploy) because its author is
+# the bot; a human reviews, merges, and publishes through a separate approval.
+#
+# Secrets (repository Actions secrets, provisioned out of band):
+#   SYNC_BOT_TOKEN        bot PAT with write:repository (push + open PR)
+#   SYNC_BOT_SIGNING_KEY  bot SSH private key; signs the subtree/provenance commits
+# Variables:
+#   none required; the bot login is asserted by publish-ci's guard separately.
+
+name: upstream-sync
+
+on:
+  schedule:
+    # 07:00 UTC daily. Daily cadence is ample for a seven-day age policy.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Import locally but do not push or open a PR"
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    runs-on: artifact-keeper-builder
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # subtree merges need full upstream ancestry, not a shallow clone.
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_BOT_TOKEN }}
+
+      - name: Configure the bot identity and commit signing
+        env:
+          SIGNING_KEY: ${{ secrets.SYNC_BOT_SIGNING_KEY }}
+        run: |
+          install -d -m 700 "${HOME}/.ssh"
+          printf '%s\n' "${SIGNING_KEY}" >"${HOME}/.ssh/sync-signing"
+          chmod 600 "${HOME}/.ssh/sync-signing"
+          ssh-keygen -y -f "${HOME}/.ssh/sync-signing" >"${HOME}/.ssh/sync-signing.pub"
+          git config user.name "supply-chain-sync"
+          git config user.email "supply-chain-sync@cazlab.link"
+          git config gpg.format ssh
+          git config user.signingkey "${HOME}/.ssh/sync-signing.pub"
+          git config commit.gpgsign true
+
+      - name: Sync vendored upstreams and open/update the PR
+        env:
+          GITEA_SERVER: http://gitea-http.gitea.svc.cluster.local:3000
+          GITEA_TOKEN: ${{ secrets.SYNC_BOT_TOKEN }}
+          GITEA_REPO: drew/supply-chain-as-a-service
+          DRY_RUN: ${{ gitea.event.inputs.dry_run }}
+        run: ci/upstream-sync.sh

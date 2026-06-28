@@ -1,12 +1,21 @@
-# Trusted, manual build/publish lane. Repository Actions secrets are exposed to
-# these jobs, so it must never run for pull_request or an unreviewed branch.
-# Backend and web are independent jobs so the two repository-scoped runners can
-# build in parallel; only the backend job continues into the registry smoke.
+# Primary build/publish lane. Runs on every PR (and on manual dispatch) so all
+# proposed changes get a full build, chart-lint, push-to-Harbor, and k8s smoke
+# before merging. Backend and web are independent jobs so the two
+# repository-scoped runners build in parallel; only the backend job continues
+# into the registry smoke.
 
 name: publish-ci
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "artifact-keeper/**"
+      - "artifact-keeper-web/**"
+      - "artifact-keeper-iac/**"
+      - "ci/**"
+      - "Makefile"
+      - ".gitea/workflows/publish-ci.yml"
 
 jobs:
   backend-build-smoke:
@@ -34,6 +43,9 @@ jobs:
           path: /tmp/artifact-keeper-backend-record/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Lint and dry-run the vendored Helm chart
+        run: make source-check-chart
 
       - name: Smoke the freshly published backend by digest
         run: |

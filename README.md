@@ -30,15 +30,17 @@ and non-squashed subtree synchronization commands.
 
 Common vendoring commands are `make vendor-check`, `make vendor-status`, and
 `make vendor-update NAME=<name> REF=<reviewed-ref> TAG=<tag-or-dash>`.
-Run `make source-check` to rebuild the pinned backend and web builder stages and
-lint/render the vendored chart without modifying the imported trees. Run
-`make source-smoke` for the k8s-native smoke gate (ephemeral chart install plus
-the vendored pypi, npm, and cargo client Jobs; needs kubectl + helm + a cluster),
-or `make source-smoke-compose` for the cluster-free Docker Compose equivalent.
+Run `make source-check-chart` to lint/render the vendored chart without
+modifying the imported trees. Run `make source-smoke` for the k8s-native smoke
+gate (ephemeral chart install plus the vendored pypi, npm, and cargo client Jobs;
+needs kubectl + helm + a cluster), or `make source-smoke-compose` for the
+cluster-free Docker Compose equivalent.
 
-`make ci-publish` is the local equivalent of the trusted manual publish lane.
-The Gitea workflow runs backend and web as independent parallel jobs so the two
-builders can share the work. Each imports and exports its retained Harbor
+`make ci-publish` is the local equivalent of the `publish-ci` Gitea workflow.
+The workflow triggers automatically on pull requests (and on manual dispatch) so
+every proposed change gets a full chart-lint, parallel backend/web build, and
+k8s smoke before merging. It runs backend and web as independent parallel jobs so
+the two builders can share the work. Each imports and exports its retained Harbor
 BuildKit cache, attaches BuildKit SBOM and mode-max provenance attestations,
 pushes a source-derived tag, and writes the immutable image digest plus build
 inputs to its retained build record. The command requires `HARBOR_REGISTRY`,

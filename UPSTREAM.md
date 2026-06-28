@@ -40,14 +40,17 @@ make source-check-web
 make source-check-chart
 ```
 
-The heavier smoke gate builds the backend image and runs the vendored native
-clients end to end via `artifact-keeper/docker-compose.test.yml` (its `smoke`
-profile). The wrapper drives that compose project directly because the upstream
-`run-e2e-tests.sh` smoke path also expects a Playwright service that the compose
-file does not define.
+The smoke gate runs the vendored `pypi`, `npm`, and `cargo` native clients
+against a freshly built backend. The pull-request gate (`make source-smoke`,
+`ci/smoke-k8s.sh`) is k8s-native: it helm-installs the vendored chart with its CI
+values into an ephemeral namespace, bootstraps the test repositories, runs the
+clients as Jobs over cluster HTTP, then deletes the namespace. It needs `kubectl`
+and `helm` pointed at a cluster and the backend image reachable by that cluster.
+A workstation Docker Compose equivalent is kept for cluster-free runs:
 
 ```sh
-make source-smoke
+make source-smoke          # k8s-native (PR gate); needs kubectl + helm + cluster
+make source-smoke-compose  # local Docker Compose equivalent
 ```
 
 The web dependency install reported seven audit findings (one low, four

@@ -1,9 +1,14 @@
-.PHONY: source-check source-check-backend source-check-chart source-check-web source-smoke vendor-check vendor-status vendor-update
+.PHONY: source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose vendor-check vendor-status vendor-update
 
 source-check:
 	ci/check-clean-snapshots.sh all
 
+# K8s-native smoke (PR gate): ephemeral chart install + native client Jobs.
 source-smoke:
+	ci/smoke-k8s.sh
+
+# Local Docker Compose smoke, kept for workstation use without a cluster.
+source-smoke-compose:
 	ci/smoke-test.sh
 
 source-check-backend:

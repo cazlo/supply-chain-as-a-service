@@ -22,7 +22,8 @@ set -euo pipefail
 readonly username="${HARBOR_USERNAME:?HARBOR_USERNAME is required}"
 readonly password="${HARBOR_PASSWORD:?HARBOR_PASSWORD is required}"
 : "${COSIGN_PRIVATE_KEY:?COSIGN_PRIVATE_KEY is required}"
-: "${COSIGN_PASSWORD?COSIGN_PASSWORD is required (export it, empty is allowed)}"
+# Empty when the key is unencrypted (the lab key is); cosign reads it regardless.
+COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
 # TODO: pin by digest once ghcr egress/mirroring is available (see scan-image.sh).
 readonly cosign_image="${COSIGN_IMAGE:-ghcr.io/sigstore/cosign:v2.4.1}"
 

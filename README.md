@@ -18,9 +18,12 @@ replication to GitHub for backup. Do not configure bidirectional mirroring.
 ```text
 .gitea/workflows/      Gitea Actions entry points
 ci/                    shared build, test, and publish scripts
-artifact-keeper/       squashed upstream subtree
-artifact-keeper-web/   squashed upstream subtree
-artifact-keeper-iac/   squashed upstream subtree
+artifact-keeper/       full-history upstream subtree
+artifact-keeper-web/   full-history upstream subtree
+artifact-keeper-iac/   full-history upstream subtree
 UPSTREAM.md            imported revisions and local patch status
 patches/               local patches awaiting upstream disposition
 ```
+
+See [UPSTREAM.md](UPSTREAM.md) for pinned revisions, provenance, verification,
+and non-squashed subtree synchronization commands.

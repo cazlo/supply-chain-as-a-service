@@ -1,0 +1,77 @@
+# =============================================================================
+# EXAMPLE CONFIGURATION - Getting Started Template
+# =============================================================================
+# This file is provided as a starting point for deployments. It should be
+# reviewed and modified to match your specific infrastructure requirements,
+# security policies, and operational needs before use in production.
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: artifact-keeper
+  namespace: argocd
+spec:
+  description: Artifact Keeper multi-environment deployment
+  sourceRepos:
+    - "https://github.com/artifact-keeper/artifact-keeper.git"
+    - "https://github.com/artifact-keeper/artifact-keeper-iac.git"
+  destinations:
+    - namespace: artifact-keeper-dev
+      server: https://kubernetes.default.svc
+    - namespace: artifact-keeper-staging
+      server: https://kubernetes.default.svc
+    - namespace: artifact-keeper-prod
+      server: https://kubernetes.default.svc
+    - namespace: ak-mesh-main
+      server: https://kubernetes.default.svc
+    - namespace: ak-mesh-peer1
+      server: https://kubernetes.default.svc
+    - namespace: ak-mesh-peer2
+      server: https://kubernetes.default.svc
+    - namespace: ak-mesh-peer3
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+    - group: ""
+      kind: PersistentVolumeClaim
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: StatefulSet
+    - group: batch
+      kind: Job
+    - group: batch
+      kind: CronJob
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: policy
+      kind: PodDisruptionBudget
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+    - group: monitoring.coreos.com
+      kind: ServiceMonitor
+    - group: external-secrets.io
+      kind: ExternalSecret
+  roles:
+    - name: admin
+      description: Full access to all environments
+      policies:
+        - p, proj:artifact-keeper:admin, applications, *, artifact-keeper/*, allow
+    - name: developer
+      description: Read access + sync dev
+      policies:
+        - p, proj:artifact-keeper:developer, applications, get, artifact-keeper/*, allow
+        - p, proj:artifact-keeper:developer, applications, sync, artifact-keeper/*-dev, allow

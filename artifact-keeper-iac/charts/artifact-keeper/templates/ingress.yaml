@@ -1,0 +1,97 @@
+{{/*
+=============================================================================
+EXAMPLE CONFIGURATION - Getting Started Template
+=============================================================================
+This file is provided as a starting point for deployments. It should be
+reviewed and modified to match your specific infrastructure requirements,
+security policies, and operational needs before use in production.
+=============================================================================
+*/}}
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          # API and health endpoints
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.httpPort }}
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.httpPort }}
+          - path: /ready
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.httpPort }}
+          # /metrics is not exposed publicly. Use the ServiceMonitor
+          # (servicemonitor.yaml) for Prometheus scraping via ClusterIP.
+          # OCI / Docker registry
+          - path: /v2
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.httpPort }}
+          # Native package format handlers — route directly to backend
+          {{- $backendSvc := printf "%s-backend" (include "artifact-keeper.fullname" .) }}
+          {{- $backendPort := .Values.backend.service.httpPort }}
+          {{- range list "/maven" "/npm" "/pypi" "/nuget" "/cargo" "/gems" "/go" "/helm" "/debian" "/rpm" "/alpine" "/composer" "/conan" "/conda" "/swift" "/terraform" "/cocoapods" "/hex" "/pub" "/lfs" "/ivy" "/chef" "/puppet" "/ansible" "/cran" "/huggingface" "/jetbrains" "/vscode" "/proto" "/incus" "/ext" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $backendSvc }}
+                port:
+                  number: {{ $backendPort }}
+          {{- end }}
+          {{- if .Values.dependencyTrack.enabled }}
+          - path: /dtrack
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-dtrack
+                port:
+                  number: 8080
+          {{- end }}
+          # Catch-all: web frontend
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-web
+                port:
+                  number: {{ .Values.web.service.port }}
+{{- end }}

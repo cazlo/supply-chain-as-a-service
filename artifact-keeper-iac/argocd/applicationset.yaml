@@ -1,0 +1,86 @@
+# =============================================================================
+# EXAMPLE CONFIGURATION - Getting Started Template
+# =============================================================================
+# This file is provided as a starting point for deployments. It should be
+# reviewed and modified to match your specific infrastructure requirements,
+# security policies, and operational needs before use in production.
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: artifact-keeper
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - list:
+        elements:
+          - env: dev
+            namespace: artifact-keeper-dev
+            valuesFile: values.yaml
+            targetRevision: main
+            imageTag: dev
+            imageUpdateStrategy: digest
+            autoSync: "true"
+          - env: staging
+            namespace: artifact-keeper-staging
+            valuesFile: values-staging.yaml
+            # Staging tracks the latest release branch. Update this when
+            # cutting a new release (e.g., release/1.2).
+            targetRevision: main
+            imageTag: dev
+            imageUpdateStrategy: digest
+            autoSync: "true"
+          - env: production
+            namespace: artifact-keeper-prod
+            valuesFile: values-production.yaml
+            # Production tracks a specific release tag. Update this value
+            # to promote a new version (e.g., v1.2.0). Sync is manual.
+            targetRevision: v1.1.9
+            imageTag: ~1.1
+            imageUpdateStrategy: semver
+            autoSync: "false"
+  template:
+    metadata:
+      name: "artifact-keeper-{{ .env }}"
+      labels:
+        app.kubernetes.io/part-of: artifact-keeper
+        environment: "{{ .env }}"
+      annotations:
+        argocd-image-updater.argoproj.io/image-list: "backend=ghcr.io/artifact-keeper/artifact-keeper-backend:{{ .imageTag }}, web=ghcr.io/artifact-keeper/artifact-keeper-web:{{ .imageTag }}"
+        argocd-image-updater.argoproj.io/backend.update-strategy: "{{ .imageUpdateStrategy }}"
+        argocd-image-updater.argoproj.io/backend.helm.image-name: backend.image.repository
+        argocd-image-updater.argoproj.io/backend.helm.image-tag: backend.image.tag
+        argocd-image-updater.argoproj.io/web.update-strategy: "{{ .imageUpdateStrategy }}"
+        argocd-image-updater.argoproj.io/web.helm.image-name: web.image.repository
+        argocd-image-updater.argoproj.io/web.helm.image-tag: web.image.tag
+        argocd-image-updater.argoproj.io/write-back-method: argocd
+    spec:
+      project: artifact-keeper
+      source:
+        repoURL: https://github.com/artifact-keeper/artifact-keeper-iac.git
+        targetRevision: "{{ .targetRevision }}"
+        path: charts/artifact-keeper
+        helm:
+          valueFiles:
+            - "{{ .valuesFile }}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{ .namespace }}"
+      syncPolicy:
+        {{- if eq .autoSync "true" }}
+        automated:
+          selfHeal: true
+          prune: true
+        {{- end }}
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 30s
+            factor: 2
+            maxDuration: 5m

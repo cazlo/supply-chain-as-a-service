@@ -1,0 +1,395 @@
+name: Helm CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - ".github/workflows/helm-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - ".github/workflows/helm-ci.yml"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ak-ci-runners
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.16.3
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
+
+      - name: Run chart-testing lint
+        run: ct lint --target-branch main --charts charts/artifact-keeper/
+
+      - name: Run helm lint
+        run: helm lint charts/artifact-keeper/ --set secrets.jwtSecret=ci-nonprod-jwt-76ce00933faca9df20b027521d0b2a63a9b264c7155f7bd7 --set postgres.auth.password=ci-test --set meilisearch.masterKey=1228c08daebf202dfa77b9d7b062c195d3ab1c8f
+
+  template-validation:
+    name: "Template & Validate (${{ matrix.variant }})"
+    runs-on: ak-ci-runners
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            values_args: "--set secrets.jwtSecret=ci-nonprod-jwt-76ce00933faca9df20b027521d0b2a63a9b264c7155f7bd7 --set postgres.auth.password=ci-test --set meilisearch.masterKey=1228c08daebf202dfa77b9d7b062c195d3ab1c8f"
+          - variant: production
+            values_args: "-f charts/artifact-keeper/values-production.yaml"
+          - variant: staging
+            values_args: "-f charts/artifact-keeper/values-staging.yaml --set secrets.jwtSecret=ci-nonprod-jwt-76ce00933faca9df20b027521d0b2a63a9b264c7155f7bd7 --set postgres.auth.password=ci-test --set meilisearch.masterKey=1228c08daebf202dfa77b9d7b062c195d3ab1c8f"
+          - variant: smoke
+            values_args: "-f charts/artifact-keeper/values-smoke.yaml --set backend.image.tag=dev --set web.image.tag=dev"
+          - variant: mesh-main
+            values_args: "-f charts/artifact-keeper/values-mesh-main.yaml"
+          - variant: mesh-peer
+            values_args: "-f charts/artifact-keeper/values-mesh-peer.yaml"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.16.3
+
+      - name: "Render template (${{ matrix.variant }})"
+        run: |
+          helm template artifact-keeper charts/artifact-keeper/ \
+            ${{ matrix.values_args }} \
+            > /tmp/rendered-${{ matrix.variant }}.yaml
+          echo "Template rendered successfully for ${{ matrix.variant }} values"
+
+      - name: Install kubeconform
+        run: |
+          KUBECONFORM_VERSION=0.6.7
+          # ARC runners run as a non-root user that cannot write to
+          # /usr/local/bin, so extract to /tmp first then sudo mv.
+          # Matches the helm-docs install pattern in helm-docs.yml.
+          curl -sSL --proto =https "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C /tmp kubeconform
+          sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+
+      - name: "Validate manifests (${{ matrix.variant }})"
+        run: |
+          kubeconform \
+            -summary \
+            -strict \
+            -ignore-missing-schemas \
+            -kubernetes-version 1.31.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /tmp/rendered-${{ matrix.variant }}.yaml
+
+  verify-image-references:
+    name: "Verify Image References (${{ matrix.variant }})"
+    runs-on: ak-ci-runners
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            values_args: "--set secrets.jwtSecret=ci-nonprod-jwt-76ce00933faca9df20b027521d0b2a63a9b264c7155f7bd7 --set postgres.auth.password=ci-test --set meilisearch.masterKey=1228c08daebf202dfa77b9d7b062c195d3ab1c8f"
+          - variant: production
+            values_args: "-f charts/artifact-keeper/values-production.yaml"
+          - variant: staging
+            values_args: "-f charts/artifact-keeper/values-staging.yaml --set secrets.jwtSecret=ci-nonprod-jwt-76ce00933faca9df20b027521d0b2a63a9b264c7155f7bd7 --set postgres.auth.password=ci-test --set meilisearch.masterKey=1228c08daebf202dfa77b9d7b062c195d3ab1c8f"
+          - variant: smoke
+            values_args: "-f charts/artifact-keeper/values-smoke.yaml --set backend.image.tag=dev --set web.image.tag=dev"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.16.3
+
+      - name: "Render template (${{ matrix.variant }})"
+        run: |
+          helm template artifact-keeper charts/artifact-keeper/ \
+            ${{ matrix.values_args }} \
+            > /tmp/rendered-${{ matrix.variant }}.yaml
+
+      - name: "Extract and verify image references (${{ matrix.variant }})"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          # Extract every "image: ..." reference from the rendered chart.
+          # Skip duplicates and probe each one against the appropriate
+          # registry. v1.1.8 shipped with a chart that referenced
+          # ghcr.io/.../artifact-keeper-web:1.1.8, an image that was
+          # never published. This gate catches that class of failure
+          # before the chart change merges.
+          IMAGES=$(grep -hE '^\s*image:\s*' /tmp/rendered-${{ matrix.variant }}.yaml \
+            | sed -E 's/^\s*image:\s*"?([^"]*)"?\s*$/\1/' \
+            | grep -v '^$' \
+            | sort -u)
+
+          if [ -z "${IMAGES}" ]; then
+            echo "::warning::no image references found in rendered chart"
+            exit 0
+          fi
+
+          echo "Image references in ${{ matrix.variant }} variant:"
+          echo "${IMAGES}" | sed 's/^/  /'
+          echo ""
+
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          probe_ghcr() {
+            local name="$1"; local tag="$2"
+            local token
+            token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              -H "Authorization: Bearer ${GH_TOKEN}" | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            # --proto =https refuses to follow HTTPS->HTTP redirects.
+            curl -sfL --proto =https -o /dev/null -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} "https://ghcr.io/v2/${name}/manifests/${tag}"
+          }
+
+          # NOTE: we deliberately do not probe Docker Hub. The original gate
+          # was added to catch unpublished *ghcr.io* images we own (the
+          # v1.1.8 chart referenced an artifact-keeper-web image that was
+          # never pushed). Anonymous Docker Hub probing from CI runners
+          # hits the 100-pulls-per-6h-per-IP unauthenticated rate limit
+          # almost immediately and produces false negatives -- it claims
+          # `postgres:16-alpine` doesn't exist when it's actually the most
+          # popular image on Docker Hub. We treat docker.io the same way
+          # we treat gcr.io / registry.k8s.io / quay.io: trust the public
+          # registry, log the reference for visibility, and let the
+          # install-test job catch a genuinely-broken upstream ref via an
+          # actual pull through the mirror-configured containerd.
+
+          missing=()
+          while IFS= read -r ref; do
+            [ -z "${ref}" ] && continue
+            tag="${ref##*:}"
+            name="${ref%:*}"
+            case "${name}" in
+              ghcr.io/*)
+                probe_name="${name#ghcr.io/}"
+                if probe_ghcr "${probe_name}" "${tag}"; then
+                  echo "  ✓ ${ref}"
+                else
+                  echo "  ✗ ${ref}  (missing on ghcr.io)"
+                  missing+=("${ref}")
+                fi
+                ;;
+              docker.io/*|gcr.io/*|registry.k8s.io/*|quay.io/*)
+                # Public well-known registries; not probed (rate limits and
+                # registry-specific auth quirks make probing unreliable).
+                echo "  - ${ref}  (public registry, not probed)"
+                ;;
+              */*)
+                # No host prefix but contains a slash; implicit Docker Hub
+                # short form (e.g. "user/image"). Not probed, see above.
+                echo "  - ${ref}  (implicit docker.io, not probed)"
+                ;;
+              *)
+                # No slash, no host. Implicit Docker Hub library namespace
+                # (e.g. "postgres:16-alpine"). Not probed, see above.
+                echo "  - ${ref}  (implicit docker.io/library, not probed)"
+                ;;
+            esac
+          done <<< "${IMAGES}"
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo ""
+            echo "::error::${#missing[@]} image reference(s) in the ${{ matrix.variant }} chart variant do not resolve on their registry. Either fix the chart values or publish the missing images before merging."
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+  version-check:
+    name: Chart Version Check
+    if: github.event_name == 'pull_request'
+    runs-on: ak-ci-runners
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Compare chart version against main
+        run: |
+          MAIN_VERSION=$(git show origin/main:charts/artifact-keeper/Chart.yaml 2>/dev/null \
+            | grep '^version:' | awk '{print $2}' || echo "")
+
+          if [ -z "$MAIN_VERSION" ]; then
+            echo "Chart does not exist on main yet, skipping version check"
+            exit 0
+          fi
+
+          PR_VERSION=$(grep '^version:' charts/artifact-keeper/Chart.yaml | awk '{print $2}')
+
+          if [ "$MAIN_VERSION" = "$PR_VERSION" ]; then
+            echo "::warning::Chart version ($PR_VERSION) was not bumped. Consider updating the version in charts/artifact-keeper/Chart.yaml if this PR changes the chart."
+          else
+            echo "Chart version bumped: $MAIN_VERSION -> $PR_VERSION"
+          fi
+
+  install-test:
+    name: Install Test (k3d)
+    # Runs on the ak-beefy-runners ARC scale set (8 CPU / 16 Gi limit) so the
+    # k3d cluster + full artifact-keeper chart (backend, web, postgres, trivy,
+    # opensearch, dtrack) can stand up inside chart-testing's timeout window.
+    # The regular ak-ci-runners pool (4 CPU / 8 Gi) is too tight.
+    #
+    # Requires argocd/arc-beefy-runners-values.yaml to be deployed to the
+    # cluster.
+    runs-on: ak-beefy-runners
+    needs: [lint, template-validation]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.16.3
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v4.0.1
+        with:
+          version: v1.29.3
+
+      - name: Install k3d
+        run: |
+          # k3d installs k3s inside Docker (uses the DinD sidecar).
+          # Pin version for reproducibility. Extract binary to $HOME/.local/bin
+          # because the runner pod cannot write to /usr/local/bin.
+          K3D_VERSION=v5.7.5
+          mkdir -p "$HOME/.local/bin"
+          curl -sL "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64" \
+            -o "$HOME/.local/bin/k3d"
+          chmod +x "$HOME/.local/bin/k3d"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/k3d" version
+
+      - name: Configure k3d Docker Hub mirror
+        run: |
+          # Route k3d's embedded containerd through Google's public Docker
+          # Hub mirror (mirror.gcr.io) before falling back to the canonical
+          # registry. The mirror is a free read-through cache of all of
+          # Docker Hub (not just `library/*`) and has no anonymous pull
+          # rate limit -- in contrast to registry-1.docker.io's
+          # 100-pulls-per-6h-per-IP cap, which CI runners trip almost
+          # immediately when an `install-test` job pulls postgres,
+          # opensearch, trivy, busybox, and alpine in a single run
+          # (observed: ImagePullBackOff with HTTP 429
+          # "toomanyrequests: You have reached your unauthenticated pull
+          # rate limit").
+          #
+          # Configuration is per the k3d registries-config schema, which
+          # k3s consumes and lowers to containerd's mirrors block.
+          # https://k3d.io/v5.7.5/usage/registries/
+          # https://cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images
+          mkdir -p /tmp/k3d
+          cat > /tmp/k3d/registries.yaml <<'EOF'
+          mirrors:
+            "docker.io":
+              endpoint:
+                - "https://mirror.gcr.io"
+                - "https://registry-1.docker.io"
+          EOF
+          echo "k3d registries.yaml:"
+          cat /tmp/k3d/registries.yaml
+
+      - name: Create k3d cluster
+        run: |
+          # Single-server cluster, no LoadBalancer (not needed for chart-testing
+          # install checks).
+          #
+          # --snapshotter=native: the beefy runner's DinD sidecar uses overlayfs
+          # as its storage driver. k3s runs its own embedded containerd inside
+          # the k3d node container, and containerd defaults to overlayfs too.
+          # Nested overlayfs is unsupported by the kernel, so containerd fails
+          # with "failed to mount overlay: invalid argument" and the k3s node
+          # never registers. The `native` snapshotter uses plain file copies
+          # instead; slower but works in nested environments.
+          #
+          # --registry-config: feeds the mirror.gcr.io fallback above into
+          # k3s, which writes /etc/rancher/k3s/registries.yaml inside the
+          # node and configures containerd's mirrors block before pulling
+          # the chart-testing image graph.
+          k3d cluster create chart-testing \
+            --agents 0 \
+            --no-lb \
+            --registry-config /tmp/k3d/registries.yaml \
+            --k3s-arg "--disable=traefik@server:0" \
+            --k3s-arg "--disable=metrics-server@server:0" \
+            --k3s-arg "--snapshotter=native@server:0" \
+            --wait \
+            --timeout 300s
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Run chart-testing install
+        # Bump helm's install timeout from the default 5m. Inside k3s in
+        # DinD, image pulls are serial (backend, web, postgres, opensearch,
+        # dtrack, trivy) and cold can easily take 8-10 minutes. chart-testing
+        # forwards anything in --helm-extra-args to the underlying
+        # `helm upgrade --install` invocation.
+        run: |
+          ct install \
+            --target-branch main \
+            --charts charts/artifact-keeper/ \
+            --helm-extra-args "--timeout=20m"
+
+      - name: Delete k3d cluster
+        if: always()
+        run: |
+          k3d cluster delete chart-testing 2>/dev/null || true
+
+      - name: Show cluster state on failure
+        if: failure()
+        run: |
+          echo "=== Pod status ==="
+          kubectl get pods -A
+          echo ""
+          echo "=== Events ==="
+          kubectl get events --sort-by='.lastTimestamp' -A | tail -40
+          echo ""
+          echo "=== Describe failing pods ==="
+          kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded -o name \
+            | xargs -I{} kubectl describe {} -n default 2>/dev/null || true

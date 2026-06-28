@@ -1,0 +1,22 @@
+queue_rules:
+  - name: default
+    merge_method: squash
+    update_method: rebase
+
+pull_request_rules:
+  - name: Label Helm chart changes
+    conditions:
+      - "files~=^charts/"
+    actions:
+      label:
+        add:
+          - helm
+
+  - name: Label Terraform changes
+    conditions:
+      - "files~=^terraform/"
+    actions:
+      label:
+        add:
+          - terraform
+

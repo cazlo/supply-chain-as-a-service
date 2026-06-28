@@ -1,0 +1,319 @@
+{{/*
+=============================================================================
+EXAMPLE CONFIGURATION - Getting Started Template
+=============================================================================
+This file is provided as a starting point for deployments. It should be
+reviewed and modified to match your specific infrastructure requirements,
+security policies, and operational needs before use in production.
+=============================================================================
+*/}}
+{{- if .Values.backend.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-backend
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  {{- if not .Values.backend.autoscaling.enabled }}
+  replicas: {{ .Values.backend.replicaCount }}
+  {{- end }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "artifact-keeper.backend.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "artifact-keeper.backend.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with (.Values.backend.tolerations | default .Values.global.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (.Values.backend.affinity | default .Values.global.affinity) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (.Values.backend.nodeSelector | default .Values.global.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (.Values.backend.topologySpreadConstraints | default .Values.global.topologySpreadConstraints) }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "artifact-keeper.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # Image bakes the Grype vulnerability DB at /home/artifact/.cache/grype
+        # with ownership 1001:0 (see artifact-keeper/docker/Dockerfile.backend
+        # lines 95-108, 175). fsGroup only chowns mounted volumes -- it does
+        # NOT touch the image's root filesystem -- so we MUST run as the
+        # image-native UID 1001 or Grype hits EACCES and every scan terminates
+        # with status=failed, findings_count=0 (#127, artifact-keeper-test
+        # release-gate run 26487615730).
+        runAsUser: {{ .Values.backend.podSecurityContext.runAsUser | default 1001 }}
+        fsGroup: {{ .Values.backend.podSecurityContext.fsGroup | default 0 }}
+      initContainers:
+        {{- if .Values.cosign.enabled }}
+        - name: verify-image-signature
+          image: "{{ .Values.cosign.image.repository }}:{{ .Values.cosign.image.tag }}"
+          command: ["cosign", "verify",
+            "--certificate-oidc-issuer={{ .Values.cosign.certificateOidcIssuer }}",
+            "--certificate-identity-regexp={{ .Values.cosign.certificateIdentityRegexp }}",
+            "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag | default .Chart.AppVersion }}"]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+              ephemeral-storage: 128Mi
+        {{- end }}
+        {{- if .Values.postgres.enabled }}
+        - name: wait-for-postgres
+          image: {{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+              ephemeral-storage: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+              ephemeral-storage: 64Mi
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Waiting for PostgreSQL..."
+              until pg_isready -h {{ include "artifact-keeper.fullname" . }}-postgres -p 5432 -U {{ .Values.postgres.auth.username }}; do
+                sleep 3
+              done
+              echo "PostgreSQL is ready"
+        {{- end }}
+        {{- if .Values.opensearch.enabled }}
+        - name: wait-for-opensearch
+          image: alpine:3.20
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+              ephemeral-storage: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+              ephemeral-storage: 64Mi
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Waiting for OpenSearch..."
+              # Accept green or yellow cluster status. When security is enabled
+              # the probe talks to HTTPS with -k; otherwise plain HTTP.
+              {{- if .Values.opensearch.disableSecurityPlugin }}
+              URL="http://{{ include "artifact-keeper.fullname" . }}-opensearch:9200/_cluster/health"
+              CURL_ARGS=""
+              {{- else }}
+              URL="https://{{ include "artifact-keeper.fullname" . }}-opensearch:9200/_cluster/health"
+              CURL_ARGS="-k"
+              {{- end }}
+              until wget -qO- $URL 2>/dev/null | grep -q '"status":"\(green\|yellow\)"'; do
+                sleep 3
+              done
+              echo "OpenSearch is ready"
+        {{- end }}
+      containers:
+        - name: backend
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          {{- if .Values.dependencyTrack.enabled }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ -f /shared/dtrack-api-key ] && [ -s /shared/dtrack-api-key ]; then
+                export DEPENDENCY_TRACK_API_KEY="$(cat /shared/dtrack-api-key)"
+              fi
+              exec /usr/local/bin/artifact-keeper
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.backend.service.httpPort }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.backend.service.grpcPort }}
+              protocol: TCP
+            {{- if .Values.backend.metricsListener.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.backend.metricsListener.port }}
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- range $key, $value := .Values.backend.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            - name: DATABASE_URL
+              {{- if and (not .Values.postgres.enabled) .Values.externalDatabase.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalDatabase.existingSecret }}
+                  key: {{ .Values.externalDatabase.existingSecretKey }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "artifact-keeper.fullname" . }}-secrets
+                  key: DATABASE_URL
+              {{- end }}
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "artifact-keeper.fullname" . }}-secrets
+                  key: JWT_SECRET
+            {{- if or (and .Values.externalSecrets.enabled .Values.externalSecrets.secrets.migrationEncryptionKey) (and (not .Values.externalSecrets.enabled) .Values.secrets.migrationEncryptionKey) }}
+            - name: MIGRATION_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "artifact-keeper.fullname" . }}-secrets
+                  key: MIGRATION_ENCRYPTION_KEY
+            {{- end }}
+            {{- if .Values.opensearch.enabled }}
+            - name: OPENSEARCH_URL
+              value: "{{ if .Values.opensearch.disableSecurityPlugin }}http{{ else }}https{{ end }}://{{ include "artifact-keeper.fullname" . }}-opensearch:9200"
+            {{- if not .Values.opensearch.disableSecurityPlugin }}
+            - name: OPENSEARCH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "artifact-keeper.fullname" . }}-secrets
+                  key: OPENSEARCH_USERNAME
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "artifact-keeper.fullname" . }}-secrets
+                  key: OPENSEARCH_PASSWORD
+            - name: OPENSEARCH_ALLOW_INVALID_CERTS
+              value: {{ .Values.opensearch.allowInvalidCerts | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.trivy.enabled }}
+            - name: TRIVY_URL
+              value: "http://{{ include "artifact-keeper.fullname" . }}-trivy:8090"
+            - name: SCAN_WORKSPACE_PATH
+              value: "/scan-workspace"
+            {{- end }}
+            {{- if .Values.dependencyTrack.enabled }}
+            - name: DEPENDENCY_TRACK_URL
+              value: "http://{{ include "artifact-keeper.fullname" . }}-dtrack:8080"
+            - name: DEPENDENCY_TRACK_ENABLED
+              value: "true"
+            {{- if not (hasKey .Values.backend.env "ALLOW_HTTP_INTEGRATIONS") }}
+            - name: ALLOW_HTTP_INTEGRATIONS
+              value: "1"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.secrets.smtpPassword }}
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "artifact-keeper.fullname" . }}-secrets
+                  key: SMTP_PASSWORD
+            {{- end }}
+            {{- if .Values.backend.metricsListener.enabled }}
+            - name: METRICS_PORT
+              value: {{ .Values.backend.metricsListener.port | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: storage
+              mountPath: /data/storage
+              subPath: storage
+            - name: storage
+              mountPath: /data/backups
+              subPath: backups
+            - name: storage
+              mountPath: /data/plugins
+              subPath: plugins
+            {{- if .Values.backend.scanWorkspace.enabled }}
+            - name: scan-workspace
+              mountPath: /scan-workspace
+            {{- end }}
+            {{- if .Values.dependencyTrack.enabled }}
+            - name: shared-config
+              mountPath: /shared
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: storage
+          {{- if .Values.backend.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-storage
+          {{- else }}
+          emptyDir:
+            sizeLimit: 10Gi
+          {{- end }}
+        {{- if .Values.backend.scanWorkspace.enabled }}
+        - name: scan-workspace
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-scan-workspace
+        {{- end }}
+        {{- if .Values.dependencyTrack.enabled }}
+        - name: shared-config
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-shared-config
+        {{- end }}
+{{- end }}

@@ -27,3 +27,6 @@ patches/               local patches awaiting upstream disposition
 
 See [UPSTREAM.md](UPSTREAM.md) for pinned revisions, provenance, verification,
 and non-squashed subtree synchronization commands.
+
+Common vendoring commands are `make vendor-check`, `make vendor-status`, and
+`make vendor-update NAME=<name> REF=<reviewed-ref> TAG=<tag-or-dash>`.

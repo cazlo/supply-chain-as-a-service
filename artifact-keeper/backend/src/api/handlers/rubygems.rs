@@ -1,0 +1,999 @@
+//! RubyGems API handlers.
+//!
+//! Implements the endpoints required for `gem push` and `gem install`.
+//!
+//! Routes are mounted at `/gems/{repo_key}/...`:
+//!   GET  /gems/{repo_key}/api/v1/gems/{name}.json           - Gem info
+//!   GET  /gems/{repo_key}/api/v1/versions/{name}.json       - All versions
+//!   GET  /gems/{repo_key}/gems/{name}-{version}.gem         - Download gem
+//!   POST /gems/{repo_key}/api/v1/gems                       - Push gem
+//!   GET  /gems/{repo_key}/specs.4.8.gz                      - Full spec index
+//!   GET  /gems/{repo_key}/latest_specs.4.8.gz               - Latest spec index
+//!   GET  /gems/{repo_key}/api/v1/dependencies?gems={names}  - Dependency info
+
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Extension;
+use axum::Router;
+use bytes::Bytes;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Row};
+use std::io::Read as IoRead;
+use std::io::Write as IoWrite;
+use tracing::info;
+
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
+use crate::api::SharedState;
+use crate::formats::rubygems::RubygemsHandler;
+use crate::models::repository::{Repository, RepositoryType};
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+pub fn router() -> Router<SharedState> {
+    Router::new()
+        // Gem push
+        .route("/:repo_key/api/v1/gems", post(push_gem))
+        // Gem info
+        .route("/:repo_key/api/v1/gems/:name", get(gem_info))
+        // Gem versions
+        .route("/:repo_key/api/v1/versions/:name", get(gem_versions))
+        // Dependencies
+        .route("/:repo_key/api/v1/dependencies", get(dependencies))
+        // Specs indices
+        .route("/:repo_key/specs.4.8.gz", get(specs_index))
+        .route("/:repo_key/latest_specs.4.8.gz", get(latest_specs_index))
+        // Download gem - use a wildcard to capture name-version.gem
+        .route("/:repo_key/gems/*gem_file", get(download_gem))
+}
+
+// ---------------------------------------------------------------------------
+// Repository resolution
+// ---------------------------------------------------------------------------
+
+async fn resolve_rubygems_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["rubygems"], "a RubyGems").await
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/api/v1/gems/{name}.json — Gem info
+// ---------------------------------------------------------------------------
+
+async fn gem_info(
+    State(state): State<SharedState>,
+    Path((repo_key, name)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    // Strip .json suffix if present
+    let gem_name = name.strip_suffix(".json").unwrap_or(&name);
+
+    let artifact =
+        proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, gem_name).await?;
+
+    if let Some(artifact) = artifact {
+        // Get download count
+        let download_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+            artifact.id
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+
+        let version = artifact.version.unwrap_or_default();
+        let description = artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("gemspec"))
+            .and_then(|gs| gs.get("summary"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let gem_filename = format!("{}-{}.gem", gem_name, version);
+        let gem_uri = format!("/gems/{}/gems/{}", repo_key, gem_filename);
+
+        let json = serde_json::json!({
+            "name": gem_name,
+            "version": version,
+            "info": description,
+            "gem_uri": gem_uri,
+            "sha": artifact.checksum_sha256,
+            "downloads": download_count,
+            "version_downloads": download_count,
+        });
+
+        return Ok(super::json_response(&json));
+    }
+
+    // Virtual repo: try remote members in priority order
+    if repo.repo_type == RepositoryType::Virtual {
+        return proxy_helpers::resolve_virtual_metadata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            &format!("api/v1/gems/{}.json", gem_name),
+            |bytes, _member_key| async move {
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(bytes))
+                    .unwrap())
+            },
+        )
+        .await;
+    }
+
+    Err((StatusCode::NOT_FOUND, "Gem not found").into_response())
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/api/v1/versions/{name}.json — All versions
+// ---------------------------------------------------------------------------
+
+async fn gem_versions(
+    State(state): State<SharedState>,
+    Path((repo_key, name)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    let gem_name = name.strip_suffix(".json").unwrap_or(&name);
+
+    let artifacts =
+        proxy_helpers::list_artifacts_by_name_lowercase(&state.db, repo.id, gem_name).await?;
+
+    if artifacts.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Gem not found").into_response());
+    }
+
+    let versions: Vec<serde_json::Value> = artifacts
+        .iter()
+        .map(|a| {
+            let version = a.version.clone().unwrap_or_default();
+            let description = a
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("gemspec"))
+                .and_then(|gs| gs.get("summary"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let gem_filename = format!("{}-{}.gem", gem_name, version);
+
+            serde_json::json!({
+                "number": version,
+                "summary": description,
+                "platform": "ruby",
+                "sha": a.checksum_sha256,
+                "gem_uri": format!("/gems/{}/gems/{}", repo_key, gem_filename),
+                "downloads_count": 0,
+            })
+        })
+        .collect();
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&versions).unwrap()))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/gems/{name}-{version}.gem — Download gem
+// ---------------------------------------------------------------------------
+
+async fn download_gem(
+    State(state): State<SharedState>,
+    Path((repo_key, gem_file)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    let filename = gem_file.trim_start_matches('/');
+
+    let artifact =
+        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+            Some(a) => a,
+            None => {
+                let upstream_path = format!("gems/{}", filename);
+                // Remote: no Content-Disposition; Virtual: include filename.
+                // Mirrors the prior behavior so clients see the same headers.
+                let cd_filename = if repo.repo_type == RepositoryType::Virtual {
+                    Some(filename)
+                } else {
+                    None
+                };
+
+                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s):
+                // if any non-Remote member of a Virtual repo already owns
+                // this gem name, block Remote members from satisfying the
+                // download so an upstream cannot shadow a locally
+                // published gem. Parses the gem name out of the filename
+                // and short-circuits to `false` if the filename does not
+                // look like a gem (no guard, fall through to normal proxy
+                // behavior). The same partial `idx_artifacts_repo_lower_name`
+                // index added by migration 106 backs the query.
+                let suppress_upstream = if repo.repo_type == RepositoryType::Virtual {
+                    match crate::formats::rubygems::package_name_from_gem_filename(filename) {
+                        Some(pkg) => {
+                            proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, &pkg)
+                                .await?
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+
+                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                    &state,
+                    &repo,
+                    proxy_helpers::DownloadResponseOpts {
+                        upstream_path: &upstream_path,
+                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                        default_content_type: "application/octet-stream",
+                        content_disposition_filename: cd_filename,
+                        suppress_upstream_proxy: suppress_upstream,
+                    },
+                )
+                .await?
+                {
+                    return Ok(resp);
+                }
+                return Err((StatusCode::NOT_FOUND, "Gem file not found").into_response());
+            }
+        };
+
+    proxy_helpers::serve_local_artifact(
+        &state,
+        &repo,
+        artifact.id,
+        &artifact.storage_key,
+        "application/octet-stream",
+        Some(filename),
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// POST /gems/{repo_key}/api/v1/gems — Push gem (raw body)
+// ---------------------------------------------------------------------------
+
+async fn push_gem(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(repo_key): Path<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    // Authenticate
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "rubygems", "write")?.user_id;
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    if body.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty gem file").into_response());
+    }
+
+    // Extract gemspec from the .gem file
+    let gemspec = RubygemsHandler::extract_gemspec(&body).map_err(|e| {
+        (StatusCode::BAD_REQUEST, format!("Invalid gem file: {}", e)).into_response()
+    })?;
+
+    let gem_name = &gemspec.name;
+    let gem_version = &gemspec.version;
+
+    if gem_name.is_empty() || gem_version.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Gem name and version are required").into_response());
+    }
+
+    // Build filename
+    let filename = if let Some(ref platform) = gemspec.platform {
+        format!("{}-{}-{}.gem", gem_name, gem_version, platform)
+    } else {
+        format!("{}-{}.gem", gem_name, gem_version)
+    };
+
+    // Compute SHA256
+    let mut hasher = Sha256::new();
+    hasher.update(&body);
+    let computed_sha256 = format!("{:x}", hasher.finalize());
+
+    // Artifact path
+    let artifact_path = format!("{}/{}/{}", gem_name, gem_version, filename);
+
+    proxy_helpers::ensure_unique_artifact_path(
+        &state.db,
+        repo.id,
+        &artifact_path,
+        "Gem version already exists",
+    )
+    .await?;
+
+    let storage_key = format!("rubygems/{}/{}/{}", gem_name, gem_version, filename);
+    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
+
+    // Build metadata JSON
+    let gem_metadata = serde_json::json!({
+        "gemspec": serde_json::to_value(&gemspec).unwrap_or_default(),
+        "filename": filename,
+    });
+
+    let size_bytes = body.len() as i64;
+
+    // Insert artifact record
+    let gem_version_str = gem_version.to_string();
+    let artifact_id = proxy_helpers::insert_artifact(
+        &state.db,
+        proxy_helpers::NewArtifact {
+            repository_id: repo.id,
+            path: &artifact_path,
+            name: gem_name,
+            version: &gem_version_str,
+            size_bytes,
+            checksum_sha256: &computed_sha256,
+            content_type: "application/octet-stream",
+            storage_key: &storage_key,
+            uploaded_by: user_id,
+        },
+    )
+    .await?;
+
+    proxy_helpers::record_artifact_metadata(
+        &state.db,
+        artifact_id,
+        repo.id,
+        "rubygems",
+        &gem_metadata,
+    )
+    .await;
+
+    info!(
+        "RubyGems push: {} {} ({}) to repo {}",
+        gem_name, gem_version, filename, repo_key
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from("Successfully registered gem"))
+        .unwrap())
+}
+
+const SPECS_QUERY: &str = r#"
+    SELECT name, version
+    FROM artifacts
+    WHERE repository_id = $1
+      AND is_deleted = false
+    ORDER BY name, created_at DESC
+"#;
+
+const LATEST_SPECS_QUERY: &str = r#"
+    SELECT DISTINCT ON (LOWER(name)) name, version
+    FROM artifacts
+    WHERE repository_id = $1
+      AND is_deleted = false
+    ORDER BY LOWER(name), created_at DESC
+"#;
+
+/// Query gem specs from a single repository using the given SQL.
+async fn query_gem_specs(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    sql: &str,
+) -> Result<Vec<serde_json::Value>, Response> {
+    let rows = sqlx::query(sql)
+        .bind(repo_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+                .into_response()
+        })?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let name: String = r.get("name");
+            let version: Option<String> = r.get("version");
+            serde_json::json!([name, version.unwrap_or_default(), "ruby"])
+        })
+        .collect())
+}
+
+/// Query gem specs from all local (non-remote) virtual members.
+async fn query_local_member_specs(
+    db: &PgPool,
+    members: &[Repository],
+    sql: &str,
+) -> Result<Vec<serde_json::Value>, Response> {
+    let mut all_specs = Vec::new();
+    for member in members {
+        if member.repo_type != RepositoryType::Remote {
+            let specs = query_gem_specs(db, member.id, sql).await?;
+            all_specs.extend(specs);
+        }
+    }
+    Ok(all_specs)
+}
+
+/// Decompress gzipped upstream spec data and parse as a JSON array of spec tuples.
+#[allow(clippy::result_large_err)]
+fn parse_upstream_specs(bytes: &[u8]) -> Result<Vec<serde_json::Value>, Response> {
+    let mut decoder = GzDecoder::new(bytes);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Failed to decompress upstream specs",
+        )
+            .into_response()
+    })?;
+    serde_json::from_slice(&decompressed)
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "Failed to parse upstream specs").into_response())
+}
+
+/// Collect remote specs from virtual members, decompress and parse each one.
+async fn collect_remote_specs(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+    upstream_path: &str,
+) -> Result<Vec<serde_json::Value>, Response> {
+    let remote_specs = proxy_helpers::collect_virtual_metadata(
+        &state.db,
+        state.proxy_service.as_deref(),
+        virtual_repo_id,
+        upstream_path,
+        |bytes, _member_key| async move { parse_upstream_specs(&bytes) },
+    )
+    .await?;
+
+    let mut all = Vec::new();
+    for (_key, specs) in remote_specs {
+        all.extend(specs);
+    }
+    Ok(all)
+}
+
+/// Serialize specs to JSON, gzip-compress, and return as a response.
+#[allow(clippy::result_large_err)]
+fn specs_to_gzip_response(specs: &[serde_json::Value]) -> Result<Response, Response> {
+    let json_bytes = serde_json::to_vec(specs).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Serialization error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let compressed = gzip_compress(&json_bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Compression error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/gzip")
+        .header(CONTENT_LENGTH, compressed.len().to_string())
+        .body(Body::from(compressed))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/specs.4.8.gz — Full spec index (gzipped JSON)
+// ---------------------------------------------------------------------------
+
+async fn specs_index(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    // Virtual repo: merge specs from all local and remote members
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut all_specs = query_local_member_specs(&state.db, &members, SPECS_QUERY).await?;
+
+        let remote = collect_remote_specs(&state, repo.id, "specs.4.8.gz").await?;
+        all_specs.extend(remote);
+
+        return specs_to_gzip_response(&all_specs);
+    }
+
+    let specs = query_gem_specs(&state.db, repo.id, SPECS_QUERY).await?;
+    specs_to_gzip_response(&specs)
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/latest_specs.4.8.gz — Latest spec index
+// ---------------------------------------------------------------------------
+
+async fn latest_specs_index(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    // Virtual repo: merge latest specs from all local and remote members,
+    // then deduplicate by gem name (keep the first occurrence per name).
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut all_specs =
+            query_local_member_specs(&state.db, &members, LATEST_SPECS_QUERY).await?;
+
+        let remote = collect_remote_specs(&state, repo.id, "latest_specs.4.8.gz").await?;
+        all_specs.extend(remote);
+
+        // Deduplicate by gem name, keeping the first occurrence (higher-priority member wins)
+        let mut seen = std::collections::HashSet::new();
+        all_specs.retain(|spec| {
+            let name = spec
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            seen.insert(name)
+        });
+
+        return specs_to_gzip_response(&all_specs);
+    }
+
+    let specs = query_gem_specs(&state.db, repo.id, LATEST_SPECS_QUERY).await?;
+    specs_to_gzip_response(&specs)
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/api/v1/dependencies?gems={names} — Dependency info
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct DependencyQuery {
+    gems: Option<String>,
+}
+
+async fn dependencies(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+    Query(query): Query<DependencyQuery>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    let gem_names: Vec<&str> = query
+        .gems
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if gem_names.is_empty() {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("[]"))
+            .unwrap());
+    }
+
+    let mut result: Vec<serde_json::Value> = Vec::new();
+
+    for gem_name in &gem_names {
+        let artifacts = sqlx::query!(
+            r#"
+            SELECT a.name, a.version, am.metadata as "metadata?"
+            FROM artifacts a
+            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+            WHERE a.repository_id = $1
+              AND a.is_deleted = false
+              AND LOWER(a.name) = LOWER($2)
+            ORDER BY a.created_at DESC
+            "#,
+            repo.id,
+            gem_name.to_string()
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+                .into_response()
+        })?;
+
+        for a in &artifacts {
+            let deps = a
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("gemspec"))
+                .and_then(|gs| gs.get("dependencies"))
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|dep| {
+                            serde_json::json!([
+                                dep.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                                dep.get("requirements")
+                                    .and_then(|r| r.as_str())
+                                    .unwrap_or(">= 0"),
+                            ])
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            result.push(serde_json::json!({
+                "name": a.name,
+                "number": a.version.clone().unwrap_or_default(),
+                "platform": "ruby",
+                "dependencies": deps,
+            }));
+        }
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&result).unwrap()))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // extract_credentials
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // gzip_compress
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gzip_compress_empty() {
+        let result = gzip_compress(b"");
+        assert!(result.is_ok());
+        assert!(!result.unwrap().is_empty()); // gzip header exists even for empty
+    }
+
+    #[test]
+    fn test_gzip_compress_data() {
+        let data = b"hello world, this is some test data for gzip compression";
+        let result = gzip_compress(data);
+        assert!(result.is_ok());
+        let compressed = result.unwrap();
+        // Compressed data should start with gzip magic bytes
+        assert!(compressed.len() >= 2);
+        assert_eq!(compressed[0], 0x1f);
+        assert_eq!(compressed[1], 0x8b);
+    }
+
+    #[test]
+    fn test_gzip_compress_roundtrip() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let original = b"RubyGems spec data [\"rails\", \"7.0.0\", \"ruby\"]";
+        let compressed = gzip_compress(original).unwrap();
+
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    // -----------------------------------------------------------------------
+    // DependencyQuery deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dependency_query_empty() {
+        let q: DependencyQuery = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(q.gems.is_none());
+    }
+
+    #[test]
+    fn test_dependency_query_with_gems() {
+        let q: DependencyQuery = serde_json::from_str(r#"{"gems":"rails,sinatra,rack"}"#).unwrap();
+        assert_eq!(q.gems, Some("rails,sinatra,rack".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Gem name parsing (strip .json suffix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gem_name_strip_json() {
+        let name = "rails.json";
+        let gem_name = name.strip_suffix(".json").unwrap_or(name);
+        assert_eq!(gem_name, "rails");
+    }
+
+    #[test]
+    fn test_gem_name_no_json() {
+        let name = "rails";
+        let gem_name = name.strip_suffix(".json").unwrap_or(name);
+        assert_eq!(gem_name, "rails");
+    }
+
+    // -----------------------------------------------------------------------
+    // Gem filename construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gem_filename_no_platform() {
+        let gem_name = "rails";
+        let gem_version = "7.0.0";
+        let platform: Option<String> = None;
+        let filename = if let Some(ref p) = platform {
+            format!("{}-{}-{}.gem", gem_name, gem_version, p)
+        } else {
+            format!("{}-{}.gem", gem_name, gem_version)
+        };
+        assert_eq!(filename, "rails-7.0.0.gem");
+    }
+
+    #[test]
+    fn test_gem_filename_with_platform() {
+        let gem_name = "nokogiri";
+        let gem_version = "1.16.0";
+        let platform = Some("x86_64-linux".to_string());
+        let filename = if let Some(ref p) = platform {
+            format!("{}-{}-{}.gem", gem_name, gem_version, p)
+        } else {
+            format!("{}-{}.gem", gem_name, gem_version)
+        };
+        assert_eq!(filename, "nokogiri-1.16.0-x86_64-linux.gem");
+    }
+
+    // -----------------------------------------------------------------------
+    // Artifact path and storage key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rubygems_artifact_path() {
+        let gem_name = "sinatra";
+        let gem_version = "3.0.0";
+        let filename = format!("{}-{}.gem", gem_name, gem_version);
+        let artifact_path = format!("{}/{}/{}", gem_name, gem_version, filename);
+        assert_eq!(artifact_path, "sinatra/3.0.0/sinatra-3.0.0.gem");
+    }
+
+    #[test]
+    fn test_rubygems_storage_key() {
+        let gem_name = "sinatra";
+        let gem_version = "3.0.0";
+        let filename = format!("{}-{}.gem", gem_name, gem_version);
+        let storage_key = format!("rubygems/{}/{}/{}", gem_name, gem_version, filename);
+        assert_eq!(storage_key, "rubygems/sinatra/3.0.0/sinatra-3.0.0.gem");
+    }
+
+    // -----------------------------------------------------------------------
+    // RepoInfo struct
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repo_info_construction() {
+        let id = uuid::Uuid::new_v4();
+        let info = RepoInfo {
+            id,
+            key: String::new(),
+            storage_path: "/data/rubygems".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "hosted".to_string(),
+            upstream_url: Some("https://rubygems.org".to_string()),
+        };
+        assert_eq!(info.id, id);
+        assert_eq!(info.repo_type, "hosted");
+        assert_eq!(info.upstream_url, Some("https://rubygems.org".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // SHA256
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sha256() {
+        let data = b"gem file content";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let checksum = format!("{:x}", hasher.finalize());
+        assert_eq!(checksum.len(), 64);
+    }
+
+    // -----------------------------------------------------------------------
+    // Gem URI format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gem_uri() {
+        let repo_key = "gems-hosted";
+        let gem_filename = "rails-7.0.0.gem";
+        let gem_uri = format!("/gems/{}/gems/{}", repo_key, gem_filename);
+        assert_eq!(gem_uri, "/gems/gems-hosted/gems/rails-7.0.0.gem");
+    }
+
+    // -----------------------------------------------------------------------
+    // Dependency parsing logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dependency_gem_names_parsing() {
+        let gems_str = "rails,sinatra,rack";
+        let gem_names: Vec<&str> = gems_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(gem_names, vec!["rails", "sinatra", "rack"]);
+    }
+
+    #[test]
+    fn test_dependency_gem_names_empty() {
+        let gems_str = "";
+        let gem_names: Vec<&str> = gems_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(gem_names.is_empty());
+    }
+
+    #[test]
+    fn test_dependency_gem_names_with_spaces() {
+        let gems_str = " rails , sinatra , rack ";
+        let gem_names: Vec<&str> = gems_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(gem_names, vec!["rails", "sinatra", "rack"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Filename trimming (download_gem path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filename_trim_leading_slash() {
+        let gem_file = "/rails-7.0.0.gem";
+        let filename = gem_file.trim_start_matches('/');
+        assert_eq!(filename, "rails-7.0.0.gem");
+    }
+
+    #[test]
+    fn test_filename_no_leading_slash() {
+        let gem_file = "rails-7.0.0.gem";
+        let filename = gem_file.trim_start_matches('/');
+        assert_eq!(filename, "rails-7.0.0.gem");
+    }
+
+    // -----------------------------------------------------------------------
+    // Specs format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_specs_json_format() {
+        let specs: Vec<serde_json::Value> = vec![
+            serde_json::json!(["rails", "7.0.0", "ruby"]),
+            serde_json::json!(["sinatra", "3.0.0", "ruby"]),
+        ];
+        let json_bytes = serde_json::to_vec(&specs).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0][0], "rails");
+        assert_eq!(parsed[0][1], "7.0.0");
+        assert_eq!(parsed[0][2], "ruby");
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for the proxy_helpers-call paths.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_rubygems_download_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/gems/missing-1.0.0.gem", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rubygems_download_serves_local() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "rubygems/rails/7.0.0/rails-7.0.0.gem",
+            "rails/7.0.0/rails-7.0.0.gem",
+            "rails",
+            "7.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"gem-data"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/gems/rails-7.0.0.gem", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"gem-data");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rubygems_gem_info_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/api/v1/gems/missing", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rubygems_push_unauthenticated_401() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .body(axum::body::Body::from("data"))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+}

@@ -1,0 +1,384 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # E2E GATE - Must pass before release proceeds
+  # ════════════════════════════════════════════════════════════════════════════
+
+  e2e-gate:
+    name: 🚦 E2E Gate
+    uses: ./.github/workflows/e2e.yml
+    with:
+      profile: smoke
+      include_stress: false
+      include_failure: false
+
+  mesh-e2e-gate:
+    name: Mesh Replication E2E (optional)
+    uses: ./.github/workflows/mesh-e2e.yml
+    with:
+      image_tag: dev
+    secrets: inherit
+
+  release-gate:
+    name: Release Gate (Full Suite)
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    with:
+      backend_tag: dev
+      test_suite: all
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # BUILD BINARIES
+  # ════════════════════════════════════════════════════════════════════════════
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: [e2e-gate, release-gate]
+    if: |
+      always() &&
+      needs.e2e-gate.result == 'success' &&
+      (needs.release-gate.result == 'success' || needs.release-gate.result == 'failure')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: artifact-keeper-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: artifact-keeper-darwin-arm64
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-windows-amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Windows cross-compilation tools
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: sudo apt-get install -y mingw-w64
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set version from tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "Setting workspace version to ${VERSION}"
+          # Portable in-place edit: GNU `sed -i` and BSD/macOS `sed -i` take
+          # incompatible arguments (BSD requires a backup suffix), which broke
+          # the macOS release builds (#1538: "sed: 1: Cargo.toml: invalid
+          # command code C"). Use a temp file so the same step works on the
+          # Linux and macOS runners alike.
+          sed "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
+          head -5 Cargo.toml
+
+      - name: Build
+        env:
+          SQLX_OFFLINE: true
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+
+      - name: Package binary (Unix)
+        if: "!contains(matrix.target, 'windows')"
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/artifact-keeper dist/${{ matrix.name }}
+          chmod +x dist/${{ matrix.name }}
+          cd dist
+          tar -czvf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          if command -v sha256sum &>/dev/null; then
+            sha256sum ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+          else
+            shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+          fi
+
+      - name: Package binary (Windows)
+        if: contains(matrix.target, 'windows')
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/artifact-keeper.exe dist/${{ matrix.name }}.exe
+          cd dist
+          sha256sum ${{ matrix.name }}.exe > ${{ matrix.name }}.exe.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.name }}.tar.gz*
+            dist/${{ matrix.name }}.exe*
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # VERIFY REQUIRED IMAGES PUBLISHED ON GHCR.IO
+  #
+  # Cross-repo image-publish gate. v1.1.8 shipped with no
+  # ghcr.io/.../artifact-keeper-web:1.1.8 published, breaking every fresh
+  # helm install. This job polls ghcr.io for every image the chart
+  # references at the release version tag, and fails if any is missing
+  # after the docker-publish workflows have had time to complete.
+  #
+  # When this gate fails, the GitHub Release stays a draft (see Check
+  # gate status step in the release job below).
+  #
+  # Tracks Hardening Core issue
+  # https://github.com/artifact-keeper/artifact-keeper/issues/882
+  # ════════════════════════════════════════════════════════════════════════════
+
+  verify-images-published:
+    name: 🐳 Verify Required Images Published
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    needs: [build-binaries]
+    if: |
+      always() &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.build-binaries.result == 'success'
+    timeout-minutes: 35
+    steps:
+      - name: Wait for and verify required images on ghcr.io and docker.io
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Verifying required images for version: ${VERSION}"
+          echo "Both registries (ghcr.io and docker.io) must have every image."
+
+          # Poll both registries for up to 30 minutes per image. Multi-arch
+          # builds, cosign signing and provenance attestation routinely take
+          # 15-25 minutes, so we wait rather than fail-fast.
+          DEADLINE=$(($(date +%s) + 30*60))
+
+          # Required image set. Each entry is "<registry>|<name>:<tag>".
+          # ghcr.io uses the artifact-keeper org / hyphenated names.
+          # docker.io uses the artifactkeeper namespace / shorter names.
+          # Missing on EITHER registry blocks the release.
+          # The `-alpine` backend variant is currently suspended (its
+          # build/merge jobs in docker-publish.yml are gated `if: false`), so
+          # it is intentionally omitted — re-add the two `${VERSION}-alpine`
+          # entries when that variant is published again.
+          IMAGES=(
+            "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}"
+            "ghcr.io|artifact-keeper/artifact-keeper-openscap:${VERSION}"
+            "ghcr.io|artifact-keeper/artifact-keeper-web:${VERSION}"
+            "docker.io|artifactkeeper/backend:${VERSION}"
+            "docker.io|artifactkeeper/openscap:${VERSION}"
+            "docker.io|artifactkeeper/web:${VERSION}"
+          )
+
+          # Common Accept headers cover OCI index, Docker manifest list,
+          # and Docker manifest v2 (different registries return different
+          # default media types).
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          probe_ghcr() {
+            local name="$1"; local tag="$2"
+            local token
+            token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            # --proto =https refuses to follow HTTPS->HTTP redirects so the
+            # Bearer token can never leak over plaintext.
+            curl -sfL --proto =https -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} \
+              "https://ghcr.io/v2/${name}/manifests/${tag}"
+          }
+
+          probe_dockerhub() {
+            local name="$1"; local tag="$2"
+            # Docker Hub anonymous token (works for public repos).
+            local token
+            token=$(curl -sf "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            # --proto =https refuses to follow HTTPS->HTTP redirects so the
+            # Bearer token can never leak over plaintext.
+            curl -sfL --proto =https -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} \
+              "https://registry-1.docker.io/v2/${name}/manifests/${tag}"
+          }
+
+          probe() {
+            local registry="$1"; local img="$2"
+            local name="${img%:*}"; local tag="${img#*:}"
+            case "${registry}" in
+              ghcr.io)   probe_ghcr "${name}" "${tag}" ;;
+              docker.io) probe_dockerhub "${name}" "${tag}" ;;
+              *) echo "::error::unknown registry ${registry}"; return 2 ;;
+            esac
+          }
+
+          missing=()
+          for entry in "${IMAGES[@]}"; do
+            registry="${entry%%|*}"
+            img="${entry#*|}"
+            echo ""
+            echo "Polling ${registry}/${img}"
+            while true; do
+              if probe "${registry}" "${img}"; then
+                echo "  ✓ ${registry}/${img}"
+                break
+              fi
+              if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+                echo "::error::Required image missing on ${registry} after 30m: ${img}"
+                missing+=("${registry}/${img}")
+                break
+              fi
+              echo "  not yet present, waiting 30s..."
+              sleep 30
+            done
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo ""
+            echo "::error::One or more required images are missing on ghcr.io and/or docker.io after the deadline. The GitHub Release will be marked DRAFT and will not promote to stable until every required image is published on both registries."
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo ""
+          echo "All required images present on ghcr.io AND docker.io for version ${VERSION}."
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CREATE RELEASE
+  # ════════════════════════════════════════════════════════════════════════════
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, release-gate, mesh-e2e-gate, verify-images-published]
+    if: always() && needs.build-binaries.result == 'success'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          pattern: artifact-keeper-*
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check gate status
+        id: gates
+        run: |
+          RELEASE_GATE="${{ needs.release-gate.result }}"
+          MESH_GATE="${{ needs.mesh-e2e-gate.result }}"
+          IMAGES_GATE="${{ needs.verify-images-published.result }}"
+          echo "release_gate=${RELEASE_GATE}" >> $GITHUB_OUTPUT
+          echo "mesh_gate=${MESH_GATE}" >> $GITHUB_OUTPUT
+          echo "images_gate=${IMAGES_GATE}" >> $GITHUB_OUTPUT
+
+          if [[ "$RELEASE_GATE" == "success" && "$IMAGES_GATE" == "success" ]]; then
+            echo "all_passed=true" >> $GITHUB_OUTPUT
+            echo "Gates passed: release=$RELEASE_GATE images=$IMAGES_GATE mesh=$MESH_GATE (mesh is optional)"
+          else
+            echo "all_passed=false" >> $GITHUB_OUTPUT
+            echo "::warning::A required gate is not green: release=$RELEASE_GATE images=$IMAGES_GATE mesh=$MESH_GATE. Release will be created as DRAFT."
+          fi
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz*" -exec cp {} release-assets/ \;
+          find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Artifact Keeper ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          draft: ${{ steps.gates.outputs.all_passed != 'true' }}
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
+
+      - name: Notify Windows MSI build
+        if: steps.gates.outputs.all_passed == 'true'
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.WINDOWS_REPO_PAT }}
+          repository: artifact-keeper/artifact-keeper-windows
+          event-type: backend-release
+          client-payload: '{"version": "${{ steps.version.outputs.version }}", "tag": "${{ steps.version.outputs.tag }}"}'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # NOTE: Docker images are published by .github/workflows/docker-publish.yml,
+  # which already triggers on `tags: ['v*']`. We previously had a redundant
+  # `docker-release` job here that re-dispatched docker-publish via
+  # workflow_dispatch after the release was created. That second run
+  # (a) duplicated ~30 minutes of multi-arch build work, and (b) could only
+  # produce inferior tags because workflow_dispatch loses the tag context
+  # required by docker/metadata-action's `type=semver` patterns. Removing it
+  # leaves a single, deterministic publish path: tag push triggers
+  # docker-publish.yml, which now self-verifies the published semver tags
+  # before the run can succeed (see issue #905).
+  # ════════════════════════════════════════════════════════════════════════════

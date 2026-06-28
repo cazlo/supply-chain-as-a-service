@@ -1,0 +1,4378 @@
+//! npm Registry API handlers.
+//!
+//! Implements the endpoints required for `npm publish` and `npm install`.
+//!
+//! Routes are mounted at `/npm/{repo_key}/...`:
+//!   GET  /npm/{repo_key}/{package}                    - Get package metadata (packument)
+//!   GET  /npm/{repo_key}/{@scope}/{package}           - Get scoped package metadata
+//!   GET  /npm/{repo_key}/{package}/{version}          - Get version-specific metadata
+//!   GET  /npm/{repo_key}/{@scope}/{package}/{version} - Get scoped version-specific metadata
+//!   GET  /npm/{repo_key}/{package}/-/{filename}       - Download tarball
+//!   GET  /npm/{repo_key}/{@scope}/{package}/-/{filename} - Download scoped tarball
+//!   PUT  /npm/{repo_key}/{package}                    - Publish package
+//!   PUT  /npm/{repo_key}/{@scope}/{package}           - Publish scoped package
+
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::Extension;
+use axum::Router;
+use base64::Engine;
+use bytes::Bytes;
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use tracing::{debug, info};
+
+use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::middleware::auth::AuthExtension;
+use crate::api::SharedState;
+use crate::error::AppError;
+use crate::models::repository::RepositoryType;
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+pub fn router() -> Router<SharedState> {
+    Router::new()
+        // Security advisories bulk lookup (npm audit): POST /npm/{repo_key}/-/npm/v1/security/advisories/bulk
+        // Quick audit (older npm versions / yarn): POST /npm/{repo_key}/-/npm/v1/security/audits/quick
+        // These literal-segment routes must precede the `:package` catch-alls
+        // below so axum matches them first. See issue #1400.
+        .route(
+            "/:repo_key/-/npm/v1/security/advisories/bulk",
+            post(security_advisories_bulk),
+        )
+        .route(
+            "/:repo_key/-/npm/v1/security/audits/quick",
+            post(security_audits_quick),
+        )
+        // dist-tags (npm dist-tag ls/add/rm + `npm install pkg@<tag>` resolution).
+        // npm percent-encodes scoped names here (`@scope%2Fname`), so a single
+        // `:package` segment captures both scoped and unscoped. Literal `-/package`
+        // keeps these ahead of the `:package` catch-alls (see issue #1543).
+        .route(
+            "/:repo_key/-/package/:package/dist-tags",
+            get(dist_tags_get),
+        )
+        .route(
+            "/:repo_key/-/package/:package/dist-tags/:tag",
+            put(dist_tags_put).delete(dist_tags_delete),
+        )
+        // npm /-/ meta namespace: GET /npm/{repo_key}/-/*rest
+        //
+        // The npm registry protocol reserves `/-/` as a meta namespace for
+        // registry-level operations (ping, whoami, search, login, audit, etc.).
+        // Without an explicit catch-all here, requests like `/-/ping` fall into
+        // the `/:package/:version` catch-all with `package="-"` and
+        // `version="ping"`, producing a spurious 404 ("Version 'ping' not found
+        // for package '-'"). This route must appear before every `:package`
+        // catch-all so axum resolves it first. More specific `/-/…` routes
+        // registered above (audit endpoints, dist-tags) continue to shadow this
+        // wildcard because axum prefers literal segments over `*` wildcards.
+        // See the filed issue for the full reproducer and impact analysis.
+        .route("/:repo_key/-/*rest", get(npm_meta_get))
+        // Scoped package tarball: GET /npm/{repo_key}/@{scope}/{package}/-/{filename}
+        .route(
+            "/:repo_key/@:scope/:package/-/:filename",
+            get(download_scoped_tarball),
+        )
+        // Scoped version metadata: GET /npm/{repo_key}/@{scope}/{package}/{version}
+        .route(
+            "/:repo_key/@:scope/:package/:version",
+            get(get_scoped_version_metadata),
+        )
+        // Scoped package metadata / publish: GET/PUT /npm/{repo_key}/@{scope}/{package}
+        .route(
+            "/:repo_key/@:scope/:package",
+            get(get_scoped_metadata).put(publish_scoped),
+        )
+        // Unscoped package tarball: GET /npm/{repo_key}/{package}/-/{filename}
+        .route("/:repo_key/:package/-/:filename", get(download_tarball))
+        // Unscoped version metadata: GET /npm/{repo_key}/{package}/{version}
+        .route("/:repo_key/:package/:version", get(get_version_metadata))
+        // Unscoped package metadata / publish: GET/PUT /npm/{repo_key}/{package}
+        .route("/:repo_key/:package", get(get_metadata).put(publish))
+}
+
+use crate::api::middleware::auth::require_auth_with_bearer_fallback;
+
+// ---------------------------------------------------------------------------
+// Package name normalization
+// ---------------------------------------------------------------------------
+
+/// Normalize an npm package name by URL-decoding any percent-encoded characters.
+///
+/// npm and yarn clients often encode scoped package names in URLs, turning
+/// `@openai/codex` into `@openai%2Fcodex` or `%40openai%2fcodex`. Axum's
+/// `Path` extractor usually decodes these, but we apply an explicit decode as
+/// a safety net so the name always reaches the database and upstream proxy in
+/// its canonical form (e.g. `@openai/codex`).
+fn normalize_package_name(raw: &str) -> String {
+    urlencoding::decode(raw)
+        .map(|cow| cow.into_owned())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// Validate a decoded npm package name.
+///
+/// Rejects names with path traversal sequences, null bytes, and names that
+/// violate the npm naming rules (empty, too long, leading dot/underscore,
+/// non-lowercase for unscoped packages). Called after URL decoding to catch
+/// percent-encoded attacks like `%2e%2e%2f`.
+#[allow(clippy::result_large_err)]
+fn validate_package_name(name: &str) -> Result<(), Response> {
+    if name.is_empty() {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Package name cannot be empty",
+        ));
+    }
+    if name.len() > 214 {
+        return Err(map_status(StatusCode::BAD_REQUEST, "Package name too long"));
+    }
+    if name.contains('\0') {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Package name contains null bytes",
+        ));
+    }
+    // After decoding, the only slash allowed is the single scope separator
+    // in scoped packages (@scope/pkg). Reject traversal sequences.
+    if name.contains("..") {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Package name contains path traversal",
+        ));
+    }
+    // Unscoped names must not contain slashes at all
+    if !name.starts_with('@') && name.contains('/') {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Unscoped package name contains '/'",
+        ));
+    }
+    // Scoped names must have exactly one slash
+    if let Some(rest) = name.strip_prefix('@') {
+        if rest.matches('/').count() != 1 {
+            return Err(map_status(
+                StatusCode::BAD_REQUEST,
+                "Scoped package name must have exactly one '/'",
+            ));
+        }
+    }
+    if name.starts_with('.') || name.starts_with('_') {
+        return Err(map_status(
+            StatusCode::BAD_REQUEST,
+            "Package name cannot start with '.' or '_'",
+        ));
+    }
+    Ok(())
+}
+
+fn map_status(status: StatusCode, msg: &str) -> Response {
+    (status, axum::Json(serde_json::json!({"error": msg}))).into_response()
+}
+
+/// Encode a package name for use in upstream registry URLs.
+///
+/// Scoped packages like `@openai/codex` must be sent to upstream registries
+/// with the scope separator encoded: `@openai%2Fcodex`. The public npm
+/// registry accepts both forms, but private registries (Nexus, Verdaccio,
+/// GitHub Packages) often require the encoded form. Unscoped packages are
+/// returned unchanged.
+fn encode_package_name_for_upstream(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('@') {
+        if let Some((scope, pkg)) = rest.split_once('/') {
+            return format!("@{}%2F{}", scope, pkg);
+        }
+    }
+    name.to_string()
+}
+
+/// Build the upstream tarball path for a (possibly scoped) package.
+///
+/// Unlike the metadata endpoint, the npm tarball URL keeps the scope
+/// separator as a literal `/`: `@scope/pkg/-/pkg-1.0.0.tgz`. The public
+/// registry and AK's own scoped-tarball route
+/// (`/:repo_key/@:scope/:package/-/:filename`) both expect `@scope` and
+/// `pkg` as separate path segments. Percent-encoding the slash here (as
+/// `encode_package_name_for_upstream` does for metadata) collapses them into
+/// a single `@scope%2Fpkg` segment, which no upstream tarball route matches,
+/// so the proxy fetch 404s (B7). The scope separator must therefore stay
+/// un-encoded for tarballs even though metadata requires `%2F`.
+fn build_tarball_upstream_path(package_name: &str, filename: &str) -> String {
+    format!("{}/-/{}", package_name, filename)
+}
+
+// ---------------------------------------------------------------------------
+// Repository resolution
+// ---------------------------------------------------------------------------
+
+async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["npm", "yarn", "pnpm", "bower"], "an npm")
+        .await
+}
+
+// ---------------------------------------------------------------------------
+// npm security advisories (npm audit) -- issue #1400
+// ---------------------------------------------------------------------------
+
+/// Build the empty `advisories/bulk` response shape that npm clients expect
+/// when no advisories are known for any of the requested packages. An empty
+/// JSON object signals "no advisories" without producing a parse error.
+fn empty_advisories_bulk_response() -> Response {
+    build_json_metadata_response(serde_json::Value::Object(serde_json::Map::new()).to_string())
+}
+
+/// Build the empty `audits/quick` response shape for the legacy npm audit
+/// endpoint. Returns a well-formed report with zero vulnerabilities so older
+/// npm and yarn clients treat the audit as a success rather than failing the
+/// command.
+fn empty_audits_quick_response() -> Response {
+    let body = serde_json::json!({
+        "actions": [],
+        "advisories": {},
+        "muted": [],
+        "metadata": {
+            "vulnerabilities": {
+                "info": 0,
+                "low": 0,
+                "moderate": 0,
+                "high": 0,
+                "critical": 0,
+            },
+            "dependencies": 0,
+            "devDependencies": 0,
+            "optionalDependencies": 0,
+            "totalDependencies": 0,
+        }
+    });
+    build_json_metadata_response(body.to_string())
+}
+
+/// Forward an npm audit POST request to the configured upstream registry.
+///
+/// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
+/// whichever upstream is configured) so `npm audit` works for cached/mirrored
+/// dependencies. The full client body is forwarded verbatim. On any upstream
+/// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
+/// well-formed response so the audit degrades gracefully instead of failing
+/// the client command. See issue #1400.
+async fn proxy_npm_audit_post(
+    upstream_url: &str,
+    path: &str,
+    body: Bytes,
+    empty_fallback: fn() -> Response,
+) -> Response {
+    let base = upstream_url.trim_end_matches('/');
+    let url = format!("{}{}", base, path);
+    let client = crate::services::http_client::default_client();
+    let req = client
+        .post(&url)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body);
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            match resp.bytes().await {
+                Ok(bytes) => {
+                    if !status.is_success() {
+                        debug!(
+                            target: "npm_audit",
+                            upstream = %url,
+                            status = %status,
+                            "npm audit upstream returned non-success; serving empty advisories"
+                        );
+                        return empty_fallback();
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, content_type)
+                        .body(Body::from(bytes))
+                        .unwrap_or_else(|_| empty_fallback())
+                }
+                Err(err) => {
+                    debug!(
+                        target: "npm_audit",
+                        upstream = %url,
+                        error = %err,
+                        "failed to read npm audit upstream body; serving empty advisories"
+                    );
+                    empty_fallback()
+                }
+            }
+        }
+        Err(err) => {
+            debug!(
+                target: "npm_audit",
+                upstream = %url,
+                error = %err,
+                "failed to reach npm audit upstream; serving empty advisories"
+            );
+            empty_fallback()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// npm /-/ meta namespace — GET handler
+// ---------------------------------------------------------------------------
+
+/// Forward a GET request to the upstream registry at the given meta path.
+///
+/// Returns the upstream status + body verbatim. On any transport error (DNS,
+/// TLS, timeout) returns `None` so the caller can fall through to the local
+/// fallback.
+async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Response> {
+    let base = upstream_url.trim_end_matches('/');
+    // Reconstruct the `/-/<rest>` meta path. axum 0.7 wildcard captures do NOT
+    // include a leading slash (`*rest` on `/-/ping` yields `ping`, not `/ping`),
+    // so prepend `/-/` and strip any stray leading slash to be robust either way.
+    let path_with_dash = format!("/-/{}", meta_path.trim_start_matches('/'));
+    let url = format!("{}{}", base, path_with_dash);
+    let client = crate::services::http_client::default_client();
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            debug!(
+                target: "npm_meta",
+                upstream = %url,
+                error = %err,
+                "npm meta GET upstream unreachable"
+            );
+            return None;
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    match resp.bytes().await {
+        Ok(bytes) => Some(
+            Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, content_type)
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
+                }),
+        ),
+        Err(err) => {
+            debug!(
+                target: "npm_meta",
+                upstream = %url,
+                error = %err,
+                "npm meta GET failed to read upstream body"
+            );
+            None
+        }
+    }
+}
+
+/// Handler for `GET /npm/{repo_key}/-/*rest`.
+///
+/// Implements the npm registry `/-/<endpoint>` meta namespace:
+///
+/// - **Remote / Virtual repos** — forwards the request transparently to the
+///   configured upstream (or the first reachable Remote member, for Virtual).
+///   This is the correct behaviour for proxy/group repos: the upstream already
+///   handles these endpoints correctly, so AK acts as a pass-through.
+///
+/// - **Local / Staging repos** — the registry is self-contained; no upstream
+///   to forward to. Minimal built-in responses:
+///   - `/-/ping` → `200 {}` (standard liveness probe)
+///   - `/-/whoami` → `200 {"username":"<name>"}` when authenticated,
+///     `401 {"error":"unauthenticated"}` otherwise
+///   - All other `/-/` paths → `501 Not Implemented`
+///
+/// Without this route, the `/:package/:version` catch-all previously matched
+/// `/-/ping` with `package="-"` and `version="ping"`, producing a confusing
+/// 404 ("Version 'ping' not found for package '-'"). See the linked issue.
+async fn npm_meta_get(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, rest)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+
+    // Remote: proxy the whole request to upstream verbatim.
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(ref upstream_url) = repo.upstream_url {
+            if let Some(resp) = proxy_npm_meta_get(upstream_url, &rest).await {
+                return Ok(resp);
+            }
+        }
+        // Upstream misconfigured or unreachable — fall through to local stub.
+    }
+
+    // Virtual: try the first Remote member whose upstream is reachable.
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        for member in &members {
+            if member.repo_type != RepositoryType::Remote {
+                continue;
+            }
+            let Some(ref upstream_url) = member.upstream_url else {
+                continue;
+            };
+            if let Some(resp) = proxy_npm_meta_get(upstream_url, &rest).await {
+                return Ok(resp);
+            }
+        }
+        // No reachable Remote member — fall through to local stub.
+    }
+
+    // Local / Staging (or Remote/Virtual without a reachable upstream):
+    // serve minimal built-in responses for the standard meta endpoints.
+    let endpoint = rest.trim_start_matches('/');
+
+    if endpoint == "ping" {
+        return Ok(build_json_metadata_response("{}".to_string()));
+    }
+
+    if endpoint == "whoami" {
+        return match auth {
+            Some(a) => Ok(build_json_metadata_response(
+                serde_json::json!({"username": a.username}).to_string(),
+            )),
+            None => Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "unauthenticated"})),
+            )
+                .into_response()),
+        };
+    }
+
+    // All other /-/ endpoints are not implemented for local repos.
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        axum::Json(
+            serde_json::json!({"error": format!("/-/{} is not implemented for local repositories", endpoint)}),
+        ),
+    )
+        .into_response())
+}
+
+/// Handler for `POST /npm/{repo_key}/-/npm/v1/security/advisories/bulk`.
+///
+/// This endpoint is used by `npm audit` (npm >= 7) to look up known security
+/// advisories for the dependency graph. Remote repositories forward the
+/// request to the configured upstream registry. Local, Staging, and Virtual
+/// repositories return an empty advisory map so `npm audit` reports zero
+/// vulnerabilities instead of failing with a 404. See issue #1400.
+async fn security_advisories_bulk(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(ref upstream_url) = repo.upstream_url {
+            return Ok(proxy_npm_audit_post(
+                upstream_url,
+                "/-/npm/v1/security/advisories/bulk",
+                body,
+                empty_advisories_bulk_response,
+            )
+            .await);
+        }
+    }
+
+    Ok(empty_advisories_bulk_response())
+}
+
+/// Handler for `POST /npm/{repo_key}/-/npm/v1/security/audits/quick`.
+///
+/// Legacy npm audit endpoint (npm v6) and the path some yarn versions use.
+/// Same Remote-proxy / empty-fallback behaviour as the bulk endpoint above.
+/// See issue #1400.
+async fn security_audits_quick(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(ref upstream_url) = repo.upstream_url {
+            return Ok(proxy_npm_audit_post(
+                upstream_url,
+                "/-/npm/v1/security/audits/quick",
+                body,
+                empty_audits_quick_response,
+            )
+            .await);
+        }
+    }
+
+    Ok(empty_audits_quick_response())
+}
+
+// ---------------------------------------------------------------------------
+// GET metadata handlers
+// ---------------------------------------------------------------------------
+
+async fn get_metadata(
+    State(state): State<SharedState>,
+    Path((repo_key, package)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+    get_package_metadata(&state, &repo_key, &package, &headers).await
+}
+
+async fn get_scoped_metadata(
+    State(state): State<SharedState>,
+    Path((repo_key, scope, package)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let scope = normalize_package_name(&scope);
+    let package = normalize_package_name(&package);
+    let full_name = format!("@{}/{}", scope, package);
+    validate_package_name(&full_name)?;
+    get_package_metadata(&state, &repo_key, &full_name, &headers).await
+}
+
+async fn get_version_metadata(
+    State(state): State<SharedState>,
+    Path((repo_key, package, version)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+    get_package_version_metadata(&state, &repo_key, &package, &version, &headers).await
+}
+
+async fn get_scoped_version_metadata(
+    State(state): State<SharedState>,
+    Path((repo_key, scope, package, version)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let scope = normalize_package_name(&scope);
+    let package = normalize_package_name(&package);
+    let full_name = format!("@{}/{}", scope, package);
+    validate_package_name(&full_name)?;
+    get_package_version_metadata(&state, &repo_key, &full_name, &version, &headers).await
+}
+
+/// Minimal artifact info needed to construct npm package metadata.
+struct NpmMetadataArtifact {
+    path: String,
+    version: Option<String>,
+    checksum_sha256: String,
+    metadata: Option<serde_json::Value>,
+}
+
+/// Build an npm package metadata JSON response from a set of artifacts.
+///
+/// `repo_key` should be the key visible to the client (the virtual repo key
+/// when serving through a virtual repository, or the repo's own key otherwise).
+#[allow(clippy::result_large_err)]
+fn build_npm_metadata_response(
+    artifacts: &[NpmMetadataArtifact],
+    package_name: &str,
+    base_url: &str,
+    repo_key: &str,
+    stored_dist_tags: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Response, Response> {
+    let mut versions = serde_json::Map::new();
+    let mut version_list: Vec<String> = Vec::new();
+
+    for artifact in artifacts {
+        let version = match &artifact.version {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+
+        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+
+        let tarball_url = format!(
+            "{}/npm/{}/{}/-/{}",
+            base_url, repo_key, package_name, filename
+        );
+
+        let version_metadata = artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("version_data").cloned())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let mut version_obj = if version_metadata.is_object() {
+            version_metadata
+        } else {
+            serde_json::json!({})
+        };
+
+        let obj = version_obj.as_object_mut().unwrap();
+        obj.entry("name".to_string())
+            .or_insert_with(|| serde_json::Value::String(package_name.to_string()));
+        obj.entry("version".to_string())
+            .or_insert_with(|| serde_json::Value::String(version.clone()));
+
+        let hex = &artifact.checksum_sha256;
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect();
+        let integrity = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
+        obj.insert(
+            "dist".to_string(),
+            serde_json::json!({
+                "tarball": tarball_url,
+                "integrity": integrity,
+            }),
+        );
+
+        versions.insert(version.clone(), version_obj);
+        version_list.push(version);
+    }
+
+    // Emit the stored dist-tags map verbatim, then ensure a usable `latest`:
+    // keep an explicit `latest` that still resolves to a known version,
+    // otherwise derive it as the highest non-prerelease semver (issue #1543).
+    let mut dist_tags = stored_dist_tags.clone();
+    let latest_resolves = dist_tags
+        .get("latest")
+        .and_then(|v| v.as_str())
+        .map(|l| version_list.iter().any(|v| v == l))
+        .unwrap_or(false);
+    if !latest_resolves {
+        if let Some(latest) = derive_latest_version(&version_list) {
+            dist_tags.insert("latest".to_string(), serde_json::Value::String(latest));
+        }
+    }
+
+    let response = serde_json::json!({
+        "name": package_name,
+        "versions": versions,
+        "dist-tags": serde_json::Value::Object(dist_tags),
+    });
+
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&response).unwrap(),
+    ))
+}
+
+/// Choose the `latest` dist-tag for a set of versions when none is recorded.
+///
+/// Per npm convention `latest` should be the highest **non-prerelease** semver,
+/// never auto-set to a prerelease by recency. We compare on the numeric
+/// `major.minor.patch` core (build metadata and prerelease suffixes are
+/// stripped); a version carrying a `-prerelease` suffix is excluded from the
+/// stable candidates. Falls back to the highest version overall when every
+/// version is a prerelease, and to the last (most-recently-created) version
+/// when nothing parses as semver. Returns `None` only for an empty input.
+fn derive_latest_version(versions: &[String]) -> Option<String> {
+    // Parse into (major, minor, patch, is_prerelease); `None` if not semver-ish.
+    fn parse(v: &str) -> Option<(u64, u64, u64, bool)> {
+        let core = v.split('+').next().unwrap_or(v); // drop +build metadata
+        let (mmp, is_pre) = match core.split_once('-') {
+            Some((head, _pre)) => (head, true),
+            None => (core, false),
+        };
+        let mut parts = mmp.split('.');
+        let major = parts.next()?.parse::<u64>().ok()?;
+        let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+        let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+        Some((major, minor, patch, is_pre))
+    }
+
+    let mut best_stable: Option<(&String, (u64, u64, u64))> = None;
+    let mut best_any: Option<(&String, (u64, u64, u64))> = None;
+    for v in versions {
+        if let Some((major, minor, patch, is_pre)) = parse(v) {
+            let key = (major, minor, patch);
+            // Prefer the later-listed (more recent) version on ties.
+            if best_any.as_ref().map_or(true, |(_, k)| key >= *k) {
+                best_any = Some((v, key));
+            }
+            if !is_pre && best_stable.as_ref().map_or(true, |(_, k)| key >= *k) {
+                best_stable = Some((v, key));
+            }
+        }
+    }
+
+    best_stable
+        .map(|(v, _)| v.clone())
+        .or_else(|| best_any.map(|(v, _)| v.clone()))
+        .or_else(|| versions.last().cloned())
+}
+
+/// Fetch the stored npm dist-tags map for a package from the `npm_dist_tags`
+/// table, which holds exactly one row per (repository_id, name). Best-effort:
+/// returns an empty map when there is no row, no tags, or on any query error
+/// (the caller still derives a `latest` from the versions).
+async fn fetch_npm_dist_tags(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    package_name: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    // PRIMARY KEY (repository_id, name) guarantees at most one row, so
+    // fetch_optional is safe here (unlike a per-version `packages` read).
+    let stored: Option<serde_json::Value> = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT tags FROM npm_dist_tags WHERE repository_id = $1 AND name = $2",
+    )
+    .bind(repository_id)
+    .bind(package_name)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    stored
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Fetch all non-deleted artifacts for a given package from a single repository,
+/// returning them as `NpmMetadataArtifact` values. Used by both the virtual
+/// member loop and the local/staged repo fallback to avoid duplicating the
+/// query and row-mapping logic.
+async fn fetch_npm_artifacts(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    package_name: &str,
+) -> Result<Vec<NpmMetadataArtifact>, Response> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               a.storage_key, a.created_at,
+               am.metadata as "metadata?"
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND a.name = $2
+        ORDER BY a.created_at ASC
+        "#,
+        repository_id,
+        package_name
+    )
+    .fetch_all(db)
+    .await
+    .map_err(map_db_err)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|a| NpmMetadataArtifact {
+            path: a.path,
+            version: a.version,
+            checksum_sha256: a.checksum_sha256,
+            metadata: a.metadata,
+        })
+        .collect())
+}
+
+/// Build and return the npm package metadata JSON for all versions.
+async fn get_package_metadata(
+    state: &SharedState,
+    repo_key: &str,
+    package_name: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let base_url = proxy_helpers::request_base_url(headers);
+
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+
+    // For remote repos, always proxy metadata from upstream. Cached tarball
+    // artifacts do not contain enough information to reconstruct the full
+    // package metadata that npm clients expect.
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(ref upstream_url) = repo.upstream_url {
+            if let Some(ref proxy) = state.proxy_service {
+                let encoded_name = encode_package_name_for_upstream(package_name);
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    &encoded_name,
+                )
+                .await?;
+
+                return Ok(rewrite_and_respond(
+                    content,
+                    content_type,
+                    &base_url,
+                    repo_key,
+                ));
+            }
+        }
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
+    }
+
+    // For virtual repos, iterate through members in priority order.
+    // Local/Staging members are checked first (query DB for artifacts),
+    // then Remote members are proxied from upstream. First match wins.
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+        if members.is_empty() {
+            return Err(
+                AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
+            );
+        }
+
+        for member in &members {
+            // For Local/Staging members, query artifacts from the DB.
+            if member.repo_type == RepositoryType::Local
+                || member.repo_type == RepositoryType::Staging
+            {
+                let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
+                if !meta.is_empty() {
+                    let dist_tags = fetch_npm_dist_tags(&state.db, member.id, package_name).await;
+                    return build_npm_metadata_response(
+                        &meta,
+                        package_name,
+                        &base_url,
+                        repo_key,
+                        &dist_tags,
+                    );
+                }
+                continue;
+            }
+
+            // For Remote members, proxy metadata from upstream.
+            if member.repo_type != RepositoryType::Remote {
+                continue;
+            }
+            let Some(ref upstream_url) = member.upstream_url else {
+                continue;
+            };
+            let Some(ref proxy) = state.proxy_service else {
+                continue;
+            };
+
+            let encoded_name = encode_package_name_for_upstream(package_name);
+            let result = proxy_helpers::proxy_fetch(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                &encoded_name,
+            )
+            .await;
+
+            match result {
+                Ok((content, content_type)) => {
+                    return Ok(rewrite_and_respond(
+                        content,
+                        content_type,
+                        &base_url,
+                        repo_key,
+                    ));
+                }
+                Err(_e) => {
+                    debug!(
+                        member_key = %member.key,
+                        "npm metadata proxy fetch missed for virtual member"
+                    );
+                }
+            }
+        }
+
+        return Err(
+            AppError::NotFound("Package not found in any member repository".to_string())
+                .into_response(),
+        );
+    }
+
+    // For local/staged repos, build metadata from stored artifacts
+    let meta_artifacts = fetch_npm_artifacts(&state.db, repo.id, package_name).await?;
+
+    if meta_artifacts.is_empty() {
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
+    }
+
+    let dist_tags = fetch_npm_dist_tags(&state.db, repo.id, package_name).await;
+    build_npm_metadata_response(
+        &meta_artifacts,
+        package_name,
+        &base_url,
+        repo_key,
+        &dist_tags,
+    )
+}
+
+/// Fetch the full packument and extract a single version's metadata.
+///
+/// For remote and virtual repos the full packument is fetched from upstream
+/// (or the first matching member) and parsed as JSON. For local/staging repos
+/// the packument is built from stored artifacts. In either case the
+/// `versions[version]` object is extracted and returned. Returns 404 when
+/// the package exists but does not contain the requested version.
+async fn get_package_version_metadata(
+    state: &SharedState,
+    repo_key: &str,
+    package_name: &str,
+    version: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let base_url = proxy_helpers::request_base_url(headers);
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+
+    // Build or fetch the full packument as a JSON value.
+    let packument: serde_json::Value = if repo.repo_type == RepositoryType::Remote {
+        fetch_remote_packument(state, &repo, repo_key, package_name, &base_url).await?
+    } else if repo.repo_type == RepositoryType::Virtual {
+        fetch_virtual_packument(state, &repo, repo_key, package_name, &base_url).await?
+    } else {
+        let artifacts = fetch_npm_artifacts(&state.db, repo.id, package_name).await?;
+        if artifacts.is_empty() {
+            return Err(AppError::NotFound("Package not found".to_string()).into_response());
+        }
+        // Version extraction ignores dist-tags; pass an empty map.
+        let resp = build_npm_metadata_response(
+            &artifacts,
+            package_name,
+            &base_url,
+            repo_key,
+            &serde_json::Map::new(),
+        )?;
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to read packument body: {}", e)).into_response()
+            })?;
+        serde_json::from_slice(&body_bytes).map_err(|e| {
+            AppError::Internal(format!("Failed to parse packument JSON: {}", e)).into_response()
+        })?
+    };
+
+    // Extract the requested version from the packument.
+    let version_obj = packument
+        .get("versions")
+        .and_then(|v| v.get(version))
+        .cloned()
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "Version '{}' not found for package '{}'",
+                version, package_name
+            ))
+            .into_response()
+        })?;
+
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&version_obj).unwrap(),
+    ))
+}
+
+/// Fetch the full packument JSON from a remote repository's upstream.
+async fn fetch_remote_packument(
+    state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+) -> Result<serde_json::Value, Response> {
+    let upstream_url = repo
+        .upstream_url
+        .as_deref()
+        .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
+    let proxy = state
+        .proxy_service
+        .as_ref()
+        .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
+    let encoded_name = encode_package_name_for_upstream(package_name);
+    let (content, _ct) =
+        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &encoded_name).await?;
+    let mut json: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
+        AppError::Internal(format!("Invalid JSON from upstream: {}", e)).into_response()
+    })?;
+    rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+    Ok(json)
+}
+
+/// Fetch the full packument JSON by iterating virtual repo members.
+async fn fetch_virtual_packument(
+    state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+) -> Result<serde_json::Value, Response> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+    if members.is_empty() {
+        return Err(
+            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
+        );
+    }
+
+    for member in &members {
+        if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
+        {
+            let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
+            if !meta.is_empty() {
+                let resp = build_npm_metadata_response(
+                    &meta,
+                    package_name,
+                    base_url,
+                    repo_key,
+                    &serde_json::Map::new(),
+                )?;
+                let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+                    .await
+                    .map_err(|e| {
+                        AppError::Internal(format!("Failed to read packument body: {}", e))
+                            .into_response()
+                    })?;
+                return serde_json::from_slice(&body_bytes).map_err(|e| {
+                    AppError::Internal(format!("Failed to parse packument JSON: {}", e))
+                        .into_response()
+                });
+            }
+            continue;
+        }
+
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let Some(ref upstream_url) = member.upstream_url else {
+            continue;
+        };
+        let Some(ref proxy) = state.proxy_service else {
+            continue;
+        };
+
+        let encoded_name = encode_package_name_for_upstream(package_name);
+        let result =
+            proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, &encoded_name)
+                .await;
+
+        match result {
+            Ok((content, _ct)) => {
+                let mut json: serde_json::Value =
+                    serde_json::from_slice(&content).map_err(|e| {
+                        AppError::Internal(format!("Invalid JSON from upstream: {}", e))
+                            .into_response()
+                    })?;
+                rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+                return Ok(json);
+            }
+            Err(_e) => {
+                debug!(
+                    member_key = %member.key,
+                    "npm metadata proxy fetch missed for virtual member"
+                );
+            }
+        }
+    }
+
+    Err(
+        AppError::NotFound("Package not found in any member repository".to_string())
+            .into_response(),
+    )
+}
+
+/// Content type for npm tarballs (.tgz). npm packages are always gzip-compressed
+/// tar archives. Upstream registries (including npmjs.org) sometimes serve these
+/// as `application/octet-stream`, but the correct MIME type is `application/gzip`.
+/// Using the right content type is important because downstream services (SBOM
+/// generation, Trivy, Grype) rely on it to decide how to extract and scan the
+/// artifact contents.
+const NPM_TARBALL_CONTENT_TYPE: &str = "application/gzip";
+
+/// Build an HTTP response for an npm tarball download.
+///
+/// All three download paths (remote, virtual, local) return the same response
+/// shape: the tarball bytes with `application/gzip` content type, a
+/// `Content-Disposition` attachment header, and the content length. This helper
+/// eliminates the repeated response-builder blocks.
+fn build_tarball_response(
+    content: Bytes,
+    filename: &str,
+    content_type: Option<String>,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            content_type.unwrap_or_else(|| NPM_TARBALL_CONTENT_TYPE.to_string()),
+        )
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, content.len().to_string())
+        .body(Body::from(content))
+        .unwrap()
+}
+
+/// Build a streaming tarball response from a storage stream.
+fn build_tarball_response_stream(
+    stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    filename: &str,
+    content_type: Option<String>,
+    content_length: Option<u64>,
+) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            content_type.unwrap_or_else(|| NPM_TARBALL_CONTENT_TYPE.to_string()),
+        )
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        );
+    if let Some(len) = content_length {
+        builder = builder.header(CONTENT_LENGTH, len.to_string());
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
+}
+
+/// Decide the `Content-Type` for an npm tarball served from a Virtual repo.
+///
+/// Virtual downloads are satisfied by a member repo's proxy-cache, and the
+/// sidecar records whatever content type the upstream sent — for npm that is
+/// frequently `application/octet-stream` (and occasionally a bogus
+/// text/HTML type on error pages that slipped into cache). npm tarballs are
+/// always gzip, and downstream SBOM/scanner tooling (Trivy, Grype) keys off
+/// the content type, so the virtual path must normalize to `application/gzip`
+/// just like the direct remote-repo path does. We therefore ignore the cached
+/// content type entirely and always return [`NPM_TARBALL_CONTENT_TYPE`].
+fn npm_virtual_tarball_content_type(_cached: Option<String>) -> Option<String> {
+    Some(NPM_TARBALL_CONTENT_TYPE.to_string())
+}
+
+/// Build an OK response with a given content type and body.
+fn build_ok_response(content_type: &str, body: impl Into<Body>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .body(body.into())
+        .unwrap()
+}
+
+/// Build a JSON response from rewritten npm metadata.
+///
+/// Both the remote and virtual metadata paths rewrite upstream tarball URLs and
+/// return the modified JSON with `application/json` content type.
+fn build_json_metadata_response(json_string: String) -> Response {
+    build_ok_response("application/json", json_string)
+}
+
+/// Try to parse upstream content as JSON, rewrite tarball URLs, and return the
+/// rewritten metadata. Falls back to a raw passthrough if the content is not
+/// valid JSON. Used by both the remote and virtual metadata paths.
+fn rewrite_and_respond(
+    content: Bytes,
+    content_type: Option<String>,
+    base_url: &str,
+    repo_key: &str,
+) -> Response {
+    if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content) {
+        rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+        let rewritten = serde_json::to_string(&json).unwrap_or_default();
+        return build_json_metadata_response(rewritten);
+    }
+    // Not valid JSON: pass through with the original content type
+    let ct = content_type.unwrap_or_else(|| "application/json".to_string());
+    build_ok_response(&ct, content)
+}
+
+// ---------------------------------------------------------------------------
+// GET tarball download handlers
+// ---------------------------------------------------------------------------
+
+async fn download_tarball(
+    State(state): State<SharedState>,
+    Path((repo_key, package, filename)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+    serve_tarball(&state, &repo_key, &package, &filename).await
+}
+
+async fn download_scoped_tarball(
+    State(state): State<SharedState>,
+    Path((repo_key, scope, package, filename)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let scope = normalize_package_name(&scope);
+    let package = normalize_package_name(&package);
+    let full_name = format!("@{}/{}", scope, package);
+    validate_package_name(&full_name)?;
+    serve_tarball(&state, &repo_key, &full_name, &filename).await
+}
+
+/// Fetch an npm tarball from a virtual member's local storage, matching
+/// by the full upstream path or by the package name + filename pattern.
+///
+/// npm tarball filenames strip the scope prefix, so two different packages
+/// can produce the same filename (e.g. `mdurl` and `@types/mdurl` both
+/// produce `mdurl-2.0.0.tgz`). A bare filename suffix match with
+/// `local_fetch_by_path_suffix` can return the wrong package's tarball.
+/// This function narrows the match by checking the upstream proxy path
+/// first (exact match for proxy-cached artifacts), then falling back to
+/// a pattern that includes the decoded package name (for locally published
+/// artifacts).
+async fn npm_local_fetch(
+    db: &PgPool,
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    location: &crate::storage::StorageLocation,
+    upstream_path: &str,
+    package_name: &str,
+    filename: &str,
+) -> Result<proxy_helpers::StreamingFetchResult, Response> {
+    // Try exact path match first (proxy-cached artifacts use the upstream
+    // path verbatim, e.g. "@types/mdurl/-/mdurl-2.0.0.tgz" -- the scope
+    // separator stays un-encoded for tarballs; see
+    // `build_tarball_upstream_path`).
+    if let Ok(result) =
+        proxy_helpers::local_fetch_by_path(db, state, repo_id, location, upstream_path).await
+    {
+        return Ok(result);
+    }
+
+    // Fall back to a pattern that anchors the match on the decoded package
+    // name, covering locally published artifacts whose path follows the
+    // layout "{package_name}/{version}/{filename}".
+    //
+    // Escape `%` and `_` from user-supplied package_name and filename so
+    // they're treated as literals; the literal `/%/` separator below
+    // remains a wildcard. ESCAPE '\' on the SQL side selects backslash as
+    // the escape character. See `super::escape_like_literal`.
+    let pkg_path_prefix = format!("{}/%/", super::escape_like_literal(package_name));
+    let filename_escaped = super::escape_like_literal(filename);
+    let artifact = sqlx::query_as::<_, proxy_helpers::LocalArtifactRow>(
+        "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND path LIKE $2 || $3 ESCAPE '\\' AND is_deleted = false \
+         LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(&pkg_path_prefix)
+    .bind(&filename_escaped)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        map_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Database error: {}", e),
+        )
+    })?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    proxy_helpers::check_quarantine_row(&artifact)?;
+
+    let storage = state
+        .storage_for_repo(location)
+        .map_err(|e| e.into_response())?;
+    // Stream the body for the common case, but preserve the #1016 / hydration
+    // contract: a storage miss falls back to the coordinated buffered retry and
+    // is re-wrapped as a one-shot stream so the caller sees a uniform result.
+    let body: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>> =
+        match storage.get_stream(&artifact.storage_key).await {
+            Ok(stream) => stream,
+            Err(crate::error::AppError::NotFound(_)) => {
+                let bytes = proxy_helpers::coordinated_retry_get(
+                    db,
+                    artifact.id,
+                    &artifact.storage_key,
+                    &*storage,
+                )
+                .await?;
+                Box::pin(futures::stream::once(async move { Ok(bytes) }))
+            }
+            Err(e) => return Err(map_storage_err(e)),
+        };
+
+    Ok(proxy_helpers::StreamingFetchResult {
+        body,
+        content_type: Some(artifact.content_type.clone()),
+        content_length: Some(artifact.size_bytes as u64),
+    })
+}
+
+async fn serve_tarball(
+    state: &SharedState,
+    repo_key: &str,
+    package_name: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+
+    // Tarball URLs keep the scope separator as a literal `/`
+    // (`@scope/pkg/-/file.tgz`); only metadata uses `%2F`. Encoding it here
+    // collapsed the scope and package into one path segment that no upstream
+    // tarball route matched, so the remote-proxy fetch 404'd (B7).
+    let upstream_path = build_tarball_upstream_path(package_name, filename);
+
+    // For remote repos, always proxy tarballs from upstream (hits cache if
+    // already fetched). The proxy cache stores content under its own storage
+    // key which the regular artifact storage cannot resolve.
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let (content, _content_type) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path)
+                    .await?;
+
+            // The upstream registry may return application/octet-stream for
+            // npm tarballs, which also gets persisted by the proxy cache.
+            // Correct the cached artifact record so that SBOM generation and
+            // security scanners can identify the file as a gzip archive.
+            correct_cached_tarball_content_type(&state.db, repo.id, &upstream_path).await;
+
+            return Ok(build_tarball_response(content, filename, None));
+        }
+        return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
+    }
+
+    // Virtual repo: try each member in priority order
+    if repo.repo_type == RepositoryType::Virtual {
+        let db = state.db.clone();
+        let upath = upstream_path.clone();
+        let pkg = package_name.to_string();
+        let fname = filename.to_string();
+
+        // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
+        // If a non-Remote member of this Virtual repo owns the npm
+        // package name, block Remote members from satisfying the
+        // download. The `package_name` parameter is the npm-canonical
+        // name (eg. `@types/node` or `lodash`) extracted by the router;
+        // `artifacts.name` stores the same shape, so a direct case-
+        // insensitive comparison is what `virtual_non_remote_owns_name`
+        // performs. Passing `None` to `resolve_virtual_download` is the
+        // load-bearing security primitive: see hex.rs's
+        // `serve_virtual_tarball_local_only` for the rationale on why
+        // any refactor here must keep this `None`.
+        //
+        // Fail-closed: skip the guard for names that fail
+        // `is_valid_npm_name` (path traversal, uppercase, homoglyphs).
+        // Such names cannot reach `artifacts.name` so the guard would
+        // always return false; skipping it spares the DB an existence
+        // check on every malformed request.
+        let local_owns = if crate::formats::npm::is_valid_npm_name(package_name) {
+            proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, package_name).await?
+        } else {
+            false
+        };
+        let proxy_for_virtual = if local_owns {
+            None
+        } else {
+            state.proxy_service.as_deref()
+        };
+
+        let result = proxy_helpers::resolve_virtual_download(
+            &state.db,
+            proxy_for_virtual,
+            repo.id,
+            &upstream_path,
+            |member_id, location| {
+                let db = db.clone();
+                let state = state.clone();
+                let upath = upath.clone();
+                let pkg = pkg.clone();
+                let fname = fname.clone();
+                async move {
+                    npm_local_fetch(&db, &state, member_id, &location, &upath, &pkg, &fname).await
+                }
+            },
+        )
+        .await?;
+
+        // Always serve npm virtual-repo tarballs as `application/gzip`,
+        // overriding whatever content type the proxy-cache sidecar recorded
+        // for the cached member artifact (see `npm_virtual_tarball_content_type`).
+        return Ok(build_tarball_response_stream(
+            result.body,
+            filename,
+            npm_virtual_tarball_content_type(result.content_type),
+            result.content_length,
+        ));
+    }
+
+    // For local/staged repos, find artifact by filename. Include the package
+    // name in the path match to avoid returning a different package's tarball
+    // when two packages share the same filename (e.g. @types/mdurl and mdurl
+    // both produce mdurl-2.0.0.tgz).
+    //
+    // Escape `%` and `_` in user-supplied package_name and filename so they
+    // are treated as literals; the `/%/` separator remains a wildcard.
+    // ESCAPE '\' on the SQL side selects backslash as the escape character.
+    // See `super::escape_like_literal`.
+    let path_pattern = format!(
+        "{}/%/{}",
+        super::escape_like_literal(package_name),
+        super::escape_like_literal(filename)
+    );
+    let artifact = sqlx::query!(
+        r#"
+        SELECT id, path, name, size_bytes, checksum_sha256, storage_key
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+          AND path LIKE $2 ESCAPE '\'
+        LIMIT 1
+        "#,
+        repo.id,
+        path_pattern
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(map_db_err)?;
+
+    let artifact = match artifact {
+        Some(a) => a,
+        None => return Err(AppError::NotFound("Tarball not found".to_string()).into_response()),
+    };
+
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
+    // Read from storage
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let stream = storage
+        .get_stream(&artifact.storage_key)
+        .await
+        .map_err(map_storage_err)?;
+
+    // Record download
+    let _ = sqlx::query!(
+        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+        artifact.id
+    )
+    .execute(&state.db)
+    .await;
+
+    Ok(build_tarball_response_stream(
+        stream,
+        filename,
+        None,
+        Some(artifact.size_bytes as u64),
+    ))
+}
+
+/// Update the content_type of a cached proxy artifact from the incorrect
+/// `application/octet-stream` to `application/gzip`. The upstream npm registry
+/// often serves tarballs with a generic content type, and the proxy cache
+/// stores whatever the upstream returns. This correction ensures that SBOM
+/// generation and security scanners can properly identify and extract the
+/// archive.
+async fn correct_cached_tarball_content_type(db: &PgPool, repository_id: uuid::Uuid, path: &str) {
+    let normalized = path.trim_start_matches('/');
+    let result = sqlx::query!(
+        r#"
+        UPDATE artifacts
+        SET content_type = $1, updated_at = NOW()
+        WHERE repository_id = $2
+          AND path = $3
+          AND content_type != $1
+        "#,
+        NPM_TARBALL_CONTENT_TYPE,
+        repository_id,
+        normalized,
+    )
+    .execute(db)
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            "Failed to correct content_type for cached npm tarball {}: {}",
+            path,
+            e
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PUT publish handlers
+// ---------------------------------------------------------------------------
+
+async fn publish(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+    publish_package(&state, auth, &repo_key, &package, &headers, body).await
+}
+
+async fn publish_scoped(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, scope, package)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let scope = normalize_package_name(&scope);
+    let package = normalize_package_name(&package);
+    let full_name = format!("@{}/{}", scope, package);
+    validate_package_name(&full_name)?;
+    publish_package(&state, auth, &repo_key, &full_name, &headers, body).await
+}
+
+/// Parsed and validated npm publish payload ready for storage.
+struct ParsedNpmPublish {
+    versions: Vec<NpmVersionToPublish>,
+    /// The `dist-tags` object from the publish body (e.g. `{"latest": "1.0.0"}`,
+    /// or `{"next": "2.0.0-rc.1"}` for `npm publish --tag next`).
+    dist_tags: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A single version extracted from the npm publish payload.
+struct NpmVersionToPublish {
+    version: String,
+    version_data: serde_json::Value,
+    tarball_filename: String,
+    tarball_bytes: Vec<u8>,
+    sha256: String,
+}
+
+/// Parse and validate the raw npm publish JSON body into structured data.
+/// Returns an error response if the payload is malformed.
+#[allow(clippy::result_large_err)]
+fn parse_npm_publish_payload(
+    body: &Bytes,
+    package_name: &str,
+) -> Result<ParsedNpmPublish, Response> {
+    let payload: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+        AppError::Validation(format!("Invalid JSON payload: {}", e)).into_response()
+    })?;
+
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(package_name);
+
+    if name != package_name {
+        return Err(AppError::Validation(format!(
+            "Package name mismatch: URL says '{}' but payload says '{}'",
+            package_name, name
+        ))
+        .into_response());
+    }
+
+    let versions_obj = payload
+        .get("versions")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            AppError::Validation("Missing 'versions' in payload".to_string()).into_response()
+        })?;
+
+    let attachments_obj = payload
+        .get("_attachments")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            AppError::Validation("Missing '_attachments' in payload".to_string()).into_response()
+        })?;
+
+    let mut versions = Vec::new();
+    for (version, version_data) in versions_obj {
+        let parsed =
+            extract_version_tarball(package_name, version, version_data.clone(), attachments_obj)?;
+        versions.push(parsed);
+    }
+
+    // npm sends the tag being published in `dist-tags` (default `latest`, or the
+    // value of `--tag <tag>`). Capture it so it can be persisted (issue #1543).
+    let dist_tags = payload
+        .get("dist-tags")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(ParsedNpmPublish {
+        versions,
+        dist_tags,
+    })
+}
+
+/// Extract and decode the tarball for a single version from the attachments map.
+#[allow(clippy::result_large_err)]
+fn extract_version_tarball(
+    package_name: &str,
+    version: &str,
+    version_data: serde_json::Value,
+    attachments_obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<NpmVersionToPublish, Response> {
+    let tarball_filename = if package_name.starts_with('@') {
+        let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
+        format!("{}-{}.tgz", short_name, version)
+    } else {
+        format!("{}-{}.tgz", package_name, version)
+    };
+
+    let attachment_data = attachments_obj
+        .get(&tarball_filename)
+        .or_else(|| attachments_obj.values().next())
+        .ok_or_else(|| {
+            AppError::Validation(format!("No attachment found for version {}", version))
+                .into_response()
+        })?;
+
+    let base64_data = attachment_data
+        .get("data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            AppError::Validation("Missing 'data' in attachment".to_string()).into_response()
+        })?;
+
+    let tarball_bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data)
+        .map_err(|e| AppError::Validation(format!("Invalid base64 data: {}", e)).into_response())?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&tarball_bytes);
+    let sha256 = format!("{:x}", hasher.finalize());
+
+    Ok(NpmVersionToPublish {
+        version: version.to_string(),
+        version_data,
+        tarball_filename,
+        tarball_bytes,
+        sha256,
+    })
+}
+
+/// Store a single npm version: check duplicates, write to storage, insert DB
+/// records, and update the package_versions table.
+#[allow(clippy::too_many_arguments)]
+async fn store_npm_version(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    location: &crate::storage::StorageLocation,
+    package_name: &str,
+    user_id: uuid::Uuid,
+    ver: &NpmVersionToPublish,
+) -> Result<(), Response> {
+    let artifact_path = format!("{}/{}/{}", package_name, ver.version, ver.tarball_filename);
+
+    // Check for duplicate
+    let existing = sqlx::query_scalar!(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        repo_id,
+        artifact_path
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(map_db_err)?;
+
+    if existing.is_some() {
+        return Err(AppError::Conflict(format!(
+            "Version {} of {} already exists",
+            ver.version, package_name
+        ))
+        .into_response());
+    }
+
+    super::cleanup_soft_deleted_artifact(&state.db, repo_id, &artifact_path).await;
+
+    // Store the tarball
+    let storage_key = format!(
+        "npm/{}/{}/{}",
+        package_name, ver.version, ver.tarball_filename
+    );
+    let storage = state.storage_for_repo_or_500(location)?;
+    storage
+        .put(&storage_key, Bytes::from(ver.tarball_bytes.clone()))
+        .await
+        .map_err(map_storage_err)?;
+
+    let size_bytes = ver.tarball_bytes.len() as i64;
+
+    // Insert artifact record
+    let artifact_id = sqlx::query_scalar!(
+        r#"
+        INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
+        "#,
+        repo_id,
+        artifact_path,
+        package_name,
+        ver.version,
+        size_bytes,
+        ver.sha256,
+        "application/gzip",
+        storage_key,
+        user_id,
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(map_db_err)?;
+
+    // Store metadata
+    let npm_metadata = serde_json::json!({
+        "name": package_name,
+        "version": ver.version,
+        "version_data": ver.version_data,
+    });
+
+    let _ = sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'npm', $2) \
+         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
+    )
+    .bind(artifact_id)
+    .bind(&npm_metadata)
+    .execute(&state.db)
+    .await;
+
+    // Populate packages / package_versions tables (best-effort)
+    let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
+    let description = ver
+        .version_data
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    pkg_svc
+        .try_create_or_update_from_artifact(
+            repo_id,
+            package_name,
+            &ver.version,
+            size_bytes,
+            &ver.sha256,
+            description.as_deref(),
+            Some(serde_json::json!({ "format": "npm" })),
+        )
+        .await;
+
+    info!(
+        "npm publish: {} {} ({}) to repo {}",
+        package_name, ver.version, ver.tarball_filename, repo_key
+    );
+
+    Ok(())
+}
+
+/// Handle npm publish. The request body is JSON with versions and base64-encoded attachments.
+async fn publish_package(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    repo_key: &str,
+    package_name: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
+    // `npm publish`. Enforce the write scope before falling through to the
+    // Bearer-fallback helper.
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    let user_id =
+        require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    let parsed = parse_npm_publish_payload(&body, package_name)?;
+
+    for ver in &parsed.versions {
+        store_npm_version(
+            state,
+            repo.id,
+            repo_key,
+            &repo.storage_location(),
+            package_name,
+            user_id,
+            ver,
+        )
+        .await?;
+    }
+
+    // Persist custom dist-tags from the publish body into npm_dist_tags
+    // (one row per repository_id+name; jsonb `||` overwrites matching keys).
+    //
+    // We deliberately DROP `latest` here. A plain `npm publish` always sends
+    // {"latest": "<this version>"}, so persisting it verbatim would pin
+    // `latest` to the just-published version — including a prerelease published
+    // without `--tag` (e.g. `2.0.0-rc.1`), which is exactly the bug #1543
+    // targets. `latest` is computed by semver in build_npm_metadata_response
+    // (highest non-prerelease); an explicit `npm dist-tag add <pkg>@<v> latest`
+    // (dist_tags_put) still sets it deterministically.
+    let mut publish_tags = parsed.dist_tags.clone();
+    publish_tags.remove("latest");
+    if !publish_tags.is_empty() {
+        let tags_value = serde_json::Value::Object(publish_tags);
+        let _ = sqlx::query(
+            "INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3::jsonb) \
+             ON CONFLICT (repository_id, name) DO UPDATE \
+             SET tags = npm_dist_tags.tags || EXCLUDED.tags, updated_at = NOW()",
+        )
+        .bind(repo.id)
+        .bind(package_name)
+        .bind(&tags_value)
+        .execute(&state.db)
+        .await;
+    }
+
+    // Update repository timestamp
+    let _ = sqlx::query!(
+        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
+        repo.id,
+    )
+    .execute(&state.db)
+    .await;
+
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// dist-tags endpoints (`npm dist-tag ls/add/rm`)
+// ---------------------------------------------------------------------------
+
+/// `GET /npm/{repo}/-/package/{pkg}/dist-tags` — list the package's dist-tags.
+///
+/// Delegates to the packument path so local, virtual and remote repos all
+/// resolve consistently, then returns just its `dist-tags` object.
+async fn dist_tags_get(
+    State(state): State<SharedState>,
+    Path((repo_key, package)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+
+    let resp = get_package_metadata(&state, &repo_key, &package, &headers).await?;
+    if !resp.status().is_success() {
+        return Ok(resp);
+    }
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 32 * 1024 * 1024)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Failed to read packument body: {}", e)).into_response()
+        })?;
+    let packument: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        AppError::Internal(format!("Failed to parse packument JSON: {}", e)).into_response()
+    })?;
+    let dist_tags = packument
+        .get("dist-tags")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&dist_tags).unwrap(),
+    ))
+}
+
+/// `PUT /npm/{repo}/-/package/{pkg}/dist-tags/{tag}` — point `tag` at a version
+/// (`npm dist-tag add pkg@ver tag`). The body is a JSON string of the version.
+async fn dist_tags_put(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, tag)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    let _user_id =
+        require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    if tag.is_empty() {
+        return Err(
+            AppError::Validation("dist-tag name must not be empty".to_string()).into_response(),
+        );
+    }
+
+    // Body is a bare JSON string, e.g. "1.2.3".
+    let version = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .ok_or_else(|| {
+            AppError::Validation("dist-tag body must be a JSON version string".to_string())
+                .into_response()
+        })?;
+
+    // The target version must exist in this repo for this package.
+    let existing: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM artifacts \
+         WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false",
+    )
+    .bind(repo.id)
+    .bind(&package)
+    .bind(&version)
+    .fetch_one(&state.db)
+    .await
+    .map_err(map_db_err)?;
+    if existing == 0 {
+        return Err(
+            AppError::NotFound(format!("Version {} of {} not found", version, package))
+                .into_response(),
+        );
+    }
+
+    let mut patch = serde_json::Map::new();
+    patch.insert(tag.clone(), serde_json::Value::String(version));
+    let patch_value = serde_json::Value::Object(patch);
+    // Upsert the (repository_id, name) row — the version-existence check above
+    // already 404s a tag pointed at a nonexistent version, and the package's
+    // dist-tags row may not exist yet (first tag for the package).
+    sqlx::query(
+        "INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3::jsonb) \
+         ON CONFLICT (repository_id, name) DO UPDATE \
+         SET tags = npm_dist_tags.tags || EXCLUDED.tags, updated_at = NOW()",
+    )
+    .bind(repo.id)
+    .bind(&package)
+    .bind(&patch_value)
+    .execute(&state.db)
+    .await
+    .map_err(map_db_err)?;
+
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
+    ))
+}
+
+/// `DELETE /npm/{repo}/-/package/{pkg}/dist-tags/{tag}` — remove a dist-tag.
+/// `latest` cannot be removed (a package must always have a `latest`).
+async fn dist_tags_delete(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package, tag)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    let _user_id =
+        require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    if tag == "latest" {
+        return Err(
+            AppError::Validation("the 'latest' dist-tag cannot be removed".to_string())
+                .into_response(),
+        );
+    }
+
+    let _ = sqlx::query(
+        "UPDATE npm_dist_tags SET tags = tags - $1, updated_at = NOW() \
+         WHERE repository_id = $2 AND name = $3",
+    )
+    .bind(&tag)
+    .bind(repo.id)
+    .bind(&package)
+    .execute(&state.db)
+    .await
+    .map_err(map_db_err)?;
+
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Proxy helpers
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Extracted pure functions for testability
+// ---------------------------------------------------------------------------
+
+/// Rewrite tarball URLs in npm metadata JSON to point to our local instance.
+/// npm metadata contains `versions.{ver}.dist.tarball` pointing to the upstream registry.
+/// We rewrite those to point to `{base_url}/npm/{repo_key}/{package}/-/{filename}`.
+fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_key: &str) {
+    let versions = match json.get_mut("versions").and_then(|v| v.as_object_mut()) {
+        Some(v) => v,
+        None => return,
+    };
+
+    for (_version, version_data) in versions.iter_mut() {
+        // Extract package name before taking mutable borrow on dist
+        let pkg_name = version_data
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("_unknown")
+            .to_string();
+
+        if let Some(dist) = version_data.get_mut("dist") {
+            // Extract the current tarball URL and compute the new one
+            let new_url = dist
+                .get("tarball")
+                .and_then(|t| t.as_str())
+                .and_then(|tarball| {
+                    // e.g., https://registry.npmjs.org/express/-/express-4.18.2.tgz
+                    tarball.rsplit_once("/-/").map(|(_, filename)| {
+                        format!("{}/npm/{}/{}/-/{}", base_url, repo_key, pkg_name, filename)
+                    })
+                });
+
+            if let Some(url) = new_url {
+                if let Some(d) = dist.as_object_mut() {
+                    d.insert("tarball".to_string(), serde_json::Value::String(url));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Extracted pure functions (test-only)
+    // -----------------------------------------------------------------------
+
+    /// Compute npm integrity field from a SHA256 hex digest.
+    fn compute_npm_integrity(sha256_hex: &str) -> String {
+        let bytes: Vec<u8> = (0..sha256_hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&sha256_hex[i..i + 2], 16).ok())
+            .collect();
+        format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        )
+    }
+
+    /// Build the tarball filename for an npm package.
+    fn build_npm_tarball_filename(package_name: &str, version: &str) -> String {
+        if package_name.starts_with('@') {
+            let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
+            format!("{}-{}.tgz", short_name, version)
+        } else {
+            format!("{}-{}.tgz", package_name, version)
+        }
+    }
+
+    /// Build the artifact path for an npm tarball.
+    fn build_npm_artifact_path(
+        package_name: &str,
+        version: &str,
+        tarball_filename: &str,
+    ) -> String {
+        format!("{}/{}/{}", package_name, version, tarball_filename)
+    }
+
+    /// Build the storage key for an npm tarball.
+    fn build_npm_storage_key(package_name: &str, version: &str, tarball_filename: &str) -> String {
+        format!("npm/{}/{}/{}", package_name, version, tarball_filename)
+    }
+
+    /// Build a scoped package name from scope and package.
+    fn build_scoped_package_name(scope: &str, package: &str) -> String {
+        format!("@{}/{}", scope, package)
+    }
+
+    /// Validate an npm package name (basic checks).
+    fn validate_npm_package_name(name: &str) -> std::result::Result<(), String> {
+        if name.is_empty() {
+            return Err("Package name cannot be empty".to_string());
+        }
+        if name.len() > 214 {
+            return Err("Package name cannot exceed 214 characters".to_string());
+        }
+        if name.starts_with('.') || name.starts_with('_') {
+            return Err("Package name cannot start with '.' or '_'".to_string());
+        }
+        if name != name.to_lowercase() && !name.starts_with('@') {
+            return Err("Package name must be lowercase (unless scoped)".to_string());
+        }
+        Ok(())
+    }
+
+    /// Build the npm tarball URL for metadata responses.
+    fn build_npm_tarball_url(
+        base_url: &str,
+        repo_key: &str,
+        package_name: &str,
+        filename: &str,
+    ) -> String {
+        format!(
+            "{}/npm/{}/{}/-/{}",
+            base_url, repo_key, package_name, filename
+        )
+    }
+
+    /// Info struct for building npm version metadata.
+    #[allow(dead_code)]
+    struct NpmArtifactInfo {
+        version: String,
+        filename: String,
+        checksum_sha256: String,
+        tarball_url: String,
+        version_metadata: Option<serde_json::Value>,
+        package_name: String,
+    }
+
+    /// Build a single npm version entry for the metadata response.
+    fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
+        let integrity = compute_npm_integrity(&info.checksum_sha256);
+
+        let mut version_obj = info
+            .version_metadata
+            .as_ref()
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let obj = version_obj.as_object_mut().unwrap();
+        obj.entry("name".to_string())
+            .or_insert_with(|| serde_json::Value::String(info.package_name.clone()));
+        obj.entry("version".to_string())
+            .or_insert_with(|| serde_json::Value::String(info.version.clone()));
+        obj.insert(
+            "dist".to_string(),
+            serde_json::json!({
+                "tarball": info.tarball_url,
+                "integrity": integrity,
+            }),
+        );
+
+        version_obj
+    }
+
+    // -----------------------------------------------------------------------
+    // rewrite_npm_tarball_urls
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_npm_tarball_urls_basic() {
+        let mut json = serde_json::json!({
+            "name": "express",
+            "versions": {
+                "4.18.2": {
+                    "name": "express",
+                    "version": "4.18.2",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/express/-/express-4.18.2.tgz",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }
+        });
+
+        rewrite_npm_tarball_urls(&mut json, "http://localhost:8080", "npm-remote");
+
+        let tarball = json["versions"]["4.18.2"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            tarball,
+            "http://localhost:8080/npm/npm-remote/express/-/express-4.18.2.tgz"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_npm_tarball_urls_scoped_package() {
+        let mut json = serde_json::json!({
+            "name": "@angular/core",
+            "versions": {
+                "17.0.0": {
+                    "name": "@angular/core",
+                    "version": "17.0.0",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/@angular/core/-/core-17.0.0.tgz"
+                    }
+                }
+            }
+        });
+
+        rewrite_npm_tarball_urls(&mut json, "https://my.registry.com", "npm-main");
+
+        let tarball = json["versions"]["17.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            tarball,
+            "https://my.registry.com/npm/npm-main/@angular/core/-/core-17.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_npm_tarball_urls_no_versions() {
+        let mut json = serde_json::json!({
+            "name": "empty-pkg"
+        });
+        // Should not panic
+        rewrite_npm_tarball_urls(&mut json, "http://localhost", "repo");
+        // JSON unchanged
+        assert!(json.get("versions").is_none());
+    }
+
+    #[test]
+    fn test_rewrite_npm_tarball_urls_no_dist() {
+        let mut json = serde_json::json!({
+            "versions": {
+                "1.0.0": {
+                    "name": "no-dist",
+                    "version": "1.0.0"
+                }
+            }
+        });
+        // Should not panic
+        rewrite_npm_tarball_urls(&mut json, "http://localhost", "repo");
+    }
+
+    #[test]
+    fn test_rewrite_npm_tarball_urls_no_tarball_field() {
+        let mut json = serde_json::json!({
+            "versions": {
+                "1.0.0": {
+                    "name": "no-tarball",
+                    "version": "1.0.0",
+                    "dist": {
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }
+        });
+        // Should not panic or modify anything
+        rewrite_npm_tarball_urls(&mut json, "http://localhost", "repo");
+    }
+
+    #[test]
+    fn test_rewrite_npm_tarball_urls_multiple_versions() {
+        let mut json = serde_json::json!({
+            "name": "lodash",
+            "versions": {
+                "4.17.20": {
+                    "name": "lodash",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+                    }
+                },
+                "4.17.21": {
+                    "name": "lodash",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"
+                    }
+                }
+            }
+        });
+
+        rewrite_npm_tarball_urls(&mut json, "http://local:8080", "npm");
+
+        let t1 = json["versions"]["4.17.20"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        let t2 = json["versions"]["4.17.21"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        assert!(t1.starts_with("http://local:8080/npm/npm/lodash/-/"));
+        assert!(t2.starts_with("http://local:8080/npm/npm/lodash/-/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // RepoInfo struct
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repo_info_construction() {
+        let info = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: String::new(),
+            storage_path: "/data/npm".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "hosted".to_string(),
+            upstream_url: None,
+        };
+        assert_eq!(info.repo_type, "hosted");
+        assert!(info.upstream_url.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_npm_integrity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_npm_integrity_zeros() {
+        let hex = "0000000000000000000000000000000000000000000000000000000000000000";
+        let result = compute_npm_integrity(hex);
+        assert!(result.starts_with("sha256-"));
+        // All zeros base64-encoded
+        assert_eq!(
+            result,
+            "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+    }
+
+    #[test]
+    fn test_compute_npm_integrity_deterministic() {
+        let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let r1 = compute_npm_integrity(hex);
+        let r2 = compute_npm_integrity(hex);
+        assert_eq!(r1, r2);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_npm_tarball_filename
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_npm_tarball_filename_unscoped() {
+        assert_eq!(
+            build_npm_tarball_filename("express", "4.18.2"),
+            "express-4.18.2.tgz"
+        );
+    }
+
+    #[test]
+    fn test_build_npm_tarball_filename_scoped() {
+        assert_eq!(
+            build_npm_tarball_filename("@angular/core", "17.0.0"),
+            "core-17.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_build_npm_tarball_filename_scoped_deep() {
+        assert_eq!(
+            build_npm_tarball_filename("@babel/preset-env", "7.24.0"),
+            "preset-env-7.24.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_build_npm_tarball_filename_scoped_no_slash() {
+        // Edge case: scoped package without a slash
+        assert_eq!(
+            build_npm_tarball_filename("@oddpackage", "1.0.0"),
+            "@oddpackage-1.0.0.tgz"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_npm_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_npm_artifact_path_unscoped() {
+        assert_eq!(
+            build_npm_artifact_path("lodash", "4.17.21", "lodash-4.17.21.tgz"),
+            "lodash/4.17.21/lodash-4.17.21.tgz"
+        );
+    }
+
+    #[test]
+    fn test_build_npm_artifact_path_scoped() {
+        assert_eq!(
+            build_npm_artifact_path("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz"),
+            "@vue/compiler-core/3.4.0/compiler-core-3.4.0.tgz"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_npm_storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_npm_storage_key_unscoped() {
+        assert_eq!(
+            build_npm_storage_key("express", "4.18.2", "express-4.18.2.tgz"),
+            "npm/express/4.18.2/express-4.18.2.tgz"
+        );
+    }
+
+    #[test]
+    fn test_build_npm_storage_key_scoped() {
+        assert_eq!(
+            build_npm_storage_key("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz"),
+            "npm/@vue/compiler-core/3.4.0/compiler-core-3.4.0.tgz"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_scoped_package_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_scoped_package_name_basic() {
+        assert_eq!(build_scoped_package_name("babel", "core"), "@babel/core");
+    }
+
+    #[test]
+    fn test_build_scoped_package_name_vue() {
+        assert_eq!(
+            build_scoped_package_name("vue", "compiler-core"),
+            "@vue/compiler-core"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_npm_package_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_npm_package_name_valid() {
+        assert!(validate_npm_package_name("express").is_ok());
+    }
+
+    #[test]
+    fn test_validate_npm_package_name_empty() {
+        assert!(validate_npm_package_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_npm_package_name_too_long() {
+        let long_name = "a".repeat(215);
+        assert!(validate_npm_package_name(&long_name).is_err());
+    }
+
+    #[test]
+    fn test_validate_npm_package_name_starts_with_dot() {
+        assert!(validate_npm_package_name(".hidden").is_err());
+    }
+
+    #[test]
+    fn test_validate_npm_package_name_starts_with_underscore() {
+        assert!(validate_npm_package_name("_private").is_err());
+    }
+
+    #[test]
+    fn test_validate_npm_package_name_uppercase_rejected() {
+        assert!(validate_npm_package_name("MyPackage").is_err());
+    }
+
+    #[test]
+    fn test_validate_npm_package_name_scoped_uppercase_ok() {
+        assert!(validate_npm_package_name("@Scope/Package").is_ok());
+    }
+
+    #[test]
+    fn test_validate_npm_package_name_max_length() {
+        let name = "a".repeat(214);
+        assert!(validate_npm_package_name(&name).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_npm_tarball_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_npm_tarball_url_basic() {
+        assert_eq!(
+            build_npm_tarball_url(
+                "http://localhost:8080",
+                "npm-hosted",
+                "express",
+                "express-4.18.2.tgz"
+            ),
+            "http://localhost:8080/npm/npm-hosted/express/-/express-4.18.2.tgz"
+        );
+    }
+
+    #[test]
+    fn test_build_npm_tarball_url_scoped() {
+        assert_eq!(
+            build_npm_tarball_url(
+                "https://registry.example.com",
+                "main",
+                "@angular/core",
+                "core-17.0.0.tgz"
+            ),
+            "https://registry.example.com/npm/main/@angular/core/-/core-17.0.0.tgz"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_npm_version_entry
+    // -----------------------------------------------------------------------
+
+    fn make_artifact_info(
+        pkg: &str,
+        version: &str,
+        sha256: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> NpmArtifactInfo {
+        let filename = build_npm_tarball_filename(pkg, version);
+        let tarball_url = build_npm_tarball_url("http://localhost:8080", "repo", pkg, &filename);
+        NpmArtifactInfo {
+            version: version.to_string(),
+            filename,
+            checksum_sha256: sha256.to_string(),
+            tarball_url,
+            version_metadata: metadata,
+            package_name: pkg.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_build_npm_version_entry_variants() {
+        // Basic entry without metadata: name, version, tarball URL, integrity
+        let basic =
+            build_npm_version_entry(&make_artifact_info("mylib", "1.0.0", SHA256_EMPTY, None));
+        assert_eq!(basic["name"], "mylib");
+        assert_eq!(basic["version"], "1.0.0");
+        assert!(basic["dist"]["tarball"]
+            .as_str()
+            .unwrap()
+            .contains("mylib-1.0.0.tgz"));
+        assert!(basic["dist"]["integrity"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256-"));
+
+        // Entry with extra metadata fields: those fields are preserved in the output
+        let with_meta = build_npm_version_entry(&make_artifact_info(
+            "pkg",
+            "2.0.0",
+            SHA256_ZEROS,
+            Some(serde_json::json!({"description": "A great library", "license": "MIT"})),
+        ));
+        assert_eq!(with_meta["name"], "pkg");
+        assert_eq!(with_meta["version"], "2.0.0");
+        assert_eq!(with_meta["description"], "A great library");
+        assert_eq!(with_meta["license"], "MIT");
+
+        // When metadata already contains name/version, or_insert_with does not overwrite
+        let preserved = build_npm_version_entry(&make_artifact_info(
+            "pkg",
+            "1.0.0",
+            SHA256_ABCD,
+            Some(serde_json::json!({"name": "custom-name", "version": "0.9.0"})),
+        ));
+        assert_eq!(preserved["name"], "custom-name");
+        assert_eq!(preserved["version"], "0.9.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_npm_publish_payload
+    // -----------------------------------------------------------------------
+
+    fn json_to_bytes(payload: &serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(payload).unwrap())
+    }
+
+    fn make_valid_publish_body(package_name: &str, version: &str) -> Bytes {
+        let tarball_data = b"fake tarball content";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(tarball_data);
+        let tarball_filename = build_npm_tarball_filename(package_name, version);
+
+        let payload = serde_json::json!({
+            "name": package_name,
+            "versions": {
+                version: {
+                    "name": package_name,
+                    "version": version,
+                    "description": "A test package"
+                }
+            },
+            "_attachments": {
+                tarball_filename: {
+                    "content_type": "application/octet-stream",
+                    "data": b64,
+                    "length": tarball_data.len()
+                }
+            }
+        });
+        Bytes::from(serde_json::to_vec(&payload).unwrap())
+    }
+
+    #[test]
+    fn test_parse_npm_publish_payload_valid() {
+        let body = make_valid_publish_body("express", "4.18.2");
+        let result = parse_npm_publish_payload(&body, "express");
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.versions.len(), 1);
+        assert_eq!(parsed.versions[0].version, "4.18.2");
+        assert_eq!(parsed.versions[0].tarball_filename, "express-4.18.2.tgz");
+        assert!(!parsed.versions[0].tarball_bytes.is_empty());
+        assert_eq!(parsed.versions[0].sha256.len(), 64);
+    }
+
+    #[test]
+    fn test_parse_npm_publish_payload_scoped() {
+        let body = make_valid_publish_body("@babel/core", "7.24.0");
+        let result = parse_npm_publish_payload(&body, "@babel/core");
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.versions[0].version, "7.24.0");
+        assert_eq!(parsed.versions[0].tarball_filename, "core-7.24.0.tgz");
+    }
+
+    #[test]
+    fn test_parse_npm_publish_payload_invalid_json() {
+        let body = Bytes::from(b"not json at all".to_vec());
+        let result = parse_npm_publish_payload(&body, "pkg");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_npm_publish_payload_rejects_invalid_payloads() {
+        let cases: Vec<(serde_json::Value, &str, &str)> = vec![
+            // Name mismatch between body and URL
+            (
+                serde_json::json!({
+                    "name": "wrong-name",
+                    "versions": { "1.0.0": {} },
+                    "_attachments": { "wrong-name-1.0.0.tgz": { "data": "dGVzdA==" } }
+                }),
+                "correct-name",
+                "name mismatch",
+            ),
+            // Missing versions field
+            (
+                serde_json::json!({ "name": "pkg", "_attachments": {} }),
+                "pkg",
+                "missing versions",
+            ),
+            // Missing attachments field
+            (
+                serde_json::json!({ "name": "pkg", "versions": { "1.0.0": {} } }),
+                "pkg",
+                "missing attachments",
+            ),
+        ];
+
+        for (payload, url_name, label) in cases {
+            let body = json_to_bytes(&payload);
+            assert!(
+                parse_npm_publish_payload(&body, url_name).is_err(),
+                "expected error for case: {}",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_npm_publish_payload_no_name_field_uses_url_name() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"data");
+        let payload = serde_json::json!({
+            "versions": {
+                "1.0.0": { "version": "1.0.0" }
+            },
+            "_attachments": {
+                "pkg-1.0.0.tgz": { "data": b64 }
+            }
+        });
+        let body = json_to_bytes(&payload);
+        let result = parse_npm_publish_payload(&body, "pkg");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_npm_publish_preserves_version_data() {
+        let body = make_valid_publish_body("mylib", "2.0.0");
+        let parsed = parse_npm_publish_payload(&body, "mylib").unwrap();
+        let vd = &parsed.versions[0].version_data;
+        assert_eq!(vd["description"], "A test package");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_version_tarball
+    // -----------------------------------------------------------------------
+
+    /// Build an attachments map with a single entry containing base64-encoded data.
+    fn make_attachments(filename: &str, data: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        let mut m = serde_json::Map::new();
+        m.insert(filename.to_string(), serde_json::json!({ "data": b64 }));
+        m
+    }
+
+    #[test]
+    fn test_extract_version_tarball_unscoped() {
+        let attachments = make_attachments("mylib-1.0.0.tgz", b"tarball bytes");
+
+        let ver = extract_version_tarball(
+            "mylib",
+            "1.0.0",
+            serde_json::json!({"version": "1.0.0"}),
+            &attachments,
+        )
+        .unwrap();
+        assert_eq!(ver.version, "1.0.0");
+        assert_eq!(ver.tarball_filename, "mylib-1.0.0.tgz");
+        assert_eq!(ver.tarball_bytes, b"tarball bytes");
+        assert_eq!(ver.sha256.len(), 64);
+    }
+
+    #[test]
+    fn test_extract_version_tarball_scoped() {
+        let attachments = make_attachments("core-7.0.0.tgz", b"scoped data");
+
+        let ver =
+            extract_version_tarball("@babel/core", "7.0.0", serde_json::json!({}), &attachments)
+                .unwrap();
+        assert_eq!(ver.tarball_filename, "core-7.0.0.tgz");
+    }
+
+    #[test]
+    fn test_extract_version_tarball_falls_back_to_first_attachment() {
+        let attachments = make_attachments("different-name.tgz", b"fallback data");
+        assert!(
+            extract_version_tarball("mylib", "1.0.0", serde_json::json!({}), &attachments).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_extract_version_tarball_rejects_bad_attachments() {
+        let version_data = serde_json::json!({});
+
+        // Empty attachments map
+        let empty = serde_json::Map::new();
+        assert!(extract_version_tarball("mylib", "1.0.0", version_data.clone(), &empty).is_err());
+
+        // Attachment present but missing the "data" field
+        let mut no_data = serde_json::Map::new();
+        no_data.insert(
+            "mylib-1.0.0.tgz".to_string(),
+            serde_json::json!({ "content_type": "application/octet-stream" }),
+        );
+        assert!(extract_version_tarball("mylib", "1.0.0", version_data.clone(), &no_data).is_err());
+
+        // Attachment has a "data" field with invalid base64
+        let mut bad_b64 = serde_json::Map::new();
+        bad_b64.insert(
+            "mylib-1.0.0.tgz".to_string(),
+            serde_json::json!({ "data": "!!!not-base64!!!" }),
+        );
+        assert!(extract_version_tarball("mylib", "1.0.0", version_data, &bad_b64).is_err());
+    }
+
+    #[test]
+    fn test_extract_version_tarball_sha256_matches_content() {
+        let content = b"deterministic content";
+        let attachments = make_attachments("pkg-1.0.0.tgz", content);
+
+        let ver =
+            extract_version_tarball("pkg", "1.0.0", serde_json::json!({}), &attachments).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        assert_eq!(ver.sha256, format!("{:x}", hasher.finalize()));
+    }
+
+    // -----------------------------------------------------------------------
+    // ParsedNpmPublish / NpmVersionToPublish structs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_npm_version_to_publish_fields() {
+        let ver = NpmVersionToPublish {
+            version: "3.0.0".to_string(),
+            version_data: serde_json::json!({"description": "test"}),
+            tarball_filename: "pkg-3.0.0.tgz".to_string(),
+            tarball_bytes: vec![1, 2, 3],
+            sha256: "abc".to_string(),
+        };
+        assert_eq!(ver.version, "3.0.0");
+        assert_eq!(ver.tarball_bytes.len(), 3);
+        assert_eq!(ver.version_data["description"], "test");
+    }
+
+    #[test]
+    fn test_parsed_npm_publish_multiple_versions() {
+        let b64_a = base64::engine::general_purpose::STANDARD.encode(b"version a");
+        let b64_b = base64::engine::general_purpose::STANDARD.encode(b"version b");
+
+        let payload = serde_json::json!({
+            "name": "multi",
+            "versions": {
+                "1.0.0": { "version": "1.0.0" },
+                "2.0.0": { "version": "2.0.0" }
+            },
+            "_attachments": {
+                "multi-1.0.0.tgz": { "data": b64_a },
+                "multi-2.0.0.tgz": { "data": b64_b }
+            }
+        });
+        let body = json_to_bytes(&payload);
+        let parsed = parse_npm_publish_payload(&body, "multi").unwrap();
+        assert_eq!(parsed.versions.len(), 2);
+
+        let version_names: Vec<&str> = parsed.versions.iter().map(|v| v.version.as_str()).collect();
+        assert!(version_names.contains(&"1.0.0"));
+        assert!(version_names.contains(&"2.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_package_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_decodes_scoped_package() {
+        assert_eq!(normalize_package_name("%40openai%2fcodex"), "@openai/codex");
+    }
+
+    #[test]
+    fn test_normalize_decodes_slash_only() {
+        assert_eq!(normalize_package_name("@openai%2Fcodex"), "@openai/codex");
+    }
+
+    #[test]
+    fn test_normalize_unscoped_unchanged() {
+        assert_eq!(normalize_package_name("express"), "express");
+    }
+
+    #[test]
+    fn test_normalize_already_decoded() {
+        assert_eq!(normalize_package_name("@openai/codex"), "@openai/codex");
+    }
+
+    // -----------------------------------------------------------------------
+    // encode_package_name_for_upstream
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_upstream_scoped_package() {
+        assert_eq!(
+            encode_package_name_for_upstream("@openai/codex"),
+            "@openai%2Fcodex"
+        );
+    }
+
+    #[test]
+    fn test_encode_upstream_unscoped_unchanged() {
+        assert_eq!(encode_package_name_for_upstream("express"), "express");
+    }
+
+    #[test]
+    fn test_encode_upstream_at_without_slash() {
+        // Edge case: starts with @ but has no slash (not a valid scope, but handle gracefully)
+        assert_eq!(
+            encode_package_name_for_upstream("@noscopepkg"),
+            "@noscopepkg"
+        );
+    }
+
+    #[test]
+    fn test_encode_upstream_deeply_scoped() {
+        // Only the first slash should be encoded
+        assert_eq!(
+            encode_package_name_for_upstream("@scope/sub/pkg"),
+            "@scope%2Fsub/pkg"
+        );
+    }
+
+    #[test]
+    fn test_normalize_then_encode_roundtrip() {
+        let from_client = "@openai%2Fcodex";
+        let normalized = normalize_package_name(from_client);
+        assert_eq!(normalized, "@openai/codex");
+        let for_upstream = encode_package_name_for_upstream(&normalized);
+        assert_eq!(for_upstream, "@openai%2Fcodex");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_tarball_upstream_path (B7)
+    //
+    // Tarball URLs keep the scope separator as a literal `/`; only metadata
+    // uses `%2F`. These pin that the tarball path is NOT percent-encoded so a
+    // future refactor that routes it through `encode_package_name_for_upstream`
+    // (which would 404 the remote-proxy tarball fetch) fails here.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tarball_upstream_path_scoped_keeps_literal_slash() {
+        let path = build_tarball_upstream_path("@e2escope/testpkg", "testpkg-1.0.0.tgz");
+        assert_eq!(path, "@e2escope/testpkg/-/testpkg-1.0.0.tgz");
+        assert!(
+            !path.contains("%2F") && !path.contains("%2f"),
+            "scoped tarball path must NOT encode the scope separator (B7); got {path}"
+        );
+    }
+
+    #[test]
+    fn test_tarball_upstream_path_unscoped() {
+        assert_eq!(
+            build_tarball_upstream_path("express", "express-4.18.2.tgz"),
+            "express/-/express-4.18.2.tgz"
+        );
+    }
+
+    #[test]
+    fn test_tarball_upstream_path_diverges_from_metadata_encoding() {
+        // Metadata encodes the slash; tarballs must not. Pin that the two
+        // helpers produce different shapes for the same scoped package so a
+        // refactor cannot accidentally collapse them into one.
+        let name = "@types/mdurl";
+        let meta = encode_package_name_for_upstream(name);
+        let tarball = build_tarball_upstream_path(name, "mdurl-2.0.0.tgz");
+        assert_eq!(meta, "@types%2Fmdurl");
+        assert_eq!(tarball, "@types/mdurl/-/mdurl-2.0.0.tgz");
+        assert!(tarball.starts_with(&format!("{name}/-/")));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_npm_metadata_response (used by virtual local/staging members)
+    // -----------------------------------------------------------------------
+
+    /// Shortcut: build a single-version NpmMetadataArtifact without metadata.
+    fn make_artifact(path: &str, version: &str, sha256: &str) -> NpmMetadataArtifact {
+        NpmMetadataArtifact {
+            path: path.to_string(),
+            version: Some(version.to_string()),
+            checksum_sha256: sha256.to_string(),
+            metadata: None,
+        }
+    }
+
+    /// Call `build_npm_metadata_response` and return the parsed JSON body.
+    async fn metadata_response_json(
+        artifacts: &[NpmMetadataArtifact],
+        package_name: &str,
+        base_url: &str,
+        repo_key: &str,
+    ) -> serde_json::Value {
+        let resp = build_npm_metadata_response(
+            artifacts,
+            package_name,
+            base_url,
+            repo_key,
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body_bytes).unwrap()
+    }
+
+    const SHA256_ZEROS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const SHA256_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const SHA256_ABCD: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_single_and_scoped_versions() {
+        // Unscoped package: basic metadata fields and tarball URL structure
+        let artifacts = vec![make_artifact(
+            "mylib/1.0.0/mylib-1.0.0.tgz",
+            "1.0.0",
+            SHA256_EMPTY,
+        )];
+        let body =
+            metadata_response_json(&artifacts, "mylib", "http://localhost:8080", "npm-virtual")
+                .await;
+
+        assert_eq!(body["name"], "mylib");
+        assert_eq!(body["dist-tags"]["latest"], "1.0.0");
+        let v = &body["versions"]["1.0.0"];
+        assert_eq!(v["name"], "mylib");
+        assert_eq!(v["version"], "1.0.0");
+        assert_eq!(
+            v["dist"]["tarball"],
+            "http://localhost:8080/npm/npm-virtual/mylib/-/mylib-1.0.0.tgz"
+        );
+        assert!(v["dist"]["integrity"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256-"));
+
+        // Scoped package: tarball URL must encode the scope correctly
+        let scoped = vec![make_artifact(
+            "@babel/core/7.24.0/core-7.24.0.tgz",
+            "7.24.0",
+            SHA256_ABCD,
+        )];
+        let body2 = metadata_response_json(
+            &scoped,
+            "@babel/core",
+            "http://localhost:8080",
+            "npm-virtual",
+        )
+        .await;
+        assert_eq!(body2["name"], "@babel/core");
+        assert_eq!(
+            body2["versions"]["7.24.0"]["dist"]["tarball"],
+            "http://localhost:8080/npm/npm-virtual/@babel/core/-/core-7.24.0.tgz"
+        );
+
+        // Virtual repo key: tarball URLs must use the virtual repo key, not the
+        // underlying member repo key.
+        let virt = vec![make_artifact(
+            "express/4.18.2/express-4.18.2.tgz",
+            "4.18.2",
+            SHA256_EMPTY,
+        )];
+        let body3 =
+            metadata_response_json(&virt, "express", "http://localhost:8080", "my-virtual-repo")
+                .await;
+        let tarball = body3["versions"]["4.18.2"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        assert!(
+            tarball.contains("my-virtual-repo"),
+            "tarball URL should use virtual repo key, got: {}",
+            tarball
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_multiple_versions() {
+        let artifacts = vec![
+            make_artifact("lodash/4.17.20/lodash-4.17.20.tgz", "4.17.20", SHA256_ZEROS),
+            make_artifact("lodash/4.17.21/lodash-4.17.21.tgz", "4.17.21", SHA256_ABCD),
+        ];
+
+        let body = metadata_response_json(
+            &artifacts,
+            "lodash",
+            "https://my.registry.com",
+            "npm-virtual",
+        )
+        .await;
+
+        assert_eq!(body["name"], "lodash");
+        assert_eq!(body["dist-tags"]["latest"], "4.17.21");
+        assert!(body["versions"]["4.17.20"].is_object());
+        assert!(body["versions"]["4.17.21"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_with_version_metadata() {
+        let artifacts = vec![NpmMetadataArtifact {
+            path: "fastlib/2.0.0/fastlib-2.0.0.tgz".to_string(),
+            version: Some("2.0.0".to_string()),
+            checksum_sha256: SHA256_ZEROS.to_string(),
+            metadata: Some(serde_json::json!({
+                "version_data": {
+                    "description": "A fast library",
+                    "license": "MIT",
+                    "main": "index.js"
+                }
+            })),
+        }];
+
+        let body =
+            metadata_response_json(&artifacts, "fastlib", "http://localhost:8080", "npm-hosted")
+                .await;
+
+        let v = &body["versions"]["2.0.0"];
+        assert_eq!(v["description"], "A fast library");
+        assert_eq!(v["license"], "MIT");
+        assert_eq!(v["main"], "index.js");
+        assert_eq!(v["name"], "fastlib");
+        assert_eq!(v["version"], "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_skips_versionless_artifacts() {
+        let artifacts = vec![
+            make_artifact("pkg/1.0.0/pkg-1.0.0.tgz", "1.0.0", SHA256_ZEROS),
+            NpmMetadataArtifact {
+                path: "pkg/unknown/pkg-unknown.tgz".to_string(),
+                version: None,
+                checksum_sha256: SHA256_ABCD.to_string(),
+                metadata: None,
+            },
+        ];
+
+        let body =
+            metadata_response_json(&artifacts, "pkg", "http://localhost:8080", "npm-hosted").await;
+
+        let versions = body["versions"].as_object().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(versions.contains_key("1.0.0"));
+    }
+
+    // Integrity preservation tests (issue #745)
+    //
+    // When proxying npm metadata from upstream, the rewrite function must
+    // preserve the original integrity and shasum fields. Only the tarball
+    // URL should change.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_preserves_upstream_integrity_and_shasum() {
+        let mut json = serde_json::json!({
+            "name": "@types/mdurl",
+            "versions": {
+                "2.0.0": {
+                    "name": "@types/mdurl",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/@types/mdurl/-/mdurl-2.0.0.tgz",
+                        "integrity": "sha512-RGdgjQUZba5p6QEFAVx2OGb8rQDL/cPRG7GiedRzMcJ1tYnUANBncjbSB1NRGwbvjcPeikRABz2nshyPk1bhWg==",
+                        "shasum": "d43878b5b20222682163ae6f897b20447233bdfd",
+                        "fileCount": 13,
+                        "unpackedSize": 5407
+                    }
+                }
+            }
+        });
+
+        rewrite_npm_tarball_urls(&mut json, "https://registry.example.dev", "npm");
+
+        let dist = &json["versions"]["2.0.0"]["dist"];
+
+        // tarball URL must be rewritten to our local instance
+        assert_eq!(
+            dist["tarball"].as_str().unwrap(),
+            "https://registry.example.dev/npm/npm/@types/mdurl/-/mdurl-2.0.0.tgz"
+        );
+
+        // integrity hash must be preserved verbatim from upstream
+        assert_eq!(
+            dist["integrity"].as_str().unwrap(),
+            "sha512-RGdgjQUZba5p6QEFAVx2OGb8rQDL/cPRG7GiedRzMcJ1tYnUANBncjbSB1NRGwbvjcPeikRABz2nshyPk1bhWg=="
+        );
+
+        // shasum must also be preserved
+        assert_eq!(
+            dist["shasum"].as_str().unwrap(),
+            "d43878b5b20222682163ae6f897b20447233bdfd"
+        );
+
+        // Other dist fields should also survive the rewrite
+        assert_eq!(dist["fileCount"], 13);
+        assert_eq!(dist["unpackedSize"], 5407);
+    }
+
+    #[test]
+    fn test_rewrite_preserves_integrity_with_multiple_versions() {
+        let mut json = serde_json::json!({
+            "name": "mdurl",
+            "versions": {
+                "1.0.1": {
+                    "name": "mdurl",
+                    "version": "1.0.1",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/mdurl/-/mdurl-1.0.1.tgz",
+                        "integrity": "sha512-aaa111==",
+                        "shasum": "aaaa1111"
+                    }
+                },
+                "2.0.0": {
+                    "name": "mdurl",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/mdurl/-/mdurl-2.0.0.tgz",
+                        "integrity": "sha512-bbb222==",
+                        "shasum": "bbbb2222"
+                    }
+                }
+            }
+        });
+
+        rewrite_npm_tarball_urls(&mut json, "http://localhost:8080", "npm-cache");
+
+        // Both versions should have rewritten tarball URLs
+        assert!(json["versions"]["1.0.1"]["dist"]["tarball"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://localhost:8080/npm/npm-cache/mdurl/-/"));
+        assert!(json["versions"]["2.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://localhost:8080/npm/npm-cache/mdurl/-/"));
+
+        // Both versions must keep their own integrity values
+        assert_eq!(
+            json["versions"]["1.0.1"]["dist"]["integrity"]
+                .as_str()
+                .unwrap(),
+            "sha512-aaa111=="
+        );
+        assert_eq!(
+            json["versions"]["2.0.0"]["dist"]["integrity"]
+                .as_str()
+                .unwrap(),
+            "sha512-bbb222=="
+        );
+
+        // shasum preserved too
+        assert_eq!(
+            json["versions"]["1.0.1"]["dist"]["shasum"]
+                .as_str()
+                .unwrap(),
+            "aaaa1111"
+        );
+        assert_eq!(
+            json["versions"]["2.0.0"]["dist"]["shasum"]
+                .as_str()
+                .unwrap(),
+            "bbbb2222"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Path pattern disambiguation tests (issue #745)
+    //
+    // npm tarball filenames strip the scope prefix, so packages like
+    // `mdurl` and `@types/mdurl` both produce `mdurl-2.0.0.tgz`. The
+    // path pattern used for artifact lookup must include the package name
+    // to prevent returning the wrong package's tarball.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_path_pattern_distinguishes_scoped_from_unscoped() {
+        // Two packages with the same tarball filename
+        let unscoped_path = "mdurl/2.0.0/mdurl-2.0.0.tgz";
+        let scoped_path = "@types/mdurl/2.0.0/mdurl-2.0.0.tgz";
+
+        // The path pattern includes the package name as a prefix
+        let unscoped_pattern = format!("{}/%/{}", "mdurl", "mdurl-2.0.0.tgz");
+        let scoped_pattern = format!("{}/%/{}", "@types/mdurl", "mdurl-2.0.0.tgz");
+
+        // SQL LIKE with `%` as wildcard:
+        // unscoped_pattern = "mdurl/%/mdurl-2.0.0.tgz"
+        // scoped_pattern = "@types/mdurl/%/mdurl-2.0.0.tgz"
+
+        // Simulate SQL LIKE matching: replace `%` with regex `.*`
+        let unscoped_re = regex::Regex::new(&format!(
+            "^{}$",
+            regex::escape(&unscoped_pattern).replace("%", ".*")
+        ))
+        .unwrap();
+        let scoped_re = regex::Regex::new(&format!(
+            "^{}$",
+            regex::escape(&scoped_pattern).replace("%", ".*")
+        ))
+        .unwrap();
+
+        // Unscoped pattern matches only the unscoped path
+        assert!(unscoped_re.is_match(unscoped_path));
+        assert!(!unscoped_re.is_match(scoped_path));
+
+        // Scoped pattern matches only the scoped path
+        assert!(scoped_re.is_match(scoped_path));
+        assert!(!scoped_re.is_match(unscoped_path));
+    }
+
+    #[test]
+    fn test_path_pattern_matches_locally_published_layout() {
+        // Locally published artifacts use: {package}/{version}/{filename}
+        let path = "express/4.18.2/express-4.18.2.tgz";
+        let pattern = format!("{}/%/{}", "express", "express-4.18.2.tgz");
+        let re = regex::Regex::new(&format!("^{}$", regex::escape(&pattern).replace("%", ".*")))
+            .unwrap();
+        assert!(re.is_match(path));
+    }
+
+    #[test]
+    fn test_path_pattern_scoped_locally_published() {
+        let path = "@babel/core/7.24.0/core-7.24.0.tgz";
+        let pattern = format!("{}/%/{}", "@babel/core", "core-7.24.0.tgz");
+        let re = regex::Regex::new(&format!("^{}$", regex::escape(&pattern).replace("%", ".*")))
+            .unwrap();
+        assert!(re.is_match(path));
+    }
+
+    #[test]
+    fn test_encode_package_name_for_upstream_unscoped() {
+        assert_eq!(encode_package_name_for_upstream("express"), "express");
+        assert_eq!(encode_package_name_for_upstream("lodash"), "lodash");
+    }
+
+    #[test]
+    fn test_encode_package_name_for_upstream_scoped() {
+        assert_eq!(
+            encode_package_name_for_upstream("@types/mdurl"),
+            "@types%2Fmdurl"
+        );
+        assert_eq!(
+            encode_package_name_for_upstream("@angular/core"),
+            "@angular%2Fcore"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_same_filename_different_packages() {
+        // Regression test for issue #745: two packages with the same tarball
+        // filename must produce metadata with the correct package name in each
+        // version entry, preventing the wrong tarball from being served.
+        let unscoped = vec![NpmMetadataArtifact {
+            path: "mdurl/2.0.0/mdurl-2.0.0.tgz".to_string(),
+            version: Some("2.0.0".to_string()),
+            checksum_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            metadata: None,
+        }];
+        let scoped = vec![NpmMetadataArtifact {
+            path: "@types/mdurl/2.0.0/mdurl-2.0.0.tgz".to_string(),
+            version: Some("2.0.0".to_string()),
+            checksum_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            metadata: None,
+        }];
+
+        let resp_unscoped = build_npm_metadata_response(
+            &unscoped,
+            "mdurl",
+            "http://localhost:8080",
+            "npm-hosted",
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+        let resp_scoped = build_npm_metadata_response(
+            &scoped,
+            "@types/mdurl",
+            "http://localhost:8080",
+            "npm-hosted",
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+
+        let body_u = axum::body::to_bytes(resp_unscoped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_u: serde_json::Value = serde_json::from_slice(&body_u).unwrap();
+        let body_s = axum::body::to_bytes(resp_scoped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_s: serde_json::Value = serde_json::from_slice(&body_s).unwrap();
+
+        // The tarball URLs must reference different packages
+        let tarball_u = json_u["versions"]["2.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        let tarball_s = json_s["versions"]["2.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+
+        assert!(
+            tarball_u.contains("/mdurl/-/"),
+            "unscoped tarball URL should reference mdurl, got: {}",
+            tarball_u
+        );
+        assert!(
+            tarball_s.contains("/@types/mdurl/-/"),
+            "scoped tarball URL should reference @types/mdurl, got: {}",
+            tarball_s
+        );
+        assert_ne!(
+            tarball_u, tarball_s,
+            "tarball URLs for different packages must differ"
+        );
+
+        // Integrity hashes must differ because the checksums are different
+        let integrity_u = json_u["versions"]["2.0.0"]["dist"]["integrity"]
+            .as_str()
+            .unwrap();
+        let integrity_s = json_s["versions"]["2.0.0"]["dist"]["integrity"]
+            .as_str()
+            .unwrap();
+        assert_ne!(
+            integrity_u, integrity_s,
+            "integrity for different packages must differ"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NPM_TARBALL_CONTENT_TYPE
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_npm_tarball_content_type_values() {
+        // npm tarballs are gzip-compressed tar archives. The content type must
+        // be application/gzip so that SBOM generators and security scanners
+        // (Trivy, Grype) can identify and extract the archive contents.
+        // It must NOT be application/octet-stream, which upstream registries
+        // like npmjs.org sometimes return.
+        assert_eq!(NPM_TARBALL_CONTENT_TYPE, "application/gzip");
+        assert_ne!(NPM_TARBALL_CONTENT_TYPE, "application/octet-stream");
+
+        // The publish handler stores "application/gzip" in the content_type
+        // column (see store_npm_version). Verify the constant matches.
+        let publish_content_type = "application/gzip";
+        assert_eq!(NPM_TARBALL_CONTENT_TYPE, publish_content_type);
+    }
+
+    #[tokio::test]
+    async fn test_build_tarball_response_stream_sets_headers() {
+        // The streaming tarball response (used for the get_stream download path)
+        // must emit the gzip content-type (or the supplied upstream type), a
+        // Content-Disposition with the filename, and Content-Length when known.
+        use futures::StreamExt as _;
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"tgz-bytes"))
+            }));
+        let resp = build_tarball_response_stream(body, "pkg-1.0.0.tgz", None, Some(9));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers();
+        assert_eq!(
+            h.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some(NPM_TARBALL_CONTENT_TYPE)
+        );
+        assert_eq!(
+            h.get("content-disposition").and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"pkg-1.0.0.tgz\"")
+        );
+        assert_eq!(
+            h.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()),
+            Some("9")
+        );
+        // Body must stream the supplied bytes verbatim.
+        let collected = resp
+            .into_body()
+            .into_data_stream()
+            .fold(Vec::new(), |mut acc, c| async move {
+                acc.extend_from_slice(&c.unwrap());
+                acc
+            })
+            .await;
+        assert_eq!(&collected[..], b"tgz-bytes");
+    }
+
+    #[tokio::test]
+    async fn test_build_tarball_response_stream_uses_upstream_ct_and_omits_length() {
+        // An upstream-provided content-type wins over the default, and Content-
+        // Length is omitted when unknown (chunked transfer).
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::iter(Vec::new()));
+        let resp = build_tarball_response_stream(
+            body,
+            "x.tgz",
+            Some("application/x-custom".to_string()),
+            None,
+        );
+        let h = resp.headers();
+        assert_eq!(
+            h.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/x-custom")
+        );
+        assert!(h.get(CONTENT_LENGTH).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: virtual-repo tarball content-type override (#1774)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_npm_virtual_tarball_content_type_always_gzip() {
+        // A Virtual npm repo serves tarballs out of a member's proxy cache.
+        // Upstream registries (and stale error-page caches) frequently record
+        // a non-gzip content type; the virtual download path must NOT leak that
+        // through, or downstream SBOM/scanner tooling mis-detects the archive.
+        // Regardless of the cached content type, the served type must be gzip,
+        // matching the direct remote-repo path.
+        for cached in [
+            None,
+            Some("application/octet-stream".to_string()),
+            Some("text/html".to_string()),
+            Some("application/gzip".to_string()),
+        ] {
+            assert_eq!(
+                npm_virtual_tarball_content_type(cached),
+                Some(NPM_TARBALL_CONTENT_TYPE.to_string()),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_virtual_tarball_response_overrides_octet_stream() {
+        // End-to-end of the helper + response builder: an octet-stream cache
+        // record must be served as application/gzip on the streaming response.
+        let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"tgz"))
+            }));
+        let ct = npm_virtual_tarball_content_type(Some("application/octet-stream".to_string()));
+        let resp = build_tarball_response_stream(body, "is-array-1.0.1.tgz", ct, Some(3));
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(NPM_TARBALL_CONTENT_TYPE),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #1377 — scoped tarball remote-proxy flow.
+    // -----------------------------------------------------------------------
+
+    /// Regression: a Remote npm repo must be able to fetch a scoped-package
+    /// tarball through the proxy. The upstream URL the proxy hits must be
+    /// `@scope/pkg/-/{filename}` with the scope separator kept as a literal
+    /// `/`. Unlike npm metadata (which encodes the separator as `%2F`),
+    /// tarball routes expect `@scope` and `pkg` as separate path segments;
+    /// percent-encoding the slash collapses them into one `@scope%2Fpkg`
+    /// segment that no upstream tarball route matches, so the proxy fetch
+    /// 404s. See `build_tarball_upstream_path` (B7 / #1377). The handler must
+    /// also unwrap axum's path extractor correctly so the test request
+    /// `/repo/@scope/pkg/-/file.tgz` reaches `download_scoped_tarball` (not
+    /// the unscoped fallback).
+    #[tokio::test]
+    async fn test_remote_proxy_download_scoped_tarball_hits_encoded_upstream_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let tarball_bytes = b"\x1f\x8b\x08mock-scoped-tarball-bytes";
+
+        // Upstream must see the scope separator as a literal `/`
+        // (`@scope/pkg/-/file.tgz`), matching the canonical npm tarball
+        // route. wiremock's `path` matcher receives the request path with
+        // scope and package as separate segments; this is the shape
+        // `build_tarball_upstream_path` produces (B7 / #1377).
+        Mock::given(method("GET"))
+            .and(path("/@e2escope/testpkg/-/testpkg-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(tarball_bytes.as_ref()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Re-point the fixture's Remote repo at the mock upstream so the
+        // proxy_fetch call lands on wiremock instead of the placeholder URL.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        // Invoke the scoped-tarball handler directly. The router decodes
+        // `%2F` on the way in, so we feed the canonical (unencoded) path
+        // segments via the Path extractor.
+        let result = super::download_scoped_tarball(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "e2escope".to_string(),
+                "testpkg".to_string(),
+                "testpkg-1.0.0.tgz".to_string(),
+            )),
+        )
+        .await;
+
+        // Cleanup first so a panic does not leak DB state.
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                cleanup().await;
+                panic!(
+                    "Remote npm proxy must serve scoped tarball; \
+                     download_scoped_tarball returned {status} (issue #1377)"
+                );
+            }
+        };
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
+
+        cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // npm audit advisories endpoint (issue #1400)
+    // -----------------------------------------------------------------------
+
+    /// The empty `advisories/bulk` response must be a JSON object so npm
+    /// parses it as "zero advisories" instead of bailing out. An array or
+    /// non-JSON body causes the npm client to print a parse error.
+    #[test]
+    fn test_empty_advisories_bulk_response_shape() {
+        let resp = super::empty_advisories_bulk_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            ct.contains("application/json"),
+            "advisories/bulk must be JSON, got {ct}"
+        );
+
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 64 * 1024))
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
+        assert!(
+            parsed.is_object(),
+            "advisories/bulk response must be a JSON object, got {parsed:?}"
+        );
+        assert_eq!(
+            parsed.as_object().map(|m| m.len()).unwrap_or(0),
+            0,
+            "empty response must have no keys"
+        );
+    }
+
+    /// The empty `audits/quick` response must include `actions`, `advisories`,
+    /// `muted`, and `metadata.vulnerabilities` keys so the legacy npm v6 audit
+    /// command does not error out on missing fields.
+    #[test]
+    fn test_empty_audits_quick_response_shape() {
+        let resp = super::empty_audits_quick_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 64 * 1024))
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
+        assert!(parsed.get("actions").map(|v| v.is_array()).unwrap_or(false));
+        assert!(parsed
+            .get("advisories")
+            .map(|v| v.is_object())
+            .unwrap_or(false));
+        assert!(parsed.get("muted").map(|v| v.is_array()).unwrap_or(false));
+        let vulns = parsed
+            .pointer("/metadata/vulnerabilities")
+            .expect("metadata.vulnerabilities required");
+        for level in ["info", "low", "moderate", "high", "critical"] {
+            assert_eq!(
+                vulns.get(level).and_then(|v| v.as_u64()),
+                Some(0),
+                "level {level} must be present and zero"
+            );
+        }
+    }
+
+    /// Integration: a Hosted (Local) npm repo must serve `npm audit` with an
+    /// empty advisories object instead of returning 404. Without this, npm
+    /// audit fails the entire CI build. Tests the full router path so the
+    /// route table actually includes the new endpoint.
+    #[tokio::test]
+    async fn test_local_repo_advisories_bulk_returns_empty_object() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let app = tdh::router_anon(super::router(), state);
+
+        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
+        let body = serde_json::json!({
+            "express": ["4.17.0"],
+        })
+        .to_string();
+        let req = tdh::post(uri, "application/json", Bytes::from(body));
+        let (status, bytes) = tdh::send(app, req).await;
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        if status != StatusCode::OK {
+            cleanup().await;
+            panic!("Local npm repo must answer audit with 200, got {status}");
+        }
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response must be JSON");
+        assert!(
+            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
+            "Local repo audit must return empty object, got {parsed:?}"
+        );
+
+        cleanup().await;
+    }
+
+    /// Integration: a Remote npm repo must forward the audit POST body
+    /// verbatim to the configured upstream registry and return the upstream
+    /// response body to the client. Mirrors the `npm audit` flow in
+    /// production where artifact-keeper is configured as the proxy and the
+    /// upstream is npmjs.org.
+    #[tokio::test]
+    async fn test_remote_repo_advisories_bulk_proxies_to_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let upstream_response = serde_json::json!({
+            "express": [
+                {
+                    "id": 1234,
+                    "url": "https://github.com/advisories/GHSA-xxxx",
+                    "title": "Test advisory",
+                    "severity": "high",
+                    "vulnerable_versions": "<4.17.3",
+                }
+            ]
+        });
+        let client_request = serde_json::json!({"express": ["4.17.0"]});
+
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/advisories/bulk"))
+            .and(body_json(client_request.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(upstream_response.clone()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let app = tdh::router_anon(super::router(), state);
+
+        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
+        let req = tdh::post(
+            uri,
+            "application/json",
+            Bytes::from(client_request.to_string()),
+        );
+        let (status, bytes) = tdh::send(app, req).await;
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        if status != StatusCode::OK {
+            cleanup().await;
+            panic!("Remote npm repo must proxy audit to upstream with 200, got {status}");
+        }
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response must be JSON");
+        assert_eq!(
+            parsed, upstream_response,
+            "Remote audit response must be the upstream payload verbatim"
+        );
+
+        cleanup().await;
+    }
+
+    /// Integration: a Remote npm repo whose upstream is unreachable must
+    /// degrade gracefully and return an empty advisories object so the
+    /// developer's `npm audit` command still exits cleanly. This is the
+    /// fallback contract callers depend on when the upstream is offline.
+    #[tokio::test]
+    async fn test_remote_repo_advisories_bulk_falls_back_when_upstream_down() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        // Point at a localhost port that nothing is listening on. This is
+        // SSRF-safe through default_client because the request itself never
+        // completes; we just need a guaranteed connection failure.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind("http://127.0.0.1:1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let app = tdh::router_anon(super::router(), state);
+
+        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
+        let req = tdh::post(
+            uri,
+            "application/json",
+            Bytes::from(r#"{"express":["4.17.0"]}"#.as_bytes().to_vec()),
+        );
+        let (status, bytes) = tdh::send(app, req).await;
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        if status != StatusCode::OK {
+            cleanup().await;
+            panic!(
+                "Remote npm repo must degrade to empty advisories on upstream \
+                 failure, got {status}"
+            );
+        }
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response must be JSON");
+        assert!(
+            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
+            "fallback response must be an empty object, got {parsed:?}"
+        );
+
+        cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // dist-tags (#1543): `latest` derivation + custom-tag persistence/emit.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_derive_latest_prefers_stable_over_prerelease() {
+        // 2.0.0-rc.1 is created last, but `latest` must be the highest stable.
+        let versions = vec![
+            "1.0.0".to_string(),
+            "1.1.0".to_string(),
+            "2.0.0-rc.1".to_string(),
+        ];
+        assert_eq!(derive_latest_version(&versions), Some("1.1.0".to_string()));
+    }
+
+    #[test]
+    fn test_derive_latest_picks_highest_stable_numerically() {
+        // 1.10.0 > 1.2.0 numerically (not lexically).
+        let versions = vec![
+            "1.2.0".to_string(),
+            "1.10.0".to_string(),
+            "1.3.0".to_string(),
+        ];
+        assert_eq!(derive_latest_version(&versions), Some("1.10.0".to_string()));
+    }
+
+    #[test]
+    fn test_derive_latest_all_prerelease_falls_back_to_highest_core() {
+        let versions = vec![
+            "2.0.0-rc.1".to_string(),
+            "2.0.0-rc.2".to_string(),
+            "1.9.0-beta".to_string(),
+        ];
+        // No stable version exists -> highest core, later-listed wins the tie.
+        assert_eq!(
+            derive_latest_version(&versions),
+            Some("2.0.0-rc.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_latest_non_semver_falls_back_to_last() {
+        let versions = vec!["alpha".to_string(), "nightly".to_string()];
+        assert_eq!(
+            derive_latest_version(&versions),
+            Some("nightly".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_latest_ignores_build_metadata() {
+        let versions = vec!["1.0.0+build.5".to_string(), "1.0.1".to_string()];
+        assert_eq!(derive_latest_version(&versions), Some("1.0.1".to_string()));
+    }
+
+    #[test]
+    fn test_derive_latest_empty_is_none() {
+        assert_eq!(derive_latest_version(&[]), None);
+    }
+
+    /// #1543 end-to-end: a custom dist-tag is served in the packument and
+    /// `latest` is the highest non-prerelease version, not the most recently
+    /// created one. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_packument_dist_tags_served_and_latest_is_stable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+
+        // Seed three versions; the prerelease is created LAST (the worst case
+        // for the old recency-based `latest`).
+        for ver in ["1.0.0", "1.1.0", "2.0.0-rc.1"] {
+            let path = format!("widget/{ver}/widget-{ver}.tgz");
+            let storage_key = format!("npm/{path}");
+            tdh::seed_artifact(
+                &fx.state,
+                &fx.pool,
+                &repo,
+                &storage_key,
+                &path,
+                "widget",
+                ver,
+                "application/gzip",
+                Bytes::from_static(b"tgz"),
+                fx.user_id,
+            )
+            .await;
+        }
+
+        // Record a custom `next` tag as `npm publish --tag next` would, in the
+        // dedicated per-package table (PK repository_id, name). Note there are
+        // THREE versions seeded above: the per-(repo,name) row makes the read
+        // single-row regardless of version count.
+        sqlx::query("INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3)")
+            .bind(fx.repo_id)
+            .bind("widget")
+            .bind(serde_json::json!({ "next": "2.0.0-rc.1" }))
+            .execute(&fx.pool)
+            .await
+            .expect("seed npm_dist_tags");
+
+        let result =
+            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
+
+        // Tear down before asserting so a failure never leaks DB/storage state.
+        fx.teardown().await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => panic!("get_package_metadata failed: HTTP {}", r.status()),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read packument body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse packument json");
+        let dist_tags = &json["dist-tags"];
+
+        // Custom tag preserved...
+        assert_eq!(dist_tags["next"], "2.0.0-rc.1");
+        // ...and `latest` is the highest STABLE version, not the prerelease.
+        assert_eq!(dist_tags["latest"], "1.1.0");
+    }
+
+    /// #1543 finding-2: a plain `npm publish` of a PRERELEASE must not pin
+    /// `latest` to it. Every publish body carries `"dist-tags":{"latest":
+    /// "<this version>"}`; the publish path drops `latest` so it stays the
+    /// semver-derived highest stable. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_publish_prerelease_does_not_clobber_latest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+
+        // A stable release already exists.
+        let path = "widget/1.1.0/widget-1.1.0.tgz".to_string();
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            &path,
+            "widget",
+            "1.1.0",
+            "application/gzip",
+            Bytes::from_static(b"tgz"),
+            fx.user_id,
+        )
+        .await;
+
+        // `npm publish` of a prerelease with NO explicit --tag: the client
+        // still sends `dist-tags: { latest: <this version> }`.
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let publish_body = serde_json::json!({
+            "name": "widget",
+            "versions": {
+                "2.0.0-rc.1": { "name": "widget", "version": "2.0.0-rc.1" }
+            },
+            "_attachments": {
+                "widget-2.0.0-rc.1.tgz": { "data": tarball_b64 }
+            },
+            "dist-tags": { "latest": "2.0.0-rc.1" }
+        });
+        let publish = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "widget",
+            &HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body")),
+        )
+        .await;
+
+        // Read back the stored tags and the served packument.
+        let stored = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
+        let meta =
+            super::get_package_metadata(&fx.state, &fx.repo_key, "widget", &HeaderMap::new()).await;
+
+        fx.teardown().await;
+
+        assert!(
+            publish.is_ok(),
+            "prerelease publish should succeed: {:?}",
+            publish.err().map(|r| r.status())
+        );
+        // The publish-body `latest` was dropped, never persisted.
+        assert!(
+            !stored.contains_key("latest"),
+            "publish must not persist `latest` from the body; stored: {stored:?}"
+        );
+        let resp = meta.expect("packument");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read packument body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse packument json");
+        // `latest` resolves to the highest STABLE (1.1.0), not the just-published
+        // prerelease — the whole point of #1543.
+        assert_eq!(
+            json["dist-tags"]["latest"], "1.1.0",
+            "latest must stay the highest stable, not the published prerelease"
+        );
+    }
+
+    #[test]
+    fn test_parse_npm_publish_payload_extracts_dist_tags() {
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let body = serde_json::json!({
+            "name": "widget",
+            "versions": {
+                "2.0.0-rc.1": { "name": "widget", "version": "2.0.0-rc.1" }
+            },
+            "_attachments": {
+                "widget-2.0.0-rc.1.tgz": { "data": tarball_b64 }
+            },
+            "dist-tags": { "next": "2.0.0-rc.1" }
+        });
+        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let parsed = parse_npm_publish_payload(&bytes, "widget").expect("payload should parse");
+        assert_eq!(
+            parsed.dist_tags.get("next").and_then(|v| v.as_str()),
+            Some("2.0.0-rc.1")
+        );
+        assert_eq!(parsed.versions.len(), 1);
+    }
+
+    /// #1543: the dist-tags endpoints backing `npm dist-tag add/ls/rm`.
+    /// Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_dist_tags_endpoints_put_get_delete() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+
+        // Seed two versions so the PUT existence check passes.
+        for ver in ["1.0.0", "2.0.0-rc.1"] {
+            let path = format!("widget/{ver}/widget-{ver}.tgz");
+            let storage_key = format!("npm/{path}");
+            tdh::seed_artifact(
+                &fx.state,
+                &fx.pool,
+                &repo,
+                &storage_key,
+                &path,
+                "widget",
+                ver,
+                "application/gzip",
+                Bytes::from_static(b"tgz"),
+                fx.user_id,
+            )
+            .await;
+        }
+        // No npm_dist_tags pre-seed: dist_tags_put UPSERTs the row itself, and
+        // its target-version check reads `artifacts` (seeded above), so the two
+        // real versions are all the setup the handlers need.
+
+        // PUT next -> 2.0.0-rc.1 (a real version)
+        let put_next = super::dist_tags_put(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "widget".to_string(),
+                "next".to_string(),
+            )),
+            HeaderMap::new(),
+            Bytes::from_static(b"\"2.0.0-rc.1\""),
+        )
+        .await;
+
+        // PUT a tag pointing at a version that does not exist -> error.
+        let put_missing = super::dist_tags_put(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "widget".to_string(),
+                "beta".to_string(),
+            )),
+            HeaderMap::new(),
+            Bytes::from_static(b"\"9.9.9\""),
+        )
+        .await;
+
+        // GET the dist-tags map.
+        let get_tags = super::dist_tags_get(
+            axum::extract::State(fx.state.clone()),
+            axum::extract::Path((fx.repo_key.clone(), "widget".to_string())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        // DELETE the custom tag.
+        let del_next = super::dist_tags_delete(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "widget".to_string(),
+                "next".to_string(),
+            )),
+            HeaderMap::new(),
+        )
+        .await;
+
+        // `latest` cannot be deleted.
+        let del_latest = super::dist_tags_delete(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(tdh::make_auth(fx.user_id, &fx.username))),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "widget".to_string(),
+                "latest".to_string(),
+            )),
+            HeaderMap::new(),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert!(
+            put_next.is_ok(),
+            "PUT of an existing version should succeed"
+        );
+        assert!(
+            put_missing.is_err(),
+            "PUT of a nonexistent version should fail"
+        );
+
+        // GET returns the custom tag plus a derived stable `latest`
+        // (1.0.0 is stable; 2.0.0-rc.1 is a prerelease, so latest != next).
+        let resp = match get_tags {
+            Ok(r) => r,
+            Err(r) => panic!("dist_tags_get failed: HTTP {}", r.status()),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read dist-tags body");
+        let tags: serde_json::Value = serde_json::from_slice(&body).expect("parse dist-tags json");
+        assert_eq!(tags["next"], "2.0.0-rc.1");
+        assert_eq!(tags["latest"], "1.0.0");
+
+        assert!(del_next.is_ok(), "DELETE of a custom tag should succeed");
+        assert!(del_latest.is_err(), "DELETE of `latest` must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // npm /-/ meta namespace (/-/ping, /-/whoami, etc.)
+    // -----------------------------------------------------------------------
+
+    /// Local repo: `/-/ping` must return `200 {}` so health-check tooling
+    /// (connectors, IDE integrations, `npm ping`) works against local repos.
+    #[tokio::test]
+    async fn test_local_repo_meta_ping_returns_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let app = fx.router_anon(super::router());
+        let uri = format!("/{}/-/ping", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, bytes) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "/-/ping must return 200");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("/-/ping body must be JSON");
+        assert!(
+            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
+            "/-/ping must return empty JSON object {{}}, got {parsed:?}"
+        );
+    }
+
+    /// Local repo: `/-/whoami` with auth returns `200 {"username":"<name>"}`.
+    #[tokio::test]
+    async fn test_local_repo_meta_whoami_authenticated_returns_username() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let app = fx.router_with_auth(super::router());
+        let uri = format!("/{}/-/whoami", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, bytes) = tdh::send(app, req).await;
+
+        let username = fx.username.clone();
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "authenticated /-/whoami must return 200"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("/-/whoami body must be JSON");
+        assert_eq!(
+            parsed.get("username").and_then(|v| v.as_str()),
+            Some(username.as_str()),
+            "/-/whoami must echo the authenticated username"
+        );
+    }
+
+    /// Local repo: `/-/whoami` without auth returns 401.
+    #[tokio::test]
+    async fn test_local_repo_meta_whoami_unauthenticated_returns_401() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let app = fx.router_anon(super::router());
+        let uri = format!("/{}/-/whoami", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, _) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated /-/whoami must return 401"
+        );
+    }
+
+    /// Remote repo: `/-/ping` is forwarded to the upstream registry and the
+    /// upstream response (200 `{}`) is returned verbatim to the client.
+    #[tokio::test]
+    async fn test_remote_repo_meta_ping_proxied_to_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/-/ping"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("{}"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let uri = format!("/{}/-/ping", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, bytes) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Remote /-/ping must be proxied; got {status}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("upstream ping body must be JSON");
+        assert!(
+            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
+            "proxied /-/ping must return the upstream payload, got {parsed:?}"
+        );
+    }
+
+    /// Regression guard: requests that previously fell into the /:package/:version
+    /// catch-all (package="-", version="ping") must no longer produce
+    /// `404 Version 'ping' not found for package '-'`.
+    #[tokio::test]
+    async fn test_local_repo_meta_ping_does_not_produce_package_not_found_404() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let app = fx.router_anon(super::router());
+        let uri = format!("/{}/-/ping", fx.repo_key);
+        let req = tdh::get(uri);
+        let (status, bytes) = tdh::send(app, req).await;
+
+        fx.teardown().await;
+
+        // The old behaviour was 404 with body mentioning package `-`.
+        // The new route must never return that error.
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "/-/ping must not 404; the catch-all regression is back"
+        );
+        if status == StatusCode::NOT_FOUND {
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(
+                !body.contains("package '-'") && !body.contains("Version 'ping'"),
+                "/-/ping must not be treated as package lookup, got: {body}"
+            );
+        }
+    }
+}

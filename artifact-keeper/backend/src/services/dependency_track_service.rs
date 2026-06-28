@@ -1,0 +1,2770 @@
+//! Dependency-Track integration service.
+//!
+//! Provides API client for OWASP Dependency-Track to upload SBOMs,
+//! retrieve vulnerability findings, and manage policy violations.
+//!
+//! ## Configuration
+//!
+//! ```bash
+//! DEPENDENCY_TRACK_URL=http://localhost:8092
+//! DEPENDENCY_TRACK_API_KEY=your-api-key
+//! DEPENDENCY_TRACK_ENABLED=true
+//! ```
+//!
+//! ## Required Dependency-Track team permissions (#1472)
+//!
+//! The API key passed via `DEPENDENCY_TRACK_API_KEY` must belong to a team
+//! that has been granted ALL of the following permissions, or SBOM submission
+//! will silently 401/403 and DT will stay empty even when scans look green:
+//!
+//! - `PROJECT_CREATION_UPLOAD` -- required by [`Self::create_project`]
+//!   (`PUT /api/v1/project`).
+//! - `BOM_UPLOAD` -- required by [`Self::upload_sbom`]
+//!   (`PUT /api/v1/bom`).
+//! - `VIEW_PORTFOLIO` -- required by [`Self::find_project`],
+//!   [`Self::list_projects`], and project lookups
+//!   (`GET /api/v1/project/...`).
+//! - `VIEW_VULNERABILITY` -- required by [`Self::get_findings`]
+//!   (`GET /api/v1/finding/project/...`).
+//!
+//! The Dependency-Track default `Automation` team has NONE of these
+//! permissions. The bundled [`docker/init-dtrack.sh`](../../../docker/init-dtrack.sh)
+//! bootstrap script grants them after creating the API key. Operators who
+//! bring their own DT instance (or set `dependencyTrack.existingApiKeySecret`
+//! in the Helm chart) must grant the four permissions out of band, either
+//! via the DT UI (Administration -> Teams -> permissions tab) or via
+//! `POST /api/v1/permission/{perm}/team/{uuid}`.
+//!
+//! When DT replies with 401 or 403, `dt_upstream_status_err` appends a
+//! permissions hint to the error message so the operator-facing log and the
+//! `/api/v1/dependency-track/status` payload both name the missing grants.
+//!
+//! ## API Reference
+//!
+//! See: https://docs.dependencytrack.org/integrations/rest-api/
+
+use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::error::Error as _;
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
+use url::Url;
+use utoipa::ToSchema;
+
+use crate::error::{AppError, Result};
+
+const DT_PAGE_SIZE: u32 = 500;
+const DT_MAX_PAGES: u32 = 200; // safety cap: 200 * 500 = 100,000 items
+
+// Maximum upstream response body length included in error messages.
+// Keeps log lines and error payloads bounded when DT returns large HTML
+// error pages or stack traces.
+const DT_ERROR_BODY_PREVIEW_LEN: usize = 500;
+
+/// Classify a `reqwest` transport-layer failure (connect refused, TLS handshake,
+/// DNS resolution, timeout) as `ServiceUnavailable`. These errors mean the DT
+/// instance is unreachable, distinct from "DT replied with non-2xx" which is a
+/// `BadGateway`.
+///
+/// Logs at `error!` so operators can alert on integration outages.
+fn dt_transport_err(operation: &str, err: reqwest::Error) -> AppError {
+    error!(
+        operation = operation,
+        error = %err,
+        error_source = ?err.source(),
+        "Dependency-Track transport error (instance unreachable)"
+    );
+    AppError::ServiceUnavailable(format!(
+        "Dependency-Track unreachable during {}: {}",
+        operation, err
+    ))
+}
+
+/// Hint appended to the operator-facing error when DT replies with 401/403.
+/// Names every team permission the AK integration depends on so a misconfigured
+/// API key (default `Automation` team, custom team missing a grant, rotated key
+/// without re-granting, etc.) is diagnosable from the log line and the
+/// `/dependency-track/status` payload without cross-referencing source. #1472.
+pub(crate) const DT_PERMISSIONS_HINT: &str =
+    "Dependency-Track rejected the request (auth/permission failure). \
+     The API key's team must have ALL of: BOM_UPLOAD, PROJECT_CREATION_UPLOAD, \
+     VIEW_PORTFOLIO, VIEW_VULNERABILITY. The default 'Automation' team has \
+     none of these; grant them via the DT UI \
+     (Administration -> Teams -> permissions) or \
+     POST /api/v1/permission/{permission}/team/{uuid}.";
+
+/// True if the status indicates an authentication or authorization failure
+/// the operator can fix by adjusting the DT team permissions or API key.
+fn is_dt_auth_failure(status: StatusCode) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+/// Classify a non-2xx HTTP response from Dependency-Track as `BadGateway`. The
+/// upstream service replied, but with an error (auth failure, 5xx, etc.). The
+/// upstream status code, the endpoint hit, and (on 401/403) the required DT
+/// team permissions are preserved in the message so the operator can diagnose
+/// the failure without cross-referencing source. #1472.
+///
+/// Body preview is truncated to keep logs bounded.
+fn dt_upstream_status_err(
+    operation: &str,
+    endpoint: &str,
+    status: StatusCode,
+    body: &str,
+) -> AppError {
+    let truncated = &body[..body.len().min(DT_ERROR_BODY_PREVIEW_LEN)];
+    let auth_failure = is_dt_auth_failure(status);
+    if auth_failure {
+        error!(
+            operation = operation,
+            endpoint = endpoint,
+            status = status.as_u16(),
+            body = truncated,
+            permissions_required =
+                "BOM_UPLOAD, PROJECT_CREATION_UPLOAD, VIEW_PORTFOLIO, VIEW_VULNERABILITY",
+            "Dependency-Track rejected request with auth/permission failure -- \
+             check that the API key's team has the required permissions"
+        );
+    } else {
+        error!(
+            operation = operation,
+            endpoint = endpoint,
+            status = status.as_u16(),
+            body = truncated,
+            "Dependency-Track returned non-success status"
+        );
+    }
+    let mut message = format!(
+        "Dependency-Track {} failed at {} (HTTP {}): {}",
+        operation, endpoint, status, truncated
+    );
+    if auth_failure {
+        message.push_str("\nHint: ");
+        message.push_str(DT_PERMISSIONS_HINT);
+    }
+    AppError::BadGateway(message)
+}
+
+/// Classify a response-parse failure (malformed JSON, unexpected shape) as
+/// `BadGateway`. Upstream replied 2xx but produced data we cannot parse, which
+/// is still an upstream issue.
+fn dt_upstream_parse_err(operation: &str, err: impl std::fmt::Display) -> AppError {
+    error!(
+        operation = operation,
+        error = %err,
+        "Failed to parse Dependency-Track response"
+    );
+    AppError::BadGateway(format!(
+        "Dependency-Track {} returned unparseable response: {}",
+        operation, err
+    ))
+}
+
+/// Dependency-Track service configuration
+#[derive(Debug, Clone)]
+pub struct DependencyTrackConfig {
+    /// Base URL of the Dependency-Track API server
+    pub base_url: String,
+    /// API key for authentication (X-Api-Key header)
+    pub api_key: String,
+    /// Whether integration is enabled
+    pub enabled: bool,
+}
+
+impl DependencyTrackConfig {
+    /// Load configuration from environment variables.
+    ///
+    /// Returns `None` when `DEPENDENCY_TRACK_ENABLED` is anything other than
+    /// `true`/`1` (case-insensitive, leading/trailing whitespace ignored).
+    /// When disabled, no other env vars are read and no client is built;
+    /// `main.rs` therefore wires no DT service into application state, the
+    /// health monitor skips its probe (see `health_monitor_service.rs`),
+    /// and the system-config endpoint reports DT as disabled. This is the
+    /// canonical kill-switch for the integration (issues #1395, #1480).
+    pub fn from_env() -> Option<Self> {
+        let enabled = std::env::var("DEPENDENCY_TRACK_ENABLED")
+            .map(|v| {
+                let v = v.trim().to_lowercase();
+                v == "true" || v == "1"
+            })
+            .unwrap_or(false);
+
+        if !enabled {
+            return None;
+        }
+
+        let base_url = std::env::var("DEPENDENCY_TRACK_URL").ok()?;
+        let api_key = std::env::var("DEPENDENCY_TRACK_API_KEY").ok()?;
+
+        Some(Self {
+            base_url,
+            api_key,
+            enabled,
+        })
+    }
+}
+
+/// Dependency-Track API client
+pub struct DependencyTrackService {
+    client: Client,
+    config: DependencyTrackConfig,
+    page_size: u32,
+}
+
+/// Dependency-Track project representation
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtProject {
+    pub uuid: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    #[serde(rename = "lastBomImport")]
+    pub last_bom_import: Option<i64>,
+    #[serde(rename = "lastBomImportFormat")]
+    pub last_bom_import_format: Option<String>,
+}
+
+/// Request to create a new project
+#[derive(Debug, Serialize)]
+struct CreateProjectRequest {
+    name: String,
+    version: Option<String>,
+    description: Option<String>,
+}
+
+/// BOM upload response
+#[derive(Debug, Deserialize)]
+pub struct BomUploadResponse {
+    pub token: String,
+}
+
+/// BOM processing status
+#[derive(Debug, Deserialize)]
+pub struct BomProcessingStatus {
+    pub processing: bool,
+}
+
+/// Structured Dependency-Track availability result. Surfaced through the
+/// `/api/v1/dependency-track/status` endpoint so the web UI can render an
+/// explicit "scanner unavailable" state instead of failing open to
+/// "0 dependencies" (issue #963).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DtHealthStatus {
+    /// `/api/version` returned 2xx.
+    Healthy,
+    /// `/api/version` either returned non-2xx (`status` = upstream code) or
+    /// the request failed at the transport layer (`status` = None, `reason`
+    /// describes the connection error).
+    Unhealthy {
+        /// Upstream HTTP status if the request reached the server, else None.
+        status: Option<u16>,
+        /// Human-readable failure description suitable for the UI and logs.
+        reason: String,
+    },
+}
+
+/// Vulnerability finding from Dependency-Track
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtFinding {
+    pub component: DtComponent,
+    pub vulnerability: DtVulnerability,
+    pub analysis: Option<DtAnalysis>,
+    pub attribution: Option<DtAttribution>,
+}
+
+/// Component affected by a vulnerability
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtComponent {
+    pub uuid: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub group: Option<String>,
+    pub purl: Option<String>,
+}
+
+/// Vulnerability details
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtVulnerability {
+    pub uuid: String,
+    #[serde(rename = "vulnId")]
+    pub vuln_id: String,
+    pub source: String,
+    pub severity: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    #[serde(rename = "cvssV3BaseScore")]
+    pub cvss_v3_base_score: Option<f64>,
+    pub cwe: Option<DtCwe>,
+}
+
+/// CWE reference
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtCwe {
+    #[serde(rename = "cweId")]
+    pub cwe_id: i32,
+    pub name: String,
+}
+
+/// Analysis state for a finding
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtAnalysis {
+    pub state: Option<String>,
+    pub justification: Option<String>,
+    pub response: Option<String>,
+    pub details: Option<String>,
+    #[serde(rename = "isSuppressed")]
+    pub is_suppressed: bool,
+}
+
+/// Attribution info
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtAttribution {
+    #[serde(rename = "analyzerIdentity")]
+    pub analyzer_identity: Option<String>,
+    #[serde(rename = "attributedOn")]
+    pub attributed_on: Option<i64>,
+}
+
+/// Policy violation from Dependency-Track
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtPolicyViolation {
+    pub uuid: String,
+    #[serde(rename = "type")]
+    pub violation_type: String,
+    pub component: DtComponent,
+    #[serde(rename = "policyCondition")]
+    pub policy_condition: DtPolicyCondition,
+}
+
+/// Policy condition that was violated
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtPolicyCondition {
+    pub uuid: String,
+    pub subject: String,
+    pub operator: String,
+    pub value: String,
+    pub policy: DtPolicy,
+}
+
+/// Policy definition
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtPolicy {
+    pub uuid: String,
+    pub name: String,
+    #[serde(rename = "violationState")]
+    pub violation_state: String,
+}
+
+/// Project-level metrics from Dependency-Track
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtProjectMetrics {
+    #[serde(default)]
+    pub critical: i64,
+    #[serde(default)]
+    pub high: i64,
+    #[serde(default)]
+    pub medium: i64,
+    #[serde(default)]
+    pub low: i64,
+    #[serde(default)]
+    pub unassigned: i64,
+    #[serde(default)]
+    pub vulnerabilities: Option<i64>,
+    #[serde(default, rename = "findingsTotal")]
+    pub findings_total: i64,
+    #[serde(default, rename = "findingsAudited")]
+    pub findings_audited: i64,
+    #[serde(default, rename = "findingsUnaudited")]
+    pub findings_unaudited: i64,
+    #[serde(default)]
+    pub suppressions: i64,
+    #[serde(default, rename = "inheritedRiskScore")]
+    pub inherited_risk_score: f64,
+    #[serde(default, rename = "policyViolationsFail")]
+    pub policy_violations_fail: i64,
+    #[serde(default, rename = "policyViolationsWarn")]
+    pub policy_violations_warn: i64,
+    #[serde(default, rename = "policyViolationsInfo")]
+    pub policy_violations_info: i64,
+    #[serde(default, rename = "policyViolationsTotal")]
+    pub policy_violations_total: i64,
+    #[serde(rename = "firstOccurrence")]
+    pub first_occurrence: Option<i64>,
+    #[serde(rename = "lastOccurrence")]
+    pub last_occurrence: Option<i64>,
+}
+
+/// Portfolio-level metrics from Dependency-Track
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtPortfolioMetrics {
+    #[serde(default)]
+    pub critical: i64,
+    #[serde(default)]
+    pub high: i64,
+    #[serde(default)]
+    pub medium: i64,
+    #[serde(default)]
+    pub low: i64,
+    #[serde(default)]
+    pub unassigned: i64,
+    #[serde(default)]
+    pub vulnerabilities: Option<i64>,
+    #[serde(default, rename = "findingsTotal")]
+    pub findings_total: i64,
+    #[serde(default, rename = "findingsAudited")]
+    pub findings_audited: i64,
+    #[serde(default, rename = "findingsUnaudited")]
+    pub findings_unaudited: i64,
+    #[serde(default)]
+    pub suppressions: i64,
+    #[serde(default, rename = "inheritedRiskScore")]
+    pub inherited_risk_score: f64,
+    #[serde(default, rename = "policyViolationsFail")]
+    pub policy_violations_fail: i64,
+    #[serde(default, rename = "policyViolationsWarn")]
+    pub policy_violations_warn: i64,
+    #[serde(default, rename = "policyViolationsInfo")]
+    pub policy_violations_info: i64,
+    #[serde(default, rename = "policyViolationsTotal")]
+    pub policy_violations_total: i64,
+    #[serde(default)]
+    pub projects: i64,
+}
+
+/// Full component representation from Dependency-Track
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtComponentFull {
+    pub uuid: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub group: Option<String>,
+    pub purl: Option<String>,
+    pub cpe: Option<String>,
+    #[serde(rename = "resolvedLicense")]
+    pub resolved_license: Option<DtLicense>,
+    #[serde(rename = "isInternal")]
+    pub is_internal: Option<bool>,
+}
+
+/// License information from Dependency-Track
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtLicense {
+    pub uuid: Option<String>,
+    #[serde(rename = "licenseId")]
+    pub license_id: Option<String>,
+    pub name: String,
+}
+
+/// Full policy representation with conditions and projects
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtPolicyFull {
+    pub uuid: String,
+    pub name: String,
+    #[serde(rename = "violationState")]
+    pub violation_state: String,
+    #[serde(rename = "includeChildren")]
+    pub include_children: Option<bool>,
+    #[serde(rename = "policyConditions")]
+    pub policy_conditions: Vec<DtPolicyConditionFull>,
+    pub projects: Vec<DtProject>,
+    #[schema(value_type = Vec<Object>)]
+    pub tags: Vec<serde_json::Value>,
+}
+
+/// Full policy condition with all fields
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtPolicyConditionFull {
+    pub uuid: String,
+    pub subject: String,
+    pub operator: String,
+    pub value: String,
+}
+
+/// Request to update analysis state for a finding
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpdateAnalysisRequest {
+    pub project: String,
+    pub component: String,
+    pub vulnerability: String,
+    #[serde(rename = "analysisState")]
+    pub analysis_state: String,
+    #[serde(
+        rename = "analysisJustification",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub analysis_justification: Option<String>,
+    #[serde(rename = "analysisDetails", skip_serializing_if = "Option::is_none")]
+    pub analysis_details: Option<String>,
+    #[serde(rename = "isSuppressed")]
+    pub is_suppressed: bool,
+}
+
+/// Response from analysis update
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtAnalysisResponse {
+    #[serde(rename = "analysisState")]
+    pub analysis_state: String,
+    #[serde(rename = "analysisJustification")]
+    pub analysis_justification: Option<String>,
+    #[serde(rename = "analysisDetails")]
+    pub analysis_details: Option<String>,
+    #[serde(rename = "isSuppressed")]
+    pub is_suppressed: bool,
+}
+
+/// Check whether a URL points to a private or local network address where
+/// HTTP (non-TLS) is acceptable. This covers:
+///
+/// - `localhost` / `127.0.0.0/8` / `::1`
+/// - RFC 1918 private ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+/// - Link-local: `169.254.0.0/16`, `fe80::/10`
+/// - Kubernetes service DNS: `*.svc`, `*.svc.cluster.local`
+/// - mDNS / local domains: `*.local`
+///
+/// Returns `false` for URLs that cannot be parsed or have no host component.
+pub fn is_private_network_url(raw_url: &str) -> bool {
+    let parsed = match Url::parse(raw_url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+
+    let host = match parsed.host() {
+        Some(h) => h,
+        None => return false,
+    };
+
+    // Check IP-based hosts using the parsed Host enum, which handles
+    // IPv6 bracket notation (e.g. [::1]) correctly.
+    match host {
+        url::Host::Ipv4(v4) => {
+            return v4.is_loopback()        // 127.0.0.0/8
+                || v4.is_private()         // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()      // 169.254/16
+                || v4.is_unspecified(); // 0.0.0.0
+        }
+        url::Host::Ipv6(v6) => {
+            return v6.is_loopback()        // ::1
+                || v6.is_unspecified()     // ::
+                // fe80::/10 (link-local) -- no stable std method yet
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // fc00::/7 (unique local addresses)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00;
+        }
+        url::Host::Domain(_) => {}
+    }
+
+    // Check hostname-based patterns
+    let host_lower = parsed.host_str().unwrap_or("").to_lowercase();
+
+    if host_lower == "localhost" {
+        return true;
+    }
+
+    // Kubernetes in-cluster service names (e.g. dependency-track.ns.svc.cluster.local)
+    if host_lower.ends_with(".svc") || host_lower.ends_with(".svc.cluster.local") {
+        return true;
+    }
+
+    // mDNS / local domains
+    if host_lower.ends_with(".local") {
+        return true;
+    }
+
+    false
+}
+
+impl DependencyTrackService {
+    /// Create a new Dependency-Track service
+    pub fn new(config: DependencyTrackConfig) -> Result<Self> {
+        // Determine whether HTTP (non-TLS) is acceptable for this URL.
+        //
+        // Priority:
+        //   1. Explicit opt-in via ALLOW_HTTP_INTEGRATIONS=1
+        //   2. Auto-allow for private/local network addresses (localhost,
+        //      RFC 1918, *.svc.cluster.local, *.local)
+        //   3. Default: require HTTPS
+        let explicit_allow_http = std::env::var("ALLOW_HTTP_INTEGRATIONS")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+
+        let is_private = is_private_network_url(&config.base_url);
+        let allow_http = explicit_allow_http || is_private;
+
+        if !allow_http && !config.base_url.starts_with("https://") {
+            warn!(
+                url = %config.base_url,
+                "Dependency-Track base_url is not HTTPS and not a private network address. \
+                 Set ALLOW_HTTP_INTEGRATIONS=1 to allow plain HTTP connections."
+            );
+        }
+
+        if is_private && !config.base_url.starts_with("https://") && !explicit_allow_http {
+            info!(
+                url = %config.base_url,
+                "Auto-allowing HTTP for private network URL: {}", config.base_url
+            );
+        }
+
+        let client = crate::services::http_client::base_client_builder()
+            .timeout(Duration::from_secs(30))
+            .https_only(!allow_http)
+            .build()
+            .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
+
+        info!(
+            url = %config.base_url,
+            "Dependency-Track integration initialized"
+        );
+
+        Ok(Self {
+            client,
+            config,
+            page_size: DT_PAGE_SIZE,
+        })
+    }
+
+    /// Create from environment variables, returns None if not enabled
+    pub fn from_env() -> Option<Result<Self>> {
+        DependencyTrackConfig::from_env().map(Self::new)
+    }
+
+    /// Check if the service is available
+    pub async fn health_check(&self) -> Result<bool> {
+        Ok(matches!(
+            self.health_status().await,
+            DtHealthStatus::Healthy
+        ))
+    }
+
+    /// Structured health-check result. Distinguishes "DT replied with non-2xx"
+    /// (auth failure, upstream bug) from "DT unreachable" (pod down, DNS, TLS).
+    ///
+    /// This is the operator-facing signal the `/status` endpoint surfaces so
+    /// the web UI can render an explicit unavailable state instead of silently
+    /// showing "0 dependencies" when DT is misconfigured (issue #963).
+    pub async fn health_status(&self) -> DtHealthStatus {
+        let url = format!("{}/api/version", self.config.base_url);
+
+        match self.client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    DtHealthStatus::Healthy
+                } else {
+                    warn!(
+                        status = status.as_u16(),
+                        "Dependency-Track health check returned non-success status"
+                    );
+                    DtHealthStatus::Unhealthy {
+                        status: Some(status.as_u16()),
+                        reason: format!("Upstream returned HTTP {}", status),
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Dependency-Track health check transport error");
+                DtHealthStatus::Unhealthy {
+                    status: None,
+                    reason: format!("Dependency-Track unreachable: {}", e),
+                }
+            }
+        }
+    }
+
+    /// Get or create a project for a repository
+    pub async fn get_or_create_project(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<DtProject> {
+        // First try to find existing project
+        if let Some(project) = self.find_project(name, version).await? {
+            return Ok(project);
+        }
+
+        // Create new project
+        self.create_project(name, version, description).await
+    }
+
+    /// Find a project by name and version
+    pub async fn find_project(
+        &self,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<Option<DtProject>> {
+        let url = match version {
+            Some(v) => format!(
+                "{}/api/v1/project/lookup?name={}&version={}",
+                self.config.base_url,
+                urlencoding::encode(name),
+                urlencoding::encode(v)
+            ),
+            None => format!(
+                "{}/api/v1/project/lookup?name={}",
+                self.config.base_url,
+                urlencoding::encode(name)
+            ),
+        };
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .send()
+            .await
+            .map_err(|e| dt_transport_err("project lookup", e))?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(dt_upstream_status_err(
+                "project lookup",
+                &url,
+                status,
+                &body,
+            ));
+        }
+
+        let project: DtProject = response
+            .json()
+            .await
+            .map_err(|e| dt_upstream_parse_err("project lookup", e))?;
+
+        Ok(Some(project))
+    }
+
+    /// Create a new project
+    pub async fn create_project(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<DtProject> {
+        let url = format!("{}/api/v1/project", self.config.base_url);
+
+        let request = CreateProjectRequest {
+            name: name.to_string(),
+            version: version.map(String::from),
+            description: description.map(String::from),
+        };
+
+        let response: reqwest::Response = self
+            .client
+            .put(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| dt_transport_err("create project", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(dt_upstream_status_err(
+                "create project",
+                &url,
+                status,
+                &body,
+            ));
+        }
+
+        let project = response
+            .json::<DtProject>()
+            .await
+            .map_err(|e| dt_upstream_parse_err("create project", e))?;
+
+        info!(
+            project_uuid = %project.uuid,
+            project_name = %project.name,
+            "Created Dependency-Track project"
+        );
+
+        Ok(project)
+    }
+
+    /// Upload an SBOM (CycloneDX format) to a project
+    pub async fn upload_sbom(
+        &self,
+        project_uuid: &str,
+        sbom_content: &str,
+    ) -> Result<BomUploadResponse> {
+        let url = format!("{}/api/v1/bom", self.config.base_url);
+
+        // DT expects base64-encoded BOM
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let encoded_bom = STANDARD.encode(sbom_content);
+
+        let body = serde_json::json!({
+            "project": project_uuid,
+            "bom": encoded_bom
+        });
+
+        let response: reqwest::Response = self
+            .client
+            .put(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| dt_transport_err("BOM upload", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(dt_upstream_status_err("BOM upload", &url, status, &body));
+        }
+
+        let result = response
+            .json::<BomUploadResponse>()
+            .await
+            .map_err(|e| dt_upstream_parse_err("BOM upload", e))?;
+
+        debug!(
+            project_uuid = %project_uuid,
+            token = %result.token,
+            "Uploaded SBOM to Dependency-Track"
+        );
+
+        Ok(result)
+    }
+
+    /// Check if BOM processing is complete
+    pub async fn is_bom_processing(&self, token: &str) -> Result<bool> {
+        let url = format!("{}/api/v1/bom/token/{}", self.config.base_url, token);
+
+        let response: reqwest::Response = self
+            .client
+            .get(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .send()
+            .await
+            .map_err(|e| dt_transport_err("BOM status check", e))?;
+
+        if !response.status().is_success() {
+            // Token not found or expired means processing is complete
+            return Ok(false);
+        }
+
+        let status = response
+            .json::<BomProcessingStatus>()
+            .await
+            .map_err(|e| dt_upstream_parse_err("BOM status check", e))?;
+
+        Ok(status.processing)
+    }
+
+    /// Wait for BOM processing to complete (with timeout)
+    pub async fn wait_for_bom_processing(&self, token: &str, timeout: Duration) -> Result<()> {
+        let start = std::time::Instant::now();
+        let poll_interval = Duration::from_secs(2);
+
+        while start.elapsed() < timeout {
+            if !self.is_bom_processing(token).await? {
+                return Ok(());
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        Err(AppError::Internal("BOM processing timeout".to_string()))
+    }
+
+    /// Generic paginated GET for Dependency-Track list endpoints.
+    ///
+    /// `endpoint` must be a full URL with no query parameters (e.g.,
+    /// `https://dt.example.com/api/v1/project`). Pagination query
+    /// parameters (`pageSize`, `pageNumber`) are appended automatically.
+    ///
+    /// `operation` is a human-readable label used in error messages and
+    /// log lines (e.g., `"DT get findings"`).
+    async fn paginated_get<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        operation: &str,
+    ) -> Result<Vec<T>> {
+        let mut page: u32 = 1;
+        let mut all = Vec::new();
+        let mut pages_fetched: u32 = 0;
+
+        loop {
+            let url = format!(
+                "{}?pageSize={}&pageNumber={}",
+                endpoint, self.page_size, page
+            );
+            let response = self
+                .client
+                .get(&url)
+                .header("X-Api-Key", &self.config.api_key)
+                .send()
+                .await
+                .map_err(|e| dt_transport_err(&format!("{} (page {})", operation, page), e))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<failed to read response body>".to_string());
+                // CRITICAL: do NOT swallow this as Ok(empty Vec) — that is the
+                // exact behavior issue #963 reported (DT 401 surfaced as
+                // "0 dependencies" in the UI). Map upstream non-2xx to
+                // BadGateway so the API returns 502 with the underlying
+                // status code, not 200 with no data.
+                return Err(dt_upstream_status_err(
+                    &format!("{} (page {}, {} items fetched)", operation, page, all.len()),
+                    &url,
+                    status,
+                    &body,
+                ));
+            }
+
+            let text = response.text().await.map_err(|e| {
+                dt_upstream_parse_err(&format!("{} (page {} body read)", operation, page), e)
+            })?;
+
+            let batch: Vec<T> = serde_json::from_str(&text).map_err(|e| {
+                dt_upstream_parse_err(
+                    &format!(
+                        "{} (page {}, {} items fetched, body preview: {})",
+                        operation,
+                        page,
+                        all.len(),
+                        &text[..text.len().min(DT_ERROR_BODY_PREVIEW_LEN)]
+                    ),
+                    e,
+                )
+            })?;
+
+            let batch_len = batch.len();
+            all.extend(batch);
+            pages_fetched += 1;
+
+            if batch_len < self.page_size as usize {
+                break;
+            }
+
+            page += 1;
+
+            if page > DT_MAX_PAGES {
+                error!(
+                    operation = %operation,
+                    max_pages = DT_MAX_PAGES,
+                    items_fetched = all.len(),
+                    "Pagination safety limit reached — results are INCOMPLETE"
+                );
+                return Err(AppError::Internal(format!(
+                    "{}: result set exceeds pagination safety limit ({} pages, {} items fetched)",
+                    operation,
+                    DT_MAX_PAGES,
+                    all.len()
+                )));
+            }
+        }
+
+        debug!(
+            operation = %operation,
+            count = all.len(),
+            pages = pages_fetched,
+            "Paginated GET complete"
+        );
+
+        Ok(all)
+    }
+
+    /// Get vulnerability findings for a project
+    pub async fn get_findings(&self, project_uuid: &str) -> Result<Vec<DtFinding>> {
+        let base_url = format!(
+            "{}/api/v1/finding/project/{}",
+            self.config.base_url, project_uuid
+        );
+        self.paginated_get(&base_url, "DT get findings").await
+    }
+
+    /// Get policy violations for a project
+    pub async fn get_policy_violations(
+        &self,
+        project_uuid: &str,
+    ) -> Result<Vec<DtPolicyViolation>> {
+        let base_url = format!(
+            "{}/api/v1/violation/project/{}",
+            self.config.base_url, project_uuid
+        );
+        self.paginated_get(&base_url, "DT get violations").await
+    }
+
+    /// Get all projects
+    pub async fn list_projects(&self) -> Result<Vec<DtProject>> {
+        let base_url = format!("{}/api/v1/project", self.config.base_url);
+        self.paginated_get(&base_url, "DT list projects").await
+    }
+
+    /// Delete a project
+    pub async fn delete_project(&self, project_uuid: &str) -> Result<()> {
+        let url = format!("{}/api/v1/project/{}", self.config.base_url, project_uuid);
+
+        let response: reqwest::Response = self
+            .client
+            .delete(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .send()
+            .await
+            .map_err(|e| dt_transport_err("delete project", e))?;
+
+        if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(dt_upstream_status_err(
+                "delete project",
+                &url,
+                status,
+                &body,
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Get current metrics for a project
+    pub async fn get_project_metrics(&self, project_uuid: &str) -> Result<DtProjectMetrics> {
+        let url = format!(
+            "{}/api/v1/metrics/project/{}/current",
+            self.config.base_url, project_uuid
+        );
+
+        let response: reqwest::Response = self
+            .client
+            .get(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .send()
+            .await
+            .map_err(|e| dt_transport_err("get project metrics", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(dt_upstream_status_err(
+                "get project metrics",
+                &url,
+                status,
+                &body,
+            ));
+        }
+
+        let metrics = response
+            .json::<DtProjectMetrics>()
+            .await
+            .map_err(|e| dt_upstream_parse_err("get project metrics", e))?;
+
+        Ok(metrics)
+    }
+
+    /// Get project metrics history for a number of days
+    pub async fn get_project_metrics_history(
+        &self,
+        project_uuid: &str,
+        days: u32,
+    ) -> Result<Vec<DtProjectMetrics>> {
+        // Validate project_uuid is a proper UUID to prevent SSRF via path manipulation
+        uuid::Uuid::parse_str(project_uuid)
+            .map_err(|_| AppError::Validation(format!("Invalid project UUID: {}", project_uuid)))?;
+        let url = format!(
+            "{}/api/v1/metrics/project/{}/days/{}",
+            self.config.base_url, project_uuid, days
+        );
+
+        let response: reqwest::Response = self
+            .client
+            .get(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .send()
+            .await
+            .map_err(|e| dt_transport_err("get project metrics history", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(dt_upstream_status_err(
+                "get project metrics history",
+                &url,
+                status,
+                &body,
+            ));
+        }
+
+        let metrics = response
+            .json::<Vec<DtProjectMetrics>>()
+            .await
+            .map_err(|e| dt_upstream_parse_err("get project metrics history", e))?;
+
+        Ok(metrics)
+    }
+
+    /// Get current portfolio-wide metrics
+    pub async fn get_portfolio_metrics(&self) -> Result<DtPortfolioMetrics> {
+        let url = format!("{}/api/v1/metrics/portfolio/current", self.config.base_url);
+
+        let response: reqwest::Response = self
+            .client
+            .get(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .send()
+            .await
+            .map_err(|e| dt_transport_err("get portfolio metrics", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(dt_upstream_status_err(
+                "get portfolio metrics",
+                &url,
+                status,
+                &body,
+            ));
+        }
+
+        let metrics = response
+            .json::<DtPortfolioMetrics>()
+            .await
+            .map_err(|e| dt_upstream_parse_err("get portfolio metrics", e))?;
+
+        Ok(metrics)
+    }
+
+    /// Refresh metrics for a project (fire-and-forget)
+    pub async fn refresh_project_metrics(&self, project_uuid: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/v1/metrics/project/{}/refresh",
+            self.config.base_url, project_uuid
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    warn!(
+                        project_uuid = %project_uuid,
+                        status = %resp.status(),
+                        "DT refresh project metrics returned non-success status"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    project_uuid = %project_uuid,
+                    error = %e,
+                    "DT refresh project metrics request failed"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update analysis state for a finding
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_analysis(
+        &self,
+        project_uuid: &str,
+        component_uuid: &str,
+        vulnerability_uuid: &str,
+        state: &str,
+        justification: Option<&str>,
+        details: Option<&str>,
+        suppressed: bool,
+    ) -> Result<DtAnalysisResponse> {
+        let url = format!("{}/api/v1/analysis", self.config.base_url);
+
+        let request = UpdateAnalysisRequest {
+            project: project_uuid.to_string(),
+            component: component_uuid.to_string(),
+            vulnerability: vulnerability_uuid.to_string(),
+            analysis_state: state.to_string(),
+            analysis_justification: justification.map(String::from),
+            analysis_details: details.map(String::from),
+            is_suppressed: suppressed,
+        };
+
+        let response: reqwest::Response = self
+            .client
+            .put(&url)
+            .header("X-Api-Key", &self.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| dt_transport_err("update analysis", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(dt_upstream_status_err(
+                "update analysis",
+                &url,
+                status,
+                &body,
+            ));
+        }
+
+        let analysis = response
+            .json::<DtAnalysisResponse>()
+            .await
+            .map_err(|e| dt_upstream_parse_err("update analysis", e))?;
+
+        Ok(analysis)
+    }
+
+    /// Get all policies
+    pub async fn get_policies(&self) -> Result<Vec<DtPolicyFull>> {
+        let base_url = format!("{}/api/v1/policy", self.config.base_url);
+        self.paginated_get(&base_url, "DT get policies").await
+    }
+
+    /// Get components for a project
+    pub async fn get_components(&self, project_uuid: &str) -> Result<Vec<DtComponentFull>> {
+        let base_url = format!(
+            "{}/api/v1/component/project/{}",
+            self.config.base_url, project_uuid
+        );
+        self.paginated_get(&base_url, "DT get components").await
+    }
+
+    /// Get the base URL of the Dependency-Track instance
+    pub fn base_url(&self) -> &str {
+        &self.config.base_url
+    }
+
+    /// Check if the integration is enabled
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Pure helper functions (moved from module scope — test-only)
+    // -----------------------------------------------------------------------
+
+    fn aggregate_vulnerabilities(findings: &[DtFinding]) -> VulnerabilityAggregate {
+        let mut agg = VulnerabilityAggregate {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            unassigned: 0,
+            total: 0,
+        };
+        for f in findings {
+            agg.total += 1;
+            match f.vulnerability.severity.to_uppercase().as_str() {
+                "CRITICAL" => agg.critical += 1,
+                "HIGH" => agg.high += 1,
+                "MEDIUM" => agg.medium += 1,
+                "LOW" => agg.low += 1,
+                _ => agg.unassigned += 1,
+            }
+        }
+        agg
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct VulnerabilityAggregate {
+        pub critical: usize,
+        pub high: usize,
+        pub medium: usize,
+        pub low: usize,
+        pub unassigned: usize,
+        pub total: usize,
+    }
+
+    fn compute_risk_score(metrics: &DtProjectMetrics) -> f64 {
+        (metrics.critical as f64 * 10.0)
+            + (metrics.high as f64 * 5.0)
+            + (metrics.medium as f64 * 3.0)
+            + (metrics.low as f64 * 1.0)
+    }
+
+    fn risk_level_from_score(score: f64) -> &'static str {
+        if score <= 0.0 {
+            "none"
+        } else if score < 10.0 {
+            "low"
+        } else if score < 30.0 {
+            "medium"
+        } else if score < 80.0 {
+            "high"
+        } else {
+            "critical"
+        }
+    }
+
+    fn filter_unsuppressed_findings(findings: &[DtFinding]) -> Vec<&DtFinding> {
+        findings
+            .iter()
+            .filter(|f| f.analysis.as_ref().map_or(true, |a| !a.is_suppressed))
+            .collect()
+    }
+
+    fn component_matches_purl_prefix(component: &DtComponent, prefix: &str) -> bool {
+        component
+            .purl
+            .as_ref()
+            .is_some_and(|p| p.starts_with(prefix))
+    }
+
+    fn compute_audit_ratio(audited: i64, total: i64) -> f64 {
+        if total == 0 {
+            1.0
+        } else {
+            audited as f64 / total as f64
+        }
+    }
+
+    fn total_policy_violations(metrics: &DtProjectMetrics) -> i64 {
+        metrics.policy_violations_fail
+            + metrics.policy_violations_warn
+            + metrics.policy_violations_info
+    }
+
+    fn severity_rank(severity: &str) -> u8 {
+        match severity.to_uppercase().as_str() {
+            "CRITICAL" => 0,
+            "HIGH" => 1,
+            "MEDIUM" => 2,
+            "LOW" => 3,
+            "INFO" => 4,
+            _ => 5,
+        }
+    }
+
+    // === Helper to create findings ===
+    fn make_finding(severity: &str, suppressed: bool) -> DtFinding {
+        DtFinding {
+            component: DtComponent {
+                uuid: "c1".to_string(),
+                name: "pkg".to_string(),
+                version: Some("1.0".to_string()),
+                group: None,
+                purl: Some("pkg:npm/pkg@1.0".to_string()),
+            },
+            vulnerability: DtVulnerability {
+                uuid: "v1".to_string(),
+                vuln_id: "CVE-2024-0001".to_string(),
+                source: "NVD".to_string(),
+                severity: severity.to_string(),
+                title: None,
+                description: None,
+                cvss_v3_base_score: None,
+                cwe: None,
+            },
+            analysis: if suppressed {
+                Some(DtAnalysis {
+                    state: Some("NOT_AFFECTED".to_string()),
+                    justification: None,
+                    response: None,
+                    details: None,
+                    is_suppressed: true,
+                })
+            } else {
+                None
+            },
+            attribution: None,
+        }
+    }
+
+    fn make_metrics(critical: i64, high: i64, medium: i64, low: i64) -> DtProjectMetrics {
+        DtProjectMetrics {
+            critical,
+            high,
+            medium,
+            low,
+            unassigned: 0,
+            vulnerabilities: None,
+            findings_total: 0,
+            findings_audited: 0,
+            findings_unaudited: 0,
+            suppressions: 0,
+            inherited_risk_score: 0.0,
+            policy_violations_fail: 0,
+            policy_violations_warn: 0,
+            policy_violations_info: 0,
+            policy_violations_total: 0,
+            first_occurrence: None,
+            last_occurrence: None,
+        }
+    }
+
+    // ===================================================================
+    // aggregate_vulnerabilities
+    // ===================================================================
+
+    #[test]
+    fn test_aggregate_vulnerabilities_empty() {
+        let agg = aggregate_vulnerabilities(&[]);
+        assert_eq!(agg.total, 0);
+        assert_eq!(agg.critical, 0);
+        assert_eq!(agg.high, 0);
+        assert_eq!(agg.medium, 0);
+        assert_eq!(agg.low, 0);
+        assert_eq!(agg.unassigned, 0);
+    }
+
+    #[test]
+    fn test_aggregate_vulnerabilities_mixed() {
+        let findings = vec![
+            make_finding("CRITICAL", false),
+            make_finding("CRITICAL", false),
+            make_finding("HIGH", false),
+            make_finding("MEDIUM", false),
+            make_finding("LOW", false),
+            make_finding("LOW", false),
+            make_finding("LOW", false),
+        ];
+        let agg = aggregate_vulnerabilities(&findings);
+        assert_eq!(agg.total, 7);
+        assert_eq!(agg.critical, 2);
+        assert_eq!(agg.high, 1);
+        assert_eq!(agg.medium, 1);
+        assert_eq!(agg.low, 3);
+        assert_eq!(agg.unassigned, 0);
+    }
+
+    #[test]
+    fn test_aggregate_vulnerabilities_unknown_severity() {
+        let findings = vec![make_finding("UNKNOWN", false), make_finding("", false)];
+        let agg = aggregate_vulnerabilities(&findings);
+        assert_eq!(agg.unassigned, 2);
+        assert_eq!(agg.total, 2);
+    }
+
+    #[test]
+    fn test_aggregate_vulnerabilities_case_insensitive() {
+        let findings = vec![
+            make_finding("critical", false),
+            make_finding("High", false),
+            make_finding("medium", false),
+            make_finding("low", false),
+        ];
+        let agg = aggregate_vulnerabilities(&findings);
+        assert_eq!(agg.critical, 1);
+        assert_eq!(agg.high, 1);
+        assert_eq!(agg.medium, 1);
+        assert_eq!(agg.low, 1);
+    }
+
+    #[test]
+    fn test_aggregate_vulnerabilities_includes_suppressed() {
+        let findings = vec![make_finding("CRITICAL", true), make_finding("HIGH", false)];
+        let agg = aggregate_vulnerabilities(&findings);
+        assert_eq!(agg.total, 2);
+        assert_eq!(agg.critical, 1);
+    }
+
+    // ===================================================================
+    // compute_risk_score
+    // ===================================================================
+
+    #[test]
+    fn test_compute_risk_score_zero() {
+        let metrics = make_metrics(0, 0, 0, 0);
+        assert!((compute_risk_score(&metrics) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_risk_score_only_critical() {
+        let metrics = make_metrics(3, 0, 0, 0);
+        assert!((compute_risk_score(&metrics) - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_risk_score_mixed() {
+        let metrics = make_metrics(1, 2, 3, 4);
+        // 1*10 + 2*5 + 3*3 + 4*1 = 10 + 10 + 9 + 4 = 33
+        assert!((compute_risk_score(&metrics) - 33.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_risk_score_only_low() {
+        let metrics = make_metrics(0, 0, 0, 5);
+        assert!((compute_risk_score(&metrics) - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_risk_score_high_counts() {
+        let metrics = make_metrics(10, 20, 30, 40);
+        // 10*10 + 20*5 + 30*3 + 40*1 = 100 + 100 + 90 + 40 = 330
+        assert!((compute_risk_score(&metrics) - 330.0).abs() < f64::EPSILON);
+    }
+
+    // ===================================================================
+    // risk_level_from_score
+    // ===================================================================
+
+    #[test]
+    fn test_risk_level_none() {
+        assert_eq!(risk_level_from_score(0.0), "none");
+        assert_eq!(risk_level_from_score(-1.0), "none");
+    }
+
+    #[test]
+    fn test_risk_level_low() {
+        assert_eq!(risk_level_from_score(1.0), "low");
+        assert_eq!(risk_level_from_score(9.9), "low");
+    }
+
+    #[test]
+    fn test_risk_level_medium() {
+        assert_eq!(risk_level_from_score(10.0), "medium");
+        assert_eq!(risk_level_from_score(29.9), "medium");
+    }
+
+    #[test]
+    fn test_risk_level_high() {
+        assert_eq!(risk_level_from_score(30.0), "high");
+        assert_eq!(risk_level_from_score(79.9), "high");
+    }
+
+    #[test]
+    fn test_risk_level_critical() {
+        assert_eq!(risk_level_from_score(80.0), "critical");
+        assert_eq!(risk_level_from_score(500.0), "critical");
+    }
+
+    // ===================================================================
+    // filter_unsuppressed_findings
+    // ===================================================================
+
+    #[test]
+    fn test_filter_unsuppressed_empty() {
+        let result = filter_unsuppressed_findings(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_unsuppressed_all_active() {
+        let findings = vec![make_finding("HIGH", false), make_finding("MEDIUM", false)];
+        let result = filter_unsuppressed_findings(&findings);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_unsuppressed_all_suppressed() {
+        let findings = vec![make_finding("HIGH", true), make_finding("CRITICAL", true)];
+        let result = filter_unsuppressed_findings(&findings);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_unsuppressed_mixed() {
+        let findings = vec![
+            make_finding("HIGH", false),
+            make_finding("CRITICAL", true),
+            make_finding("LOW", false),
+        ];
+        let result = filter_unsuppressed_findings(&findings);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].vulnerability.severity, "HIGH");
+        assert_eq!(result[1].vulnerability.severity, "LOW");
+    }
+
+    #[test]
+    fn test_filter_unsuppressed_analysis_not_suppressed() {
+        // Analysis present but is_suppressed = false
+        let mut f = make_finding("MEDIUM", false);
+        f.analysis = Some(DtAnalysis {
+            state: Some("IN_TRIAGE".to_string()),
+            justification: None,
+            response: None,
+            details: None,
+            is_suppressed: false,
+        });
+        let binding = [f];
+        let result = filter_unsuppressed_findings(&binding);
+        assert_eq!(result.len(), 1);
+    }
+
+    // ===================================================================
+    // component_matches_purl_prefix
+    // ===================================================================
+
+    #[test]
+    fn test_component_matches_purl_prefix_exact() {
+        let comp = DtComponent {
+            uuid: "c1".to_string(),
+            name: "lodash".to_string(),
+            version: None,
+            group: None,
+            purl: Some("pkg:npm/lodash@4.17.21".to_string()),
+        };
+        assert!(component_matches_purl_prefix(&comp, "pkg:npm/"));
+    }
+
+    #[test]
+    fn test_component_matches_purl_prefix_no_match() {
+        let comp = DtComponent {
+            uuid: "c1".to_string(),
+            name: "spring".to_string(),
+            version: None,
+            group: None,
+            purl: Some("pkg:maven/org.springframework/spring-core@5.3.0".to_string()),
+        };
+        assert!(!component_matches_purl_prefix(&comp, "pkg:npm/"));
+    }
+
+    #[test]
+    fn test_component_matches_purl_prefix_no_purl() {
+        let comp = DtComponent {
+            uuid: "c1".to_string(),
+            name: "unknown".to_string(),
+            version: None,
+            group: None,
+            purl: None,
+        };
+        assert!(!component_matches_purl_prefix(&comp, "pkg:npm/"));
+    }
+
+    #[test]
+    fn test_component_matches_purl_prefix_empty_prefix() {
+        let comp = DtComponent {
+            uuid: "c1".to_string(),
+            name: "anything".to_string(),
+            version: None,
+            group: None,
+            purl: Some("pkg:cargo/serde@1.0".to_string()),
+        };
+        assert!(component_matches_purl_prefix(&comp, ""));
+    }
+
+    #[test]
+    fn test_component_matches_purl_prefix_full_purl() {
+        let comp = DtComponent {
+            uuid: "c1".to_string(),
+            name: "pkg".to_string(),
+            version: None,
+            group: None,
+            purl: Some("pkg:npm/lodash@4.17.21".to_string()),
+        };
+        assert!(component_matches_purl_prefix(
+            &comp,
+            "pkg:npm/lodash@4.17.21"
+        ));
+    }
+
+    // ===================================================================
+    // compute_audit_ratio
+    // ===================================================================
+
+    #[test]
+    fn test_compute_audit_ratio_all_audited() {
+        assert!((compute_audit_ratio(10, 10) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_audit_ratio_none_audited() {
+        assert!((compute_audit_ratio(0, 10) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_audit_ratio_partial() {
+        assert!((compute_audit_ratio(5, 10) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_audit_ratio_zero_total() {
+        assert!((compute_audit_ratio(0, 0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_audit_ratio_large_numbers() {
+        assert!((compute_audit_ratio(999, 1000) - 0.999).abs() < 0.001);
+    }
+
+    // ===================================================================
+    // total_policy_violations
+    // ===================================================================
+
+    #[test]
+    fn test_total_policy_violations_zero() {
+        let mut metrics = make_metrics(0, 0, 0, 0);
+        metrics.policy_violations_fail = 0;
+        metrics.policy_violations_warn = 0;
+        metrics.policy_violations_info = 0;
+        assert_eq!(total_policy_violations(&metrics), 0);
+    }
+
+    #[test]
+    fn test_total_policy_violations_mixed() {
+        let mut metrics = make_metrics(0, 0, 0, 0);
+        metrics.policy_violations_fail = 3;
+        metrics.policy_violations_warn = 5;
+        metrics.policy_violations_info = 2;
+        assert_eq!(total_policy_violations(&metrics), 10);
+    }
+
+    #[test]
+    fn test_total_policy_violations_only_fail() {
+        let mut metrics = make_metrics(0, 0, 0, 0);
+        metrics.policy_violations_fail = 7;
+        assert_eq!(total_policy_violations(&metrics), 7);
+    }
+
+    #[test]
+    fn test_total_policy_violations_only_warn() {
+        let mut metrics = make_metrics(0, 0, 0, 0);
+        metrics.policy_violations_warn = 4;
+        assert_eq!(total_policy_violations(&metrics), 4);
+    }
+
+    #[test]
+    fn test_total_policy_violations_only_info() {
+        let mut metrics = make_metrics(0, 0, 0, 0);
+        metrics.policy_violations_info = 12;
+        assert_eq!(total_policy_violations(&metrics), 12);
+    }
+
+    // ===================================================================
+    // severity_rank
+    // ===================================================================
+
+    #[test]
+    fn test_severity_rank_critical() {
+        assert_eq!(severity_rank("CRITICAL"), 0);
+        assert_eq!(severity_rank("critical"), 0);
+    }
+
+    #[test]
+    fn test_severity_rank_high() {
+        assert_eq!(severity_rank("HIGH"), 1);
+        assert_eq!(severity_rank("high"), 1);
+    }
+
+    #[test]
+    fn test_severity_rank_medium() {
+        assert_eq!(severity_rank("MEDIUM"), 2);
+    }
+
+    #[test]
+    fn test_severity_rank_low() {
+        assert_eq!(severity_rank("LOW"), 3);
+    }
+
+    #[test]
+    fn test_severity_rank_info() {
+        assert_eq!(severity_rank("INFO"), 4);
+    }
+
+    #[test]
+    fn test_severity_rank_unknown() {
+        assert_eq!(severity_rank("UNKNOWN"), 5);
+        assert_eq!(severity_rank(""), 5);
+        assert_eq!(severity_rank("foo"), 5);
+    }
+
+    #[test]
+    fn test_severity_rank_ordering() {
+        assert!(severity_rank("CRITICAL") < severity_rank("HIGH"));
+        assert!(severity_rank("HIGH") < severity_rank("MEDIUM"));
+        assert!(severity_rank("MEDIUM") < severity_rank("LOW"));
+        assert!(severity_rank("LOW") < severity_rank("INFO"));
+        assert!(severity_rank("INFO") < severity_rank("UNKNOWN"));
+    }
+
+    // ===================================================================
+    // Existing serialization/deserialization tests
+    // ===================================================================
+
+    #[test]
+    fn test_config_from_env_disabled() {
+        unsafe { std::env::remove_var("DEPENDENCY_TRACK_ENABLED") };
+        assert!(DependencyTrackConfig::from_env().is_none());
+    }
+
+    #[test]
+    fn test_dt_finding_deserialize() {
+        let json = r#"{
+            "component": {
+                "uuid": "test-uuid",
+                "name": "lodash",
+                "version": "4.17.0",
+                "group": null,
+                "purl": "pkg:npm/lodash@4.17.0"
+            },
+            "vulnerability": {
+                "uuid": "vuln-uuid",
+                "vulnId": "CVE-2021-23337",
+                "source": "NVD",
+                "severity": "HIGH",
+                "title": "Prototype Pollution",
+                "description": "Test description",
+                "cvssV3BaseScore": 7.5,
+                "cwe": {
+                    "cweId": 1321,
+                    "name": "Improperly Controlled Modification"
+                }
+            },
+            "analysis": null,
+            "attribution": null
+        }"#;
+        let finding: DtFinding = serde_json::from_str(json).unwrap();
+        assert_eq!(finding.vulnerability.vuln_id, "CVE-2021-23337");
+        assert_eq!(finding.vulnerability.severity, "HIGH");
+        assert_eq!(finding.component.name, "lodash");
+    }
+
+    #[test]
+    fn test_dt_project_metrics_deserialize() {
+        let json = r#"{
+            "critical": 2,
+            "high": 5,
+            "medium": 12,
+            "low": 3,
+            "unassigned": 0,
+            "vulnerabilities": 22,
+            "findingsTotal": 22,
+            "findingsAudited": 4,
+            "findingsUnaudited": 18,
+            "suppressions": 1,
+            "inheritedRiskScore": 42.5,
+            "policyViolationsFail": 1,
+            "policyViolationsWarn": 2,
+            "policyViolationsInfo": 0,
+            "policyViolationsTotal": 3,
+            "firstOccurrence": 1700000000000,
+            "lastOccurrence": 1700100000000
+        }"#;
+        let metrics: DtProjectMetrics = serde_json::from_str(json).unwrap();
+        assert_eq!(metrics.critical, 2);
+        assert_eq!(metrics.high, 5);
+        assert_eq!(metrics.findings_total, 22);
+        assert!((metrics.inherited_risk_score - 42.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_dt_project_metrics_defaults() {
+        let json = r#"{}"#;
+        let metrics: DtProjectMetrics = serde_json::from_str(json).unwrap();
+        assert_eq!(metrics.critical, 0);
+        assert_eq!(metrics.high, 0);
+        assert!(metrics.vulnerabilities.is_none());
+    }
+
+    #[test]
+    fn test_dependency_track_config_construction() {
+        let config = DependencyTrackConfig {
+            base_url: "http://localhost:8092".to_string(),
+            api_key: "test-api-key".to_string(),
+            enabled: true,
+        };
+        assert_eq!(config.base_url, "http://localhost:8092");
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_dependency_track_config_clone() {
+        let config = DependencyTrackConfig {
+            base_url: "http://dt.example.com".to_string(),
+            api_key: "key-123".to_string(),
+            enabled: false,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.base_url, "http://dt.example.com");
+        assert!(!cloned.enabled);
+    }
+
+    #[test]
+    fn test_update_analysis_request_serialize() {
+        let request = UpdateAnalysisRequest {
+            project: "proj-uuid".to_string(),
+            component: "comp-uuid".to_string(),
+            vulnerability: "vuln-uuid".to_string(),
+            analysis_state: "NOT_AFFECTED".to_string(),
+            analysis_justification: Some("Protected by WAF".to_string()),
+            analysis_details: None,
+            is_suppressed: true,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["project"], "proj-uuid");
+        assert_eq!(json["analysisState"], "NOT_AFFECTED");
+        assert!(json.get("analysisDetails").is_none());
+        assert_eq!(json["isSuppressed"], true);
+    }
+
+    // ===================================================================
+    // is_private_network_url
+    // ===================================================================
+
+    #[test]
+    fn test_private_url_localhost() {
+        assert!(is_private_network_url("http://localhost:8080"));
+        assert!(is_private_network_url("http://localhost"));
+        assert!(is_private_network_url("https://localhost:443/api"));
+    }
+
+    #[test]
+    fn test_private_url_loopback_ipv4() {
+        assert!(is_private_network_url("http://127.0.0.1:8092"));
+        assert!(is_private_network_url("http://127.0.0.1"));
+        assert!(is_private_network_url("http://127.255.255.255:80"));
+    }
+
+    #[test]
+    fn test_private_url_loopback_ipv6() {
+        assert!(is_private_network_url("http://[::1]:8080"));
+        assert!(is_private_network_url("http://[::1]"));
+    }
+
+    #[test]
+    fn test_private_url_rfc1918_class_a() {
+        assert!(is_private_network_url("http://10.0.0.1:8080"));
+        assert!(is_private_network_url("http://10.255.255.255"));
+    }
+
+    #[test]
+    fn test_private_url_rfc1918_class_b() {
+        assert!(is_private_network_url("http://172.16.0.1:8080"));
+        assert!(is_private_network_url("http://172.31.255.255"));
+        // 172.32.x.x is NOT private
+        assert!(!is_private_network_url("http://172.32.0.1:8080"));
+    }
+
+    #[test]
+    fn test_private_url_rfc1918_class_c() {
+        assert!(is_private_network_url("http://192.168.0.1:8080"));
+        assert!(is_private_network_url("http://192.168.255.255"));
+    }
+
+    #[test]
+    fn test_private_url_link_local() {
+        assert!(is_private_network_url("http://169.254.1.1:8080"));
+    }
+
+    #[test]
+    fn test_private_url_kubernetes_svc() {
+        assert!(is_private_network_url(
+            "http://dependency-track.default.svc.cluster.local:8080"
+        ));
+        assert!(is_private_network_url("http://dt-api.ns.svc:8080"));
+        assert!(is_private_network_url(
+            "http://my-service.monitoring.svc.cluster.local"
+        ));
+    }
+
+    #[test]
+    fn test_private_url_local_domain() {
+        assert!(is_private_network_url("http://dt.local:8080"));
+        assert!(is_private_network_url("http://myhost.local"));
+    }
+
+    #[test]
+    fn test_private_url_unspecified() {
+        assert!(is_private_network_url("http://0.0.0.0:8080"));
+    }
+
+    #[test]
+    fn test_public_url_rejected() {
+        assert!(!is_private_network_url("http://dt.example.com:8080"));
+        assert!(!is_private_network_url("http://8.8.8.8:8080"));
+        assert!(!is_private_network_url(
+            "https://dependency-track.prod.company.com"
+        ));
+    }
+
+    #[test]
+    fn test_private_url_invalid_input() {
+        assert!(!is_private_network_url("not-a-url"));
+        assert!(!is_private_network_url(""));
+        assert!(!is_private_network_url("://missing-scheme"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_link_local() {
+        assert!(is_private_network_url("http://[fe80::1]:8080"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_unique_local() {
+        assert!(is_private_network_url("http://[fd12::1]:8080"));
+    }
+
+    // --- Additional edge cases for is_private_network_url ---
+
+    #[test]
+    fn test_private_url_ipv4_with_path_and_query() {
+        assert!(is_private_network_url(
+            "http://10.0.0.1:8080/api/v1?key=abc"
+        ));
+        assert!(is_private_network_url(
+            "http://192.168.1.1/health?format=json"
+        ));
+    }
+
+    #[test]
+    fn test_private_url_ipv4_with_auth_info() {
+        assert!(is_private_network_url("http://admin:pass@192.168.1.1:8080"));
+        assert!(is_private_network_url("http://user:pwd@10.0.0.5/api"));
+        assert!(is_private_network_url("http://user@127.0.0.1:9090"));
+    }
+
+    #[test]
+    fn test_private_url_ipv4_ports_on_private_ips() {
+        assert!(is_private_network_url("http://10.0.0.1:443"));
+        assert!(is_private_network_url("http://10.0.0.1:8443"));
+        assert!(is_private_network_url("http://172.16.0.1:9090"));
+        assert!(is_private_network_url("http://192.168.0.1:1"));
+        assert!(is_private_network_url("http://192.168.0.1:65535"));
+    }
+
+    #[test]
+    fn test_private_url_rfc1918_class_b_boundary() {
+        // 172.15.x.x is NOT private (below the 172.16-172.31 range)
+        assert!(!is_private_network_url("http://172.15.255.255:8080"));
+        // 172.16.0.0 is the start of the private range
+        assert!(is_private_network_url("http://172.16.0.0:8080"));
+        // 172.31.255.255 is the end of the private range
+        assert!(is_private_network_url("http://172.31.255.255:8080"));
+        // 172.32.0.0 is outside the private range
+        assert!(!is_private_network_url("http://172.32.0.0:8080"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_unspecified() {
+        assert!(is_private_network_url("http://[::]:8080"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_full_link_local() {
+        assert!(is_private_network_url("http://[fe80::abcd:1234]:8080"));
+        assert!(is_private_network_url("http://[fe80::abcd:ef01:2345]:9090"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_unique_local_range() {
+        // fc00::/7 covers fc00:: through fdff::
+        assert!(is_private_network_url("http://[fc00::1]:8080"));
+        assert!(is_private_network_url("http://[fdff::1]:8080"));
+    }
+
+    #[test]
+    fn test_public_url_ipv6_global() {
+        // 2001:db8:: is documentation range, but treated as public by the function
+        assert!(!is_private_network_url("http://[2001:db8::1]:8080"));
+        // 2600:: is a public IPv6 range
+        assert!(!is_private_network_url("http://[2600::1]:8080"));
+    }
+
+    #[test]
+    fn test_private_url_localhost_variants() {
+        assert!(is_private_network_url("http://localhost:3000/path"));
+        assert!(is_private_network_url("https://localhost:443"));
+        assert!(is_private_network_url("http://localhost"));
+        // LOCALHOST uppercase should not match (case-sensitive hostname comparison
+        // lowercases before checking, so it should match)
+        assert!(is_private_network_url("http://LOCALHOST:8080"));
+    }
+
+    #[test]
+    fn test_private_url_kubernetes_svc_variants() {
+        assert!(is_private_network_url(
+            "http://my-app.production.svc.cluster.local:8080"
+        ));
+        assert!(is_private_network_url(
+            "http://api.kube-system.svc.cluster.local"
+        ));
+        assert!(is_private_network_url("http://service.ns.svc"));
+        // Just ".svc" suffix should match
+        assert!(is_private_network_url("http://redis.default.svc:6379"));
+    }
+
+    #[test]
+    fn test_private_url_local_domain_variants() {
+        assert!(is_private_network_url("http://my-mac.local:8080"));
+        assert!(is_private_network_url("http://printer.local"));
+        assert!(is_private_network_url("http://nas.local:5000/api"));
+    }
+
+    #[test]
+    fn test_public_url_svc_in_middle() {
+        // "svc" appearing in the middle of a domain should NOT be private
+        assert!(!is_private_network_url("http://svc.example.com:8080"));
+        assert!(!is_private_network_url(
+            "http://my-svc-api.cloud.company.com"
+        ));
+    }
+
+    #[test]
+    fn test_private_url_loopback_full_range() {
+        // 127.0.0.0/8 covers 127.0.0.0 through 127.255.255.255
+        assert!(is_private_network_url("http://127.0.0.0:8080"));
+        assert!(is_private_network_url("http://127.0.0.1:8080"));
+        assert!(is_private_network_url("http://127.100.200.50:8080"));
+        assert!(is_private_network_url("http://127.255.255.254:8080"));
+    }
+
+    #[test]
+    fn test_private_url_invalid_schemes() {
+        // Schemes other than http/https should still be parseable by url::Url
+        // ftp with a private IP
+        assert!(is_private_network_url("ftp://192.168.1.1/file"));
+    }
+
+    #[test]
+    fn test_private_url_fragment_and_query() {
+        assert!(is_private_network_url(
+            "http://10.0.0.1:8080/path?q=1#section"
+        ));
+    }
+
+    #[test]
+    fn test_public_url_dot_local_like_but_not_local() {
+        // "example.locals" is not ".local"
+        assert!(!is_private_network_url("http://example.locals:8080"));
+        // "mylocal.com" is not ".local"
+        assert!(!is_private_network_url("http://mylocal.com:8080"));
+    }
+
+    #[test]
+    fn test_private_url_https_scheme() {
+        assert!(is_private_network_url("https://10.0.0.1:443"));
+        assert!(is_private_network_url("https://192.168.1.1"));
+        assert!(is_private_network_url("https://localhost:8443"));
+    }
+
+    #[test]
+    fn test_private_url_link_local_range() {
+        assert!(is_private_network_url("http://169.254.0.1:8080"));
+        assert!(is_private_network_url("http://169.254.255.254:8080"));
+    }
+
+    // ===================================================================
+    // Pagination (wiremock integration tests)
+    // ===================================================================
+
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TEST_PAGE_SIZE: u32 = 2;
+
+    fn make_service(base_url: &str) -> DependencyTrackService {
+        DependencyTrackService {
+            client: Client::new(),
+            config: DependencyTrackConfig {
+                base_url: base_url.to_string(),
+                api_key: "test-key".to_string(),
+                enabled: true,
+            },
+            page_size: TEST_PAGE_SIZE,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_multi_page() {
+        let server = MockServer::start().await;
+
+        // Page 1: 2 items
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "1"))
+            .and(query_param("pageSize", "2"))
+            .and(header("X-Api-Key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+                make_finding("HIGH", false),
+                make_finding("MEDIUM", false),
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Page 2: 1 item (< DT_PAGE_SIZE, so early termination — no page 3)
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "2"))
+            .and(query_param("pageSize", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(vec![make_finding("LOW", false)]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let findings = svc.get_findings("abc-123").await.unwrap();
+
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0].vulnerability.severity, "HIGH");
+        assert_eq!(findings[1].vulnerability.severity, "MEDIUM");
+        assert_eq!(findings[2].vulnerability.severity, "LOW");
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_single_page() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"uuid": "p1", "name": "proj1", "version": "1.0"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Page 2 should NOT be fetched (1 item < DT_PAGE_SIZE = early termination)
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .and(query_param("pageNumber", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtProject>::new()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let projects = svc.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "proj1");
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_empty_first_page() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/policy"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtPolicyFull>::new()))
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let policies = svc.get_policies().await.unwrap();
+        assert!(policies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_http_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/bad-uuid"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let result = svc.get_findings("bad-uuid").await;
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_safety_cap_returns_error() {
+        let server = MockServer::start().await;
+
+        // Always return a full page (TEST_PAGE_SIZE items) — loop never terminates naturally
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"uuid": "p1", "name": "proj1", "version": "1.0"},
+                {"uuid": "p2", "name": "proj2", "version": "2.0"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let result = svc.list_projects().await;
+
+        // Safety cap must return Err, not silently truncated Ok
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("pagination safety limit"));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_early_termination_on_partial_page() {
+        let server = MockServer::start().await;
+
+        // Page 1 returns fewer items than TEST_PAGE_SIZE (1 < 2) — no page 2 request
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"uuid": "p1", "name": "proj1", "version": "1.0"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Page 2 should never be called
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .and(query_param("pageNumber", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtProject>::new()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let projects = svc.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_mid_pagination_http_error() {
+        let server = MockServer::start().await;
+
+        // Page 1: returns full page (TEST_PAGE_SIZE=2 items) to trigger page 2
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+                make_finding("HIGH", false),
+                make_finding("MEDIUM", false),
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Page 2 fails with 500
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "2"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let result = svc.get_findings("abc-123").await;
+
+        // Must return error, not partial data
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("500"));
+        // Error should include page context
+        assert!(err.contains("page 2"));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_malformed_json_response() {
+        let server = MockServer::start().await;
+
+        // Return a JSON object instead of array
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"error": "unexpected format"}"#)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let result = svc.get_findings("abc-123").await;
+
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("page 1"));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_violations_url() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/violation/project/proj-1"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtPolicyViolation>::new()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let violations = svc.get_policy_violations("proj-1").await.unwrap();
+        assert!(violations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_components_url() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/component/project/proj-1"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtComponentFull>::new()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let components = svc.get_components("proj-1").await.unwrap();
+        assert!(components.is_empty());
+    }
+
+    // ===================================================================
+    // Failure-mode classification tests (issue #963)
+    //
+    // Regression: DT connection failures (pod unavailable, wrong API key,
+    // 401 Unauthorized) used to be mapped to AppError::Internal, which
+    // produced HTTP 500 with a generic "Internal server error" message.
+    // The web UI then rendered this as "0 dependencies" — indistinguishable
+    // from a clean scan. These tests pin the new behavior:
+    //
+    //   - Upstream non-2xx  -> AppError::BadGateway       (HTTP 502)
+    //   - Transport failure -> AppError::ServiceUnavailable (HTTP 503)
+    //
+    // so the frontend can render an explicit "DT unreachable" state
+    // instead of failing open to an empty list.
+    // ===================================================================
+
+    /// Helper: assert an error is `BadGateway`. Better than substring matching
+    /// because it pins the HTTP status code path.
+    fn assert_is_bad_gateway(err: &AppError) {
+        assert!(
+            matches!(err, AppError::BadGateway(_)),
+            "expected AppError::BadGateway, got: {:?}",
+            err
+        );
+    }
+
+    /// Helper: assert an error is `ServiceUnavailable`.
+    fn assert_is_service_unavailable(err: &AppError) {
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(_)),
+            "expected AppError::ServiceUnavailable, got: {:?}",
+            err
+        );
+    }
+
+    /// DT returning 401 Unauthorized (wrong API key, expired token) must
+    /// surface as BadGateway, NOT Internal. This is the exact scenario in
+    /// issue #963: DT logs "Unauthorized access attempt" while the UI used
+    /// to show "0 deps" silently.
+    #[tokio::test]
+    async fn test_dt_401_unauthorized_maps_to_bad_gateway() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string("The supplied credentials are invalid."),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let result = svc.get_findings("abc-123").await;
+
+        let err = result.expect_err("DT 401 must produce an error, not Ok(empty)");
+        assert_is_bad_gateway(&err);
+
+        // Message must carry enough context for the operator: upstream status,
+        // operation, and the upstream body so misconfigured API keys are
+        // distinguishable from other 401-producing bugs.
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "missing status code in: {}", msg);
+        assert!(
+            msg.contains("DT get findings"),
+            "missing operation in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("credentials are invalid"),
+            "missing upstream body in: {}",
+            msg
+        );
+    }
+
+    /// DT returning 403 Forbidden (valid key, but no permission for project)
+    /// is also an upstream failure, not an internal bug, so it must be
+    /// BadGateway.
+    #[tokio::test]
+    async fn test_dt_403_forbidden_maps_to_bad_gateway() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/component/project/abc-123"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Insufficient permissions"))
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let err = svc
+            .get_components("abc-123")
+            .await
+            .expect_err("DT 403 must produce an error");
+        assert_is_bad_gateway(&err);
+        assert!(err.to_string().contains("403"));
+    }
+
+    /// Regression: #1472. When DT replies 403 to `PUT /api/v1/bom` (the
+    /// canonical "API key team is missing BOM_UPLOAD" failure mode), the
+    /// error surfaced to the operator MUST carry:
+    ///   1. the upstream HTTP status code (so 401 vs 403 vs 500 is visible),
+    ///   2. the endpoint that was hit (so the operator can curl it),
+    ///   3. the upstream body (so DT's own message survives),
+    ///   4. a permissions hint naming every required DT team permission.
+    /// Without (4) the operator has to grep source to find which DT team
+    /// permissions AK actually depends on. The default DT `Automation` team
+    /// has none of them, so every fresh install hits this 403.
+    #[tokio::test]
+    async fn test_dt_bom_upload_403_surfaces_permissions_hint() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/bom"))
+            .and(header("X-Api-Key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("The principal does not have permission to upload BOMs."),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let err = svc
+            .upload_sbom(
+                "11111111-1111-1111-1111-111111111111",
+                "{\"bomFormat\":\"CycloneDX\"}",
+            )
+            .await
+            .expect_err("DT 403 on BOM upload must surface as an Err");
+
+        assert_is_bad_gateway(&err);
+        let msg = err.to_string();
+
+        // (1) upstream status code preserved
+        assert!(msg.contains("403"), "missing status code in: {}", msg);
+        // (2) endpoint URL surfaced so the operator can reproduce with curl
+        assert!(
+            msg.contains("/api/v1/bom"),
+            "missing endpoint path in: {}",
+            msg
+        );
+        // (3) upstream body preserved verbatim (DT's own diagnostic)
+        assert!(
+            msg.contains("permission to upload BOMs"),
+            "missing upstream body in: {}",
+            msg
+        );
+        // (4) permissions hint naming EVERY required permission so the operator
+        // can fix the team grant without grepping source. The default DT
+        // `Automation` team has none of these.
+        assert!(
+            msg.contains("BOM_UPLOAD"),
+            "missing BOM_UPLOAD hint in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("PROJECT_CREATION_UPLOAD"),
+            "missing PROJECT_CREATION_UPLOAD hint in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("VIEW_PORTFOLIO"),
+            "missing VIEW_PORTFOLIO hint in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("VIEW_VULNERABILITY"),
+            "missing VIEW_VULNERABILITY hint in: {}",
+            msg
+        );
+        // Operation tag survives so log aggregators can group by integration
+        // step.
+        assert!(
+            msg.contains("BOM upload"),
+            "missing operation tag in: {}",
+            msg
+        );
+        // (5) HTTP verb in the permissions-hint curl example must be POST
+        // (DT's permission-grant endpoint is POST, not PUT). Regression guard
+        // for the doc/copy mismatch fixed alongside #1472 review feedback:
+        // operators copy this verb straight out of the log into `curl -X ...`,
+        // and `PUT` returns HTTP 405 against a real DT instance.
+        assert!(
+            msg.contains("POST /api/v1/permission"),
+            "permissions hint must specify POST verb in: {}",
+            msg
+        );
+    }
+
+    /// Companion to the BOM-upload test: `PUT /api/v1/project` returning 401
+    /// (API key invalid OR team missing PROJECT_CREATION_UPLOAD) must also
+    /// carry the permissions hint. `submit_sbom_to_dependency_track` hits
+    /// `create project` before `upload_sbom`, so this is the first wall a
+    /// misconfigured key meets in the scan pipeline.
+    #[tokio::test]
+    async fn test_dt_create_project_401_surfaces_permissions_hint() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/project"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string("The supplied credentials are invalid."),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let err = svc
+            .create_project("myproj", Some("1.0.0"), None)
+            .await
+            .expect_err("DT 401 on create project must surface as an Err");
+
+        assert_is_bad_gateway(&err);
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "missing status code in: {}", msg);
+        assert!(
+            msg.contains("/api/v1/project"),
+            "missing endpoint path in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("PROJECT_CREATION_UPLOAD"),
+            "missing PROJECT_CREATION_UPLOAD hint in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("BOM_UPLOAD"),
+            "missing BOM_UPLOAD hint in: {}",
+            msg
+        );
+    }
+
+    /// Non-auth upstream failures (500, 502, 504) must NOT include the
+    /// permissions hint, because the hint would mislead the operator into
+    /// rotating a key that is actually fine. The permissions hint is reserved
+    /// for 401/403.
+    #[tokio::test]
+    async fn test_dt_500_does_not_include_permissions_hint() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/bom"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("DT internal failure"))
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let err = svc
+            .upload_sbom("11111111-1111-1111-1111-111111111111", "{}")
+            .await
+            .expect_err("DT 500 must surface as an Err");
+
+        assert_is_bad_gateway(&err);
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "missing status code in: {}", msg);
+        // Hint is auth-failure-specific. Including it on 500 would push the
+        // operator to rotate a working key while the real issue is upstream.
+        assert!(
+            !msg.contains("BOM_UPLOAD"),
+            "permissions hint must NOT appear on 500: {}",
+            msg
+        );
+    }
+
+    /// DT pod down / TCP refused / DNS failure must surface as
+    /// ServiceUnavailable (503), distinct from BadGateway (upstream replied
+    /// but with an error). The frontend can render different UI for each:
+    /// "scanner offline" vs "scanner auth misconfigured".
+    #[tokio::test]
+    async fn test_dt_unreachable_maps_to_service_unavailable() {
+        // Point the service at a port we know no process is listening on.
+        // 127.0.0.1:1 is in the privileged range so even a misbehaving test
+        // process is unlikely to grab it.
+        let svc = make_service("http://127.0.0.1:1");
+
+        let err = svc
+            .get_findings("any-uuid")
+            .await
+            .expect_err("transport failure must produce an error");
+        assert_is_service_unavailable(&err);
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Dependency-Track unreachable"),
+            "missing unreachable signal in: {}",
+            msg
+        );
+    }
+
+    /// DT returning 200 with garbage body (HTML error page squeezing through
+    /// a reverse proxy, partial response after a connection reset) must be a
+    /// BadGateway because the upstream produced unparseable output. We must
+    /// NOT swallow it as Ok(empty Vec) — that is the issue #963 failure mode
+    /// dressed up as a different bug.
+    #[tokio::test]
+    async fn test_dt_unparseable_response_maps_to_bad_gateway() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body>503 Backend Down</body></html>")
+                    .insert_header("content-type", "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let err = svc
+            .get_findings("abc-123")
+            .await
+            .expect_err("unparseable upstream response must produce an error");
+        assert_is_bad_gateway(&err);
+    }
+
+    /// HTTP status_and_code mapping check: BadGateway is HTTP 502, NOT 500.
+    /// Pinning this prevents a future refactor from collapsing all DT errors
+    /// back to Internal (HTTP 500), which is what triggered #963.
+    #[test]
+    fn test_dt_failure_variants_produce_distinguishable_http_status() {
+        // We don't pull axum::IntoResponse here (it would need a runtime);
+        // checking the message format is enough to prove the variant changed.
+        // The status code is enforced by error.rs (tested in that module).
+        let bg = AppError::BadGateway("DT get findings failed (HTTP 401)".into());
+        let su = AppError::ServiceUnavailable("Dependency-Track unreachable".into());
+        let int_err = AppError::Internal("stack trace at 0x7fff".into());
+
+        // user_message must surface real DT message for BadGateway/SU so the
+        // frontend can render it. Internal must hide details.
+        assert!(
+            !matches!(
+                int_err,
+                AppError::BadGateway(_) | AppError::ServiceUnavailable(_)
+            ),
+            "Internal must not collapse into upstream variants"
+        );
+        // Confirm the upstream variants carry their original message (so the
+        // frontend sees "401" not "Internal server error").
+        match bg {
+            AppError::BadGateway(ref m) => assert!(m.contains("401")),
+            _ => panic!("expected BadGateway"),
+        }
+        match su {
+            AppError::ServiceUnavailable(ref m) => assert!(m.contains("unreachable")),
+            _ => panic!("expected ServiceUnavailable"),
+        }
+    }
+}

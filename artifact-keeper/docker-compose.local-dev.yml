@@ -1,0 +1,309 @@
+# Local development stack with hot-reload
+#
+# Runs all infrastructure in Docker + backend and web with source mounts.
+# Changes to source code trigger automatic rebuilds.
+#
+# Usage:
+#   docker compose -f docker-compose.local-dev.yml up -d
+#
+# First time setup (installs cargo-watch in backend container):
+#   docker compose -f docker-compose.local-dev.yml up -d --build
+#
+# View logs:
+#   docker compose -f docker-compose.local-dev.yml logs -f backend web
+#
+# Ports:
+#   Backend API:    8080
+#   Backend gRPC:   9090
+#   Web UI:         3000
+#   Postgres:       30432
+#   OpenSearch:     9200
+#   Trivy:          8090
+#   OpenSCAP:       8091
+#   Dependency-Track: 8092
+#   Jaeger UI:        16686
+#   OTLP gRPC:        4317
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: artifact-keeper-dev-db
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    volumes:
+      - dev_postgres_data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      - "30432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.1
+    container_name: artifact-keeper-dev-opensearch
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_JAVA_OPTS: "-Xms256m -Xmx256m"
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+    volumes:
+      - dev_opensearch_data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  trivy:
+    image: ghcr.io/aquasecurity/trivy:0.69.3
+    container_name: artifact-keeper-dev-trivy
+    command: ["server", "--listen", "0.0.0.0:8090"]
+    ports:
+      - "8090:8090"
+    volumes:
+      - dev_trivy_cache:/root/.cache/trivy
+      - dev_scan_workspace:/scan-workspace:ro
+    restart: unless-stopped
+
+  openscap:
+    image: ghcr.io/artifact-keeper/artifact-keeper-openscap:latest
+    container_name: artifact-keeper-dev-openscap
+    ports:
+      - "8091:8091"
+    volumes:
+      - dev_scan_workspace:/scan-workspace:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  dependency-track-apiserver:
+    image: dependencytrack/apiserver:4.14.2
+    container_name: artifact-keeper-dev-dtrack-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ALPINE_DATABASE_MODE: external
+      ALPINE_DATABASE_URL: jdbc:postgresql://postgres:5432/dependency_track
+      ALPINE_DATABASE_DRIVER: org.postgresql.Driver
+      ALPINE_DATABASE_USERNAME: registry
+      ALPINE_DATABASE_PASSWORD: registry
+      ALPINE_DATA_DIRECTORY: /data
+      ALPINE_ENFORCE_AUTHENTICATION: "true"
+      ALPINE_CORS_ENABLED: "true"
+      ALPINE_CORS_ALLOW_ORIGIN: "*"
+      # Proxy configuration (required for NVD mirroring behind corporate proxies)
+      ALPINE_HTTP_PROXY_ADDRESS: ${DTRACK_HTTP_PROXY_ADDRESS:-}
+      ALPINE_HTTP_PROXY_PORT: ${DTRACK_HTTP_PROXY_PORT:-}
+      ALPINE_HTTP_PROXY_USERNAME: ${DTRACK_HTTP_PROXY_USERNAME:-}
+      ALPINE_HTTP_PROXY_PASSWORD: ${DTRACK_HTTP_PROXY_PASSWORD:-}
+      ALPINE_NO_PROXY: ${DTRACK_NO_PROXY:-localhost,127.0.0.1}
+    volumes:
+      - dev_dtrack_data:/data
+    ports:
+      - "8092:8080"
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: artifact-keeper-dev-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    restart: unless-stopped
+
+  dtrack-init:
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
+    container_name: artifact-keeper-dev-dtrack-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dependency-track-apiserver:
+        condition: service_healthy
+    volumes:
+      - ./docker/init-dtrack.sh:/init-dtrack.sh:ro
+      - dev_shared_config:/shared
+    environment:
+      DTRACK_INIT_FORCE_ROTATE: ${DTRACK_INIT_FORCE_ROTATE:-false}
+      DEPENDENCY_TRACK_ADMIN_PASSWORD: ${DEPENDENCY_TRACK_ADMIN_PASSWORD:-ArtifactKeeper2026!}
+    entrypoint: ["/bin/sh", "/init-dtrack.sh"]
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  # Make the shared scan_workspace volume writable by the non-root dev backend
+  # user before it starts. The dev backend runs as a system `appuser` with a
+  # runtime-assigned UID, so we make the volume world-writable rather than
+  # chown to a fixed UID. See docker-compose.yml's scan-workspace-init and
+  # issue #1563 for the production equivalent.
+  scan-workspace-init:
+    image: alpine:3.23
+    container_name: artifact-keeper-dev-scan-ws-init
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /scan-workspace
+        chmod 0777 /scan-workspace
+        echo "scan-workspace-init: dev volume made writable"
+    volumes:
+      - dev_scan_workspace:/scan-workspace
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  # Backend with hot-reload using cargo-watch
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend.dev
+    container_name: artifact-keeper-dev-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      scan-workspace-init:
+        condition: service_completed_successfully
+      dtrack-init:
+        condition: service_completed_successfully
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ -f /shared/dtrack-api-key ] && [ -s /shared/dtrack-api-key ]; then
+          export DEPENDENCY_TRACK_API_KEY="$$(cat /shared/dtrack-api-key)"
+        fi
+        cargo watch -x 'run --bin artifact-keeper'
+    environment:
+      DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
+      STORAGE_PATH: /data/storage
+      BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
+      JWT_SECRET: dev-secret-change-in-production
+      ADMIN_PASSWORD: admin
+      RUST_LOG: info,artifact_keeper=debug
+      ENVIRONMENT: development
+      CORS_ORIGINS: http://localhost:3000,http://localhost:8080
+      TRIVY_URL: http://trivy:8090
+      OPENSCAP_URL: http://openscap:8091
+      SCAN_WORKSPACE_PATH: /scan-workspace
+      OPENSEARCH_URL: http://opensearch:9200
+      DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
+      DEPENDENCY_TRACK_ENABLED: "true"
+      ALLOW_HTTP_INTEGRATIONS: "1"
+      # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
+      # Generate once for your local stack with: openssl rand -base64 32,
+      # then export AK_WEBHOOK_SECRET_KEY before docker compose up. The
+      # placeholder below is intentionally invalid base64 so the backend
+      # ensure_configured check fails fast with a clear error rather than
+      # silently running with a shared dev key.
+      AK_WEBHOOK_SECRET_KEY: ${AK_WEBHOOK_SECRET_KEY:-REPLACE_ME_WITH_OUTPUT_OF_openssl_rand_base64_32}
+      # Webhooks v2 producer is off by default; enable after rotating
+      # migrated webhook secrets to avoid duplicate delivery from System B.
+      WEBHOOKS_V2_PRODUCER_ENABLED: ${WEBHOOKS_V2_PRODUCER_ENABLED:-false}
+      # Forward host proxy settings so the backend can reach external services
+      # through a corporate proxy. reqwest honours these natively.
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      ALL_PROXY: ${ALL_PROXY:-}
+      # Prevent host proxy settings from intercepting container-to-container
+      # traffic on the compose network. See docker-compose.yml for details.
+      no_proxy: "${NO_PROXY:-},localhost,127.0.0.1,db,postgres,opensearch,trivy,openscap,dependency-track-apiserver"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: artifact-keeper
+      HOST: 0.0.0.0
+      PORT: 8080
+      SQLX_OFFLINE: "true"
+      CARGO_TARGET_DIR: /target
+    volumes:
+      # Mount source code for hot-reload
+      - ./backend:/app/backend:cached
+      - ./edge:/app/edge:cached
+      - ./Cargo.toml:/app/Cargo.toml:cached
+      - ./Cargo.lock:/app/Cargo.lock:cached
+      - ./.sqlx:/app/.sqlx:cached
+      # Persistent volumes for faster builds
+      - dev_cargo_registry:/usr/local/cargo/registry
+      - dev_cargo_target:/target
+      - dev_sccache:/sccache
+      - dev_artifact_storage:/data/storage
+      - dev_backup_storage:/data/backups
+      - dev_plugins_storage:/data/plugins
+      - dev_scan_workspace:/scan-workspace
+      - dev_shared_config:/shared:ro
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+    restart: unless-stopped
+
+  # Web frontend with hot-reload using next dev
+  # Set WEB_PATH env var if artifact-keeper-web is not at ../artifact-keeper-web
+  web:
+    build:
+      context: ${WEB_PATH:-../artifact-keeper-web}
+      dockerfile: Dockerfile.dev
+    container_name: artifact-keeper-dev-web
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+      BACKEND_URL: http://backend:8080
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"
+    volumes:
+      # Mount source code for hot-reload
+      - ${WEB_PATH:-../artifact-keeper-web}/src:/app/src:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/public:/app/public:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/next.config.ts:/app/next.config.ts:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/tailwind.config.ts:/app/tailwind.config.ts:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/tsconfig.json:/app/tsconfig.json:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/components.json:/app/components.json:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/postcss.config.mjs:/app/postcss.config.mjs:cached
+      # Exclude node_modules (use container's own)
+      - dev_web_node_modules:/app/node_modules
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  dev_postgres_data:
+  dev_opensearch_data:
+  dev_trivy_cache:
+  dev_dtrack_data:
+  dev_shared_config:
+  dev_cargo_registry:
+  dev_cargo_target:
+  dev_sccache:
+  dev_artifact_storage:
+  dev_backup_storage:
+  dev_plugins_storage:
+  dev_scan_workspace:
+  dev_web_node_modules:
+
+networks:
+  default:
+    name: artifact-keeper-dev-network

@@ -1,0 +1,139 @@
+# syntax=docker/dockerfile:1
+
+# ---------- Base: Rust toolchain on Alpine ----------
+FROM rust:1.96-alpine3.21 AS rust-alpine-base
+RUN apk add --no-cache \
+    build-base pkgconfig perl openssl-dev openssl-libs-static \
+    zlib-dev zlib-static xz-dev xz-static \
+    bzip2-dev bzip2-static protobuf-dev curl
+RUN cargo install cargo-chef --locked
+
+# ---------- Stage 1: Plan dependencies ----------
+FROM rust-alpine-base AS planner
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY backend ./backend
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---------- Stage 2: Build dependencies (cached) ----------
+FROM rust-alpine-base AS deps
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+ENV SQLX_OFFLINE=true
+ARG CARGO_FEATURES=""
+RUN FEATURES="vendored-openssl"; \
+    if [ -n "$CARGO_FEATURES" ]; then FEATURES="$FEATURES,$CARGO_FEATURES"; fi && \
+    cargo chef cook --release --features "$FEATURES" --recipe-path recipe.json
+
+# ---------- Stage 3: Build binary ----------
+FROM rust-alpine-base AS builder
+WORKDIR /app
+COPY --from=deps /app/target target
+COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
+COPY Cargo.toml Cargo.lock ./
+COPY .sqlx ./.sqlx
+COPY backend ./backend
+ARG GIT_SHA=unknown
+ARG CARGO_FEATURES=""
+ARG APP_VERSION=""
+ENV SQLX_OFFLINE=true
+ENV GIT_SHA=${GIT_SHA}
+RUN if [ -n "${APP_VERSION}" ]; then \
+      CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
+      sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
+    fi && \
+    FEATURES="vendored-openssl"; \
+    if [ -n "$CARGO_FEATURES" ]; then FEATURES="$FEATURES,$CARGO_FEATURES"; fi && \
+    cargo build --release --features "$FEATURES" --bin artifact-keeper
+
+# ---------- Stage 4: Copy scanner CLIs from official images ----------
+FROM ghcr.io/aquasecurity/trivy:0.71.0 AS trivy-bin
+FROM ghcr.io/anchore/grype:v0.114.0 AS grype-bin
+
+# ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
+# Populates the Grype DB at build time so the image works on egress-restricted
+# networks (e.g. ARC runner pods) without a first-scan network fetch from
+# grype.anchore.io. See artifact-keeper#1001.
+FROM alpine:3.24 AS grype-db-seed
+RUN apk add --no-cache ca-certificates
+COPY --from=grype-bin /grype /usr/local/bin/grype
+ENV GRYPE_DB_CACHE_DIR=/grype-db
+RUN mkdir -p /grype-db && grype db update && grype db status
+
+# ---------- Stage 5: Alpine runtime ----------
+FROM alpine:3.24
+
+# Runtime dependencies (no libssl needed - OpenSSL is vendored/static)
+RUN apk add --no-cache --upgrade ca-certificates libgcc libstdc++ zlib xz-libs libbz2 curl jq
+
+# --- CIS hardening (adapted from CIS Alpine Linux Benchmark) ---
+
+# Non-root user
+RUN addgroup -g 1001 artifact && \
+    adduser -D -u 1001 -G artifact -h /home/artifact -s /sbin/nologin artifact
+
+# Application directories
+RUN mkdir -p /app /data/storage /data/backups /data/plugins \
+    /scan-workspace /shared /home/artifact/.cache/grype /home/artifact/.cache/trivy && \
+    chown -R 1001:1001 /data /scan-workspace /home/artifact /app /shared
+
+# Disable core dumps (CIS 1.5.1)
+RUN mkdir -p /etc/security/limits.d && \
+    echo "* hard core 0" > /etc/security/limits.d/50-coredump.conf && \
+    echo "ulimit -c 0" > /etc/profile.d/coredump.sh
+
+# Restrictive umask (CIS 5.4.4)
+RUN echo "umask 077" > /etc/profile.d/umask.sh
+
+# Remove SUID/SGID binaries (CIS 6.1.13/6.1.14)
+RUN find / -perm /6000 -type f -exec chmod a-s {} \; 2>/dev/null || true
+
+# Remove shell access from system accounts (CIS 5.4.2)
+RUN sed -i 's|/bin/sh$|/sbin/nologin|g' /etc/passwd || true
+
+# Clean machine-id (regenerated at runtime)
+RUN rm -f /etc/machine-id && touch /etc/machine-id && chmod 0444 /etc/machine-id
+
+# Clean caches
+RUN rm -rf /var/cache/apk/* /tmp/*
+
+# --- End CIS hardening ---
+
+# Copy scanner CLIs (statically linked Go binaries)
+COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/
+COPY --from=grype-bin /grype /usr/local/bin/
+
+# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch)
+COPY --from=grype-db-seed --chown=1001:1001 /grype-db /home/artifact/.cache/grype
+
+# Copy application binary
+COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
+
+WORKDIR /app
+USER 1001
+
+# Grype defaults `db.auto-update=true` and `db.validate-age=true`. With those
+# defaults, Grype at scan time refuses to use the pre-seeded DB if its build
+# timestamp is older than `db.max-allowed-built-age` (5 days) and tries to
+# refetch from grype.anchore.io. That fetch fails in network-restricted
+# environments and Grype exits 1 with no stderr (because the scanner passes
+# `-q`). Disable both knobs so the seeded DB is honored for the full image
+# lifetime; refresh the DB by rebuilding the image. See artifact-keeper#1001
+# and PR #1002 (commit 23d9743) which added the seed stage.
+ENV RUST_LOG=info \
+    DATABASE_URL=set-database-url-at-runtime \
+    STORAGE_PATH=/data/storage \
+    BACKUP_PATH=/data/backups \
+    GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
+    GRYPE_DB_AUTO_UPDATE=false \
+    GRYPE_DB_VALIDATE_AGE=false \
+    GRYPE_CHECK_FOR_APP_UPDATE=false \
+    HOST=0.0.0.0 \
+    PORT=8080
+
+EXPOSE 8080 9090
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["curl", "-sf", "http://localhost:8080/health"]
+
+CMD ["artifact-keeper"]

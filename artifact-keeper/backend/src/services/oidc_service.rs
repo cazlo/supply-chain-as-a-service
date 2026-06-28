@@ -1,0 +1,1130 @@
+//! OIDC (OpenID Connect) authentication service.
+//!
+//! Provides authentication via OpenID Connect providers like Keycloak,
+//! Azure AD, Okta, Auth0, Google, etc.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::config::Config;
+use crate::error::{AppError, Result};
+use crate::models::user::{AuthProvider, User};
+
+/// OIDC provider configuration
+#[derive(Debug, Clone)]
+pub struct OidcConfig {
+    /// OIDC issuer URL (e.g., https://accounts.google.com)
+    pub issuer: String,
+    /// Client ID
+    pub client_id: String,
+    /// Client secret
+    pub client_secret: String,
+    /// Redirect URI for callback
+    pub redirect_uri: String,
+    /// Scopes to request (default: openid profile email)
+    pub scopes: Vec<String>,
+    /// Claim containing username
+    pub username_claim: String,
+    /// Claim containing email
+    pub email_claim: String,
+    /// Claim containing display name
+    pub display_name_claim: String,
+    /// Claim containing groups
+    pub groups_claim: String,
+    /// Group name for admin role
+    pub admin_group: Option<String>,
+    /// Default role for all OIDC users (OIDC_DEFAULT_ROLE, defaults to "user").
+    pub default_role: String,
+}
+
+impl OidcConfig {
+    /// Create OIDC config from application config
+    pub fn from_config(config: &Config) -> Option<Self> {
+        let issuer = config.oidc_issuer.clone()?;
+        let client_id = config.oidc_client_id.clone()?;
+        let client_secret = config.oidc_client_secret.clone()?;
+
+        Some(Self {
+            issuer,
+            client_id,
+            client_secret,
+            redirect_uri: std::env::var("OIDC_REDIRECT_URI")
+                .unwrap_or_else(|_| "http://localhost:8080/auth/oidc/callback".to_string()),
+            scopes: std::env::var("OIDC_SCOPES")
+                .map(|s| s.split(' ').map(|s| s.to_string()).collect())
+                .unwrap_or_else(|_| vec!["openid".into(), "profile".into(), "email".into()]),
+            username_claim: std::env::var("OIDC_USERNAME_CLAIM")
+                .unwrap_or_else(|_| "preferred_username".to_string()),
+            email_claim: std::env::var("OIDC_EMAIL_CLAIM").unwrap_or_else(|_| "email".to_string()),
+            display_name_claim: std::env::var("OIDC_DISPLAY_NAME_CLAIM")
+                .unwrap_or_else(|_| "name".to_string()),
+            groups_claim: std::env::var("OIDC_GROUPS_CLAIM")
+                .unwrap_or_else(|_| "groups".to_string()),
+            admin_group: std::env::var("OIDC_ADMIN_GROUP").ok(),
+            default_role: std::env::var("OIDC_DEFAULT_ROLE").unwrap_or_else(|_| "user".to_string()),
+        })
+    }
+}
+
+/// OIDC discovery document (well-known configuration)
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcDiscovery {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub userinfo_endpoint: Option<String>,
+    pub jwks_uri: String,
+    pub scopes_supported: Option<Vec<String>>,
+    pub response_types_supported: Vec<String>,
+    pub grant_types_supported: Option<Vec<String>>,
+    pub id_token_signing_alg_values_supported: Option<Vec<String>>,
+}
+
+/// Token response from OIDC provider
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in: Option<u64>,
+    pub refresh_token: Option<String>,
+    pub id_token: Option<String>,
+    pub scope: Option<String>,
+}
+
+/// User information from OIDC provider
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcUserInfo {
+    /// Subject identifier (unique user ID from provider)
+    pub sub: String,
+    /// Username (preferred_username claim)
+    pub username: String,
+    /// Email address
+    pub email: String,
+    /// Whether email is verified
+    pub email_verified: Option<bool>,
+    /// Display name
+    pub display_name: Option<String>,
+    /// Group memberships
+    pub groups: Vec<String>,
+    /// Raw claims from ID token
+    #[serde(flatten)]
+    pub extra_claims: HashMap<String, serde_json::Value>,
+}
+
+/// ID Token claims (JWT payload)
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdTokenClaims {
+    /// Issuer
+    pub iss: String,
+    /// Subject (user ID)
+    pub sub: String,
+    /// Audience (client ID)
+    pub aud: OidcAudience,
+    /// Expiration time
+    pub exp: i64,
+    /// Issued at
+    pub iat: i64,
+    /// Auth time (optional)
+    pub auth_time: Option<i64>,
+    /// Nonce (optional)
+    pub nonce: Option<String>,
+    /// Additional claims
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// OIDC audience can be a string or array
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OidcAudience {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl OidcAudience {
+    pub fn contains(&self, client_id: &str) -> bool {
+        match self {
+            OidcAudience::Single(aud) => aud == client_id,
+            OidcAudience::Multiple(auds) => auds.iter().any(|a| a == client_id),
+        }
+    }
+}
+
+/// Authorization URL parameters
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorizationParams {
+    pub authorization_url: String,
+    pub state: String,
+    pub nonce: String,
+}
+
+/// OIDC authentication service
+pub struct OidcService {
+    db: PgPool,
+    config: OidcConfig,
+    http_client: Client,
+    discovery: Option<OidcDiscovery>,
+}
+
+impl OidcService {
+    /// Create a new OIDC service
+    pub fn new(db: PgPool, app_config: Arc<Config>) -> Result<Self> {
+        let config = OidcConfig::from_config(&app_config)
+            .ok_or_else(|| AppError::Config("OIDC configuration not set".into()))?;
+
+        Ok(Self {
+            db,
+            config,
+            http_client: crate::services::http_client::default_client(),
+            discovery: None,
+        })
+    }
+
+    /// Create OIDC service from explicit config
+    pub fn with_config(db: PgPool, config: OidcConfig) -> Self {
+        Self {
+            db,
+            config,
+            http_client: crate::services::http_client::default_client(),
+            discovery: None,
+        }
+    }
+
+    /// Fetch OIDC discovery document
+    pub async fn discover(&mut self) -> Result<&OidcDiscovery> {
+        if self.discovery.is_none() {
+            let discovery_url = format!(
+                "{}/.well-known/openid-configuration",
+                self.config.issuer.trim_end_matches('/')
+            );
+
+            let response = self
+                .http_client
+                .get(&discovery_url)
+                .send()
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("Failed to fetch OIDC discovery: {}", e))
+                })?;
+
+            if !response.status().is_success() {
+                return Err(AppError::Internal(format!(
+                    "OIDC discovery failed with status: {}",
+                    response.status()
+                )));
+            }
+
+            let discovery: OidcDiscovery = response.json().await.map_err(|e| {
+                AppError::Internal(format!("Failed to parse OIDC discovery: {}", e))
+            })?;
+
+            self.discovery = Some(discovery);
+        }
+
+        Ok(self.discovery.as_ref().unwrap())
+    }
+
+    /// Generate authorization URL for login redirect
+    pub async fn get_authorization_url(&mut self) -> Result<AuthorizationParams> {
+        let discovery = self.discover().await?.clone();
+
+        // Generate random state and nonce for CSRF protection
+        let state = Uuid::new_v4().to_string();
+        let nonce = Uuid::new_v4().to_string();
+
+        let scopes = self.config.scopes.join(" ");
+
+        let params = [
+            ("response_type", "code"),
+            ("client_id", &self.config.client_id),
+            ("redirect_uri", &self.config.redirect_uri),
+            ("scope", &scopes),
+            ("state", &state),
+            ("nonce", &nonce),
+        ];
+
+        let authorization_url = format!(
+            "{}?{}",
+            discovery.authorization_endpoint,
+            serde_urlencoded::to_string(params)
+                .map_err(|e| AppError::Internal(format!("Failed to encode params: {}", e)))?
+        );
+
+        Ok(AuthorizationParams {
+            authorization_url,
+            state,
+            nonce,
+        })
+    }
+
+    /// Exchange authorization code for tokens
+    pub async fn authenticate(&mut self, code: &str) -> Result<OidcUserInfo> {
+        let discovery = self.discover().await?.clone();
+
+        // Exchange code for tokens
+        let token_response = self.exchange_code(code, &discovery.token_endpoint).await?;
+
+        // Extract user info from ID token or userinfo endpoint
+        let user_info = if let Some(id_token) = &token_response.id_token {
+            self.extract_user_from_id_token(id_token)?
+        } else if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
+            self.fetch_userinfo(&token_response.access_token, userinfo_endpoint)
+                .await?
+        } else {
+            return Err(AppError::Authentication(
+                "No ID token or userinfo endpoint available".into(),
+            ));
+        };
+
+        tracing::info!(
+            sub = %user_info.sub,
+            username = %user_info.username,
+            "OIDC authentication successful"
+        );
+
+        Ok(user_info)
+    }
+
+    /// Exchange authorization code for tokens
+    async fn exchange_code(&self, code: &str, token_endpoint: &str) -> Result<TokenResponse> {
+        let params = [
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", &self.config.redirect_uri),
+            ("client_id", &self.config.client_id),
+            ("client_secret", &self.config.client_secret),
+        ];
+
+        let response = self
+            .http_client
+            .post(token_endpoint)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| AppError::Authentication(format!("Token exchange failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(AppError::Authentication(format!(
+                "Token exchange failed: {}",
+                error_text
+            )));
+        }
+
+        response
+            .json()
+            .await
+            .map_err(|e| AppError::Authentication(format!("Failed to parse token response: {}", e)))
+    }
+
+    /// Extract user information from ID token
+    fn extract_user_from_id_token(&self, id_token: &str) -> Result<OidcUserInfo> {
+        // Decode JWT without verification (validation should use JWKS in production)
+        // The token format is: header.payload.signature
+        let parts: Vec<&str> = id_token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(AppError::Authentication("Invalid ID token format".into()));
+        }
+
+        // Decode the payload (middle part)
+        let payload = parts[1];
+
+        // Add padding if needed for base64 decoding
+        let padding = match payload.len() % 4 {
+            2 => "==",
+            3 => "=",
+            _ => "",
+        };
+        let padded = format!("{}{}", payload, padding);
+
+        // Use URL-safe base64 decoding
+        let decoded = base64_decode_url_safe(&padded)
+            .map_err(|e| AppError::Authentication(format!("Failed to decode ID token: {}", e)))?;
+
+        let claims: IdTokenClaims = serde_json::from_slice(&decoded).map_err(|e| {
+            AppError::Authentication(format!("Failed to parse ID token claims: {}", e))
+        })?;
+
+        // Validate issuer
+        if claims.iss != self.config.issuer {
+            return Err(AppError::Authentication(format!(
+                "Invalid issuer: expected {}, got {}",
+                self.config.issuer, claims.iss
+            )));
+        }
+
+        // Validate audience
+        if !claims.aud.contains(&self.config.client_id) {
+            return Err(AppError::Authentication("Invalid audience".into()));
+        }
+
+        // Validate expiration
+        let now = chrono::Utc::now().timestamp();
+        if claims.exp < now {
+            return Err(AppError::Authentication("ID token expired".into()));
+        }
+
+        // Extract user info from claims
+        let username = claims
+            .extra
+            .get(&self.config.username_claim)
+            .and_then(|v| v.as_str())
+            .unwrap_or(&claims.sub)
+            .to_string();
+
+        let email = claims
+            .extra
+            .get(&self.config.email_claim)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let display_name = claims
+            .extra
+            .get(&self.config.display_name_claim)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let groups = claims
+            .extra
+            .get(&self.config.groups_claim)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let email_verified = claims.extra.get("email_verified").and_then(|v| v.as_bool());
+
+        Ok(OidcUserInfo {
+            sub: claims.sub,
+            username,
+            email,
+            email_verified,
+            display_name,
+            groups,
+            extra_claims: claims.extra,
+        })
+    }
+
+    /// Fetch user info from userinfo endpoint
+    async fn fetch_userinfo(
+        &self,
+        access_token: &str,
+        userinfo_endpoint: &str,
+    ) -> Result<OidcUserInfo> {
+        let response = self
+            .http_client
+            .get(userinfo_endpoint)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| AppError::Authentication(format!("Userinfo request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(AppError::Authentication("Userinfo request failed".into()));
+        }
+
+        let claims: HashMap<String, serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| AppError::Authentication(format!("Failed to parse userinfo: {}", e)))?;
+
+        let sub = claims
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::Authentication("Missing sub claim".into()))?
+            .to_string();
+
+        let username = claims
+            .get(&self.config.username_claim)
+            .and_then(|v| v.as_str())
+            .unwrap_or(&sub)
+            .to_string();
+
+        let email = claims
+            .get(&self.config.email_claim)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let display_name = claims
+            .get(&self.config.display_name_claim)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let groups = claims
+            .get(&self.config.groups_claim)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let email_verified = claims.get("email_verified").and_then(|v| v.as_bool());
+
+        Ok(OidcUserInfo {
+            sub,
+            username,
+            email,
+            email_verified,
+            display_name,
+            groups,
+            extra_claims: claims,
+        })
+    }
+
+    /// Get or create a user from OIDC information
+    pub async fn get_or_create_user(&self, oidc_user: &OidcUserInfo) -> Result<User> {
+        // Check if user already exists by external_id (sub)
+        let existing_user = sqlx::query_as!(
+            User,
+            r#"
+            SELECT
+                id, username, email, password_hash, display_name,
+                auth_provider as "auth_provider: AuthProvider",
+                external_id, is_admin, is_active, is_service_account, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
+            FROM users
+            WHERE external_id = $1 AND auth_provider = 'oidc'
+            "#,
+            oidc_user.sub
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if let Some(mut user) = existing_user {
+            // Update user info from OIDC
+            let is_admin = self.is_admin_from_groups(&oidc_user.groups);
+
+            sqlx::query!(
+                r#"
+                UPDATE users
+                SET email = $1, display_name = $2, is_admin = $3,
+                    last_login_at = NOW(), updated_at = NOW()
+                WHERE id = $4
+                "#,
+                oidc_user.email,
+                oidc_user.display_name,
+                is_admin,
+                user.id
+            )
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            user.email = oidc_user.email.clone();
+            user.display_name = oidc_user.display_name.clone();
+            user.is_admin = is_admin;
+
+            return Ok(user);
+        }
+
+        // Create new user from OIDC
+        let user_id = Uuid::new_v4();
+        let is_admin = self.is_admin_from_groups(&oidc_user.groups);
+
+        // Generate unique username if conflict exists
+        let username = self.generate_unique_username(&oidc_user.username).await?;
+
+        let user = sqlx::query_as!(
+            User,
+            r#"
+            INSERT INTO users (id, username, email, display_name, auth_provider, external_id, is_admin, is_active, is_service_account)
+            VALUES ($1, $2, $3, $4, 'oidc', $5, $6, true, false)
+            RETURNING
+                id, username, email, password_hash, display_name,
+                auth_provider as "auth_provider: AuthProvider",
+                external_id, is_admin, is_active, is_service_account, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
+            "#,
+            user_id,
+            username,
+            oidc_user.email,
+            oidc_user.display_name,
+            oidc_user.sub,
+            is_admin
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tracing::info!(
+            user_id = %user.id,
+            username = %user.username,
+            sub = %oidc_user.sub,
+            "Created new user from OIDC"
+        );
+
+        Ok(user)
+    }
+
+    /// Generate unique username if conflict exists
+    async fn generate_unique_username(&self, base_username: &str) -> Result<String> {
+        let mut username = base_username.to_string();
+        let mut suffix = 1;
+
+        loop {
+            let exists = sqlx::query_scalar!(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)",
+                username
+            )
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .unwrap_or(false);
+
+            if !exists {
+                return Ok(username);
+            }
+
+            username = format!("{}_{}", base_username, suffix);
+            suffix += 1;
+
+            if suffix > 100 {
+                return Err(AppError::Internal(
+                    "Failed to generate unique username".into(),
+                ));
+            }
+        }
+    }
+
+    fn is_admin_from_groups(&self, groups: &[String]) -> bool {
+        if let Some(admin_group) = &self.config.admin_group {
+            if groups
+                .iter()
+                .any(|g| g.to_lowercase() == admin_group.to_lowercase())
+            {
+                return true;
+            }
+        }
+
+        if let Ok(mappings) = std::env::var("OIDC_GROUP_ROLE_MAP") {
+            for mapping in mappings.split(';') {
+                if let Some((group, role)) = mapping.split_once(':') {
+                    if role.trim().to_lowercase() == "admin"
+                        && groups
+                            .iter()
+                            .any(|g| g.to_lowercase() == group.trim().to_lowercase())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        self.config.default_role.to_lowercase() == "admin"
+    }
+
+    /// Extract group memberships for role mapping
+    pub fn extract_groups(&self, oidc_user: &OidcUserInfo) -> Vec<String> {
+        oidc_user.groups.clone()
+    }
+
+    pub fn map_groups_to_roles(&self, groups: &[String]) -> Vec<String> {
+        let mut roles = vec![self.config.default_role.clone()];
+
+        if self.is_admin_from_groups(groups) {
+            roles.push("admin".to_string());
+        }
+
+        if let Ok(mappings) = std::env::var("OIDC_GROUP_ROLE_MAP") {
+            for mapping in mappings.split(';') {
+                if let Some((group, role)) = mapping.split_once(':') {
+                    if groups
+                        .iter()
+                        .any(|g| g.to_lowercase() == group.trim().to_lowercase())
+                    {
+                        roles.push(role.trim().to_string());
+                    }
+                }
+            }
+        }
+
+        roles.sort();
+        roles.dedup();
+        roles
+    }
+
+    /// Check if OIDC is configured
+    pub fn is_configured(&self) -> bool {
+        !self.config.issuer.is_empty()
+            && !self.config.client_id.is_empty()
+            && !self.config.client_secret.is_empty()
+    }
+
+    /// Get the OIDC issuer URL
+    pub fn issuer(&self) -> &str {
+        &self.config.issuer
+    }
+
+    /// Get the client ID
+    pub fn client_id(&self) -> &str {
+        &self.config.client_id
+    }
+}
+
+/// URL-safe base64 decode
+fn base64_decode_url_safe(input: &str) -> std::result::Result<Vec<u8>, String> {
+    // Convert URL-safe base64 to standard base64
+    let standard = input.replace('-', "+").replace('_', "/");
+
+    // Simple base64 decode implementation
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut output = Vec::new();
+    let mut buffer: u32 = 0;
+    let mut bits_collected = 0;
+
+    for byte in standard.bytes() {
+        if byte == b'=' {
+            break;
+        }
+
+        let value = ALPHABET
+            .iter()
+            .position(|&c| c == byte)
+            .ok_or_else(|| format!("Invalid base64 character: {}", byte as char))?;
+
+        buffer = (buffer << 6) | (value as u32);
+        bits_collected += 6;
+
+        if bits_collected >= 8 {
+            bits_collected -= 8;
+            output.push(((buffer >> bits_collected) & 0xFF) as u8);
+        }
+    }
+
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_base64_decode_url_safe() {
+        // Test basic decoding
+        let input = "SGVsbG8gV29ybGQ"; // "Hello World" without padding
+        let decoded = base64_decode_url_safe(&format!("{}=", input)).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "Hello World");
+    }
+
+    #[test]
+    fn test_oidc_audience_contains() {
+        let single = OidcAudience::Single("client-123".into());
+        assert!(single.contains("client-123"));
+        assert!(!single.contains("other-client"));
+
+        let multiple = OidcAudience::Multiple(vec!["client-123".into(), "client-456".into()]);
+        assert!(multiple.contains("client-123"));
+        assert!(multiple.contains("client-456"));
+        assert!(!multiple.contains("other-client"));
+    }
+
+    #[test]
+    fn test_oidc_config_from_env() {
+        let config = Config {
+            database_url: "postgres://localhost/test".into(),
+            bind_address: "0.0.0.0:8080".into(),
+            log_level: "info".into(),
+            storage_backend: "filesystem".into(),
+            storage_path: "/tmp/artifacts".into(),
+            s3_bucket: None,
+            gcs_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            jwt_secret: "test-secret".into(),
+            jwt_expiration_secs: 86400,
+            jwt_access_token_expiry_minutes: 30,
+            jwt_refresh_token_expiry_days: 7,
+            oidc_issuer: Some("https://accounts.google.com".into()),
+            oidc_client_id: Some("client-123".into()),
+            oidc_client_secret: Some("secret-456".into()),
+            ldap_url: None,
+            ldap_base_dn: None,
+            trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
+            opensearch_url: None,
+            opensearch_username: None,
+            opensearch_password: None,
+            opensearch_allow_invalid_certs: false,
+            scan_workspace_path: "/scan-workspace".into(),
+            demo_mode: false,
+            guest_access_enabled: true,
+            plugins_require_signed: true,
+            plugins_trusted_pubkey: None,
+            peer_instance_name: "test".into(),
+            peer_public_endpoint: "http://localhost:8080".into(),
+            peer_api_key: "test-key".into(),
+            dependency_track_url: None,
+            dependency_track_enabled: false,
+            otel_exporter_otlp_endpoint: None,
+            otel_service_name: "test".into(),
+            gc_schedule: "0 0 * * * *".into(),
+            blob_gc_enabled: false,
+            lifecycle_check_interval_secs: 60,
+            stuck_scan_threshold_secs: 1800,
+            stuck_scan_check_interval_secs: 600,
+            stuck_scan_reap_limit: 1000,
+            max_upload_size_bytes: 10_737_418_240,
+            allow_local_admin_login: false,
+            metrics_port: None,
+            database_max_connections: 20,
+            database_min_connections: 5,
+            database_acquire_timeout_secs: 30,
+            database_idle_timeout_secs: 600,
+            database_max_lifetime_secs: 1800,
+            auth_max_concurrency: 8,
+            global_max_concurrency: 512,
+            global_request_timeout_secs: 120,
+            rate_limit_enabled: true,
+            rate_limit_auth_per_window: 120,
+            rate_limit_api_per_window: 5000,
+            rate_limit_search_per_window: 300,
+            rate_limit_presign_per_window: 30,
+            rate_limit_password_change_per_window: 5,
+            rate_limit_password_change_window_secs: 900,
+            rate_limit_window_secs: 60,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
+            rate_limit_trusted_cidrs: Vec::new(),
+            account_lockout_threshold: 5,
+            account_lockout_duration_minutes: 30,
+            quarantine_enabled: false,
+            quarantine_duration_minutes: 60,
+            password_history_count: 0,
+            password_expiry_days: 0,
+            password_expiry_warning_days: vec![1, 7, 14],
+            password_expiry_check_interval_secs: 3600,
+            password_min_length: 8,
+            password_max_length: 128,
+            password_require_uppercase: false,
+            password_require_lowercase: false,
+            password_require_digit: false,
+            password_require_special: false,
+            password_min_strength: 0,
+            presigned_downloads_enabled: false,
+            presigned_download_expiry_secs: 300,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_address: "noreply@artifact-keeper.local".to_string(),
+            smtp_tls_mode: "starttls".to_string(),
+        };
+
+        let oidc_config = OidcConfig::from_config(&config);
+        assert!(oidc_config.is_some());
+        let oidc_config = oidc_config.unwrap();
+        assert_eq!(oidc_config.issuer, "https://accounts.google.com");
+        assert_eq!(oidc_config.client_id, "client-123");
+    }
+
+    fn make_test_config() -> Config {
+        Config {
+            database_url: "postgres://localhost/test".into(),
+            bind_address: "0.0.0.0:8080".into(),
+            log_level: "info".into(),
+            storage_backend: "filesystem".into(),
+            storage_path: "/tmp/artifacts".into(),
+            s3_bucket: None,
+            gcs_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            jwt_secret: "test-secret".into(),
+            jwt_expiration_secs: 86400,
+            jwt_access_token_expiry_minutes: 30,
+            jwt_refresh_token_expiry_days: 7,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            ldap_url: None,
+            ldap_base_dn: None,
+            trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
+            opensearch_url: None,
+            opensearch_username: None,
+            opensearch_password: None,
+            opensearch_allow_invalid_certs: false,
+            scan_workspace_path: "/scan-workspace".into(),
+            demo_mode: false,
+            guest_access_enabled: true,
+            plugins_require_signed: true,
+            plugins_trusted_pubkey: None,
+            peer_instance_name: "test".into(),
+            peer_public_endpoint: "http://localhost:8080".into(),
+            peer_api_key: "test-key".into(),
+            dependency_track_url: None,
+            dependency_track_enabled: false,
+            otel_exporter_otlp_endpoint: None,
+            otel_service_name: "test".into(),
+            gc_schedule: "0 0 * * * *".into(),
+            blob_gc_enabled: false,
+            lifecycle_check_interval_secs: 60,
+            stuck_scan_threshold_secs: 1800,
+            stuck_scan_check_interval_secs: 600,
+            stuck_scan_reap_limit: 1000,
+            max_upload_size_bytes: 10_737_418_240,
+            allow_local_admin_login: false,
+            metrics_port: None,
+            database_max_connections: 20,
+            database_min_connections: 5,
+            database_acquire_timeout_secs: 30,
+            database_idle_timeout_secs: 600,
+            database_max_lifetime_secs: 1800,
+            auth_max_concurrency: 8,
+            global_max_concurrency: 512,
+            global_request_timeout_secs: 120,
+            rate_limit_enabled: true,
+            rate_limit_auth_per_window: 120,
+            rate_limit_api_per_window: 5000,
+            rate_limit_search_per_window: 300,
+            rate_limit_presign_per_window: 30,
+            rate_limit_password_change_per_window: 5,
+            rate_limit_password_change_window_secs: 900,
+            rate_limit_window_secs: 60,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
+            rate_limit_trusted_cidrs: Vec::new(),
+            account_lockout_threshold: 5,
+            account_lockout_duration_minutes: 30,
+            quarantine_enabled: false,
+            quarantine_duration_minutes: 60,
+            password_history_count: 0,
+            password_expiry_days: 0,
+            password_expiry_warning_days: vec![1, 7, 14],
+            password_expiry_check_interval_secs: 3600,
+            password_min_length: 8,
+            password_max_length: 128,
+            password_require_uppercase: false,
+            password_require_lowercase: false,
+            password_require_digit: false,
+            password_require_special: false,
+            password_min_strength: 0,
+            presigned_downloads_enabled: false,
+            presigned_download_expiry_secs: 300,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_address: "noreply@artifact-keeper.local".to_string(),
+            smtp_tls_mode: "starttls".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_oidc_config_from_env_missing_issuer() {
+        let config = make_test_config();
+        let oidc_config = OidcConfig::from_config(&config);
+        assert!(oidc_config.is_none());
+    }
+
+    #[test]
+    fn test_oidc_config_from_env_missing_client_id() {
+        let mut config = make_test_config();
+        config.oidc_issuer = Some("https://example.com".into());
+        // missing client_id
+        let oidc_config = OidcConfig::from_config(&config);
+        assert!(oidc_config.is_none());
+    }
+
+    #[test]
+    fn test_oidc_config_from_env_missing_client_secret() {
+        let mut config = make_test_config();
+        config.oidc_issuer = Some("https://example.com".into());
+        config.oidc_client_id = Some("client-123".into());
+        // missing client_secret
+        let oidc_config = OidcConfig::from_config(&config);
+        assert!(oidc_config.is_none());
+    }
+
+    #[test]
+    fn test_oidc_audience_single_match() {
+        let aud = OidcAudience::Single("my-client".to_string());
+        assert!(aud.contains("my-client"));
+        assert!(!aud.contains("other-client"));
+    }
+
+    #[test]
+    fn test_oidc_audience_multiple_match() {
+        let aud = OidcAudience::Multiple(vec![
+            "client-a".to_string(),
+            "client-b".to_string(),
+            "client-c".to_string(),
+        ]);
+        assert!(aud.contains("client-a"));
+        assert!(aud.contains("client-b"));
+        assert!(aud.contains("client-c"));
+        assert!(!aud.contains("client-d"));
+    }
+
+    #[test]
+    fn test_oidc_audience_empty_multiple() {
+        let aud = OidcAudience::Multiple(vec![]);
+        assert!(!aud.contains("any-client"));
+    }
+
+    #[test]
+    fn test_base64_decode_url_safe_hello() {
+        let result = base64_decode_url_safe("SGVsbG8=").unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "Hello");
+    }
+
+    #[test]
+    fn test_base64_decode_url_safe_url_chars() {
+        // URL-safe base64 uses - instead of + and _ instead of /
+        // "Hello+World/" in standard base64 might use + and /
+        // Test that URL-safe decoding works
+        let standard_input = "SGVsbG8gV29ybGQ="; // "Hello World"
+        let result = base64_decode_url_safe(standard_input).unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "Hello World");
+    }
+
+    #[test]
+    fn test_base64_decode_url_safe_no_padding() {
+        // "ab" in base64 without padding
+        let result = base64_decode_url_safe("YWI");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_base64_decode_invalid_char() {
+        let result = base64_decode_url_safe("!!!invalid!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_oidc_user_info_serialization() {
+        let user_info = OidcUserInfo {
+            sub: "user-123".to_string(),
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            email_verified: Some(true),
+            display_name: Some("Test User".to_string()),
+            groups: vec!["developers".to_string(), "admins".to_string()],
+            extra_claims: HashMap::new(),
+        };
+        let json = serde_json::to_string(&user_info).unwrap();
+        let deserialized: OidcUserInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.sub, "user-123");
+        assert_eq!(deserialized.username, "testuser");
+        assert_eq!(deserialized.email, "test@example.com");
+        assert_eq!(deserialized.groups.len(), 2);
+    }
+
+    #[test]
+    fn test_oidc_discovery_deserialization() {
+        let json = serde_json::json!({
+            "issuer": "https://accounts.google.com",
+            "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
+            "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
+            "response_types_supported": ["code", "token"],
+            "scopes_supported": ["openid", "profile", "email"]
+        });
+        let discovery: OidcDiscovery = serde_json::from_value(json).unwrap();
+        assert_eq!(discovery.issuer, "https://accounts.google.com");
+        assert!(discovery.userinfo_endpoint.is_some());
+        assert_eq!(discovery.response_types_supported.len(), 2);
+    }
+
+    #[test]
+    fn test_token_response_deserialization() {
+        let json = serde_json::json!({
+            "access_token": "access-abc",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "refresh-xyz",
+            "id_token": "ey.jwt.token",
+            "scope": "openid profile email"
+        });
+        let response: TokenResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(response.access_token, "access-abc");
+        assert_eq!(response.token_type, "Bearer");
+        assert_eq!(response.expires_in, Some(3600));
+        assert_eq!(response.refresh_token, Some("refresh-xyz".to_string()));
+    }
+
+    #[test]
+    fn test_token_response_minimal() {
+        let json = serde_json::json!({
+            "access_token": "token",
+            "token_type": "Bearer"
+        });
+        let response: TokenResponse = serde_json::from_value(json).unwrap();
+        assert!(response.expires_in.is_none());
+        assert!(response.refresh_token.is_none());
+        assert!(response.id_token.is_none());
+    }
+
+    #[test]
+    fn test_authorization_params_construction() {
+        let params = AuthorizationParams {
+            authorization_url: "https://example.com/auth?client_id=abc".to_string(),
+            state: "random-state".to_string(),
+            nonce: "random-nonce".to_string(),
+        };
+        assert!(params.authorization_url.contains("client_id=abc"));
+        assert!(!params.state.is_empty());
+        assert!(!params.nonce.is_empty());
+    }
+
+    #[test]
+    fn test_id_token_claims_deserialization() {
+        let json = serde_json::json!({
+            "iss": "https://accounts.google.com",
+            "sub": "1234567890",
+            "aud": "client-123",
+            "exp": 9999999999_i64,
+            "iat": 1000000000,
+            "preferred_username": "testuser",
+            "email": "test@example.com",
+            "name": "Test User",
+            "groups": ["admins", "developers"]
+        });
+        let claims: IdTokenClaims = serde_json::from_value(json).unwrap();
+        assert_eq!(claims.iss, "https://accounts.google.com");
+        assert_eq!(claims.sub, "1234567890");
+        assert!(claims.aud.contains("client-123"));
+        assert_eq!(
+            claims
+                .extra
+                .get("preferred_username")
+                .and_then(|v| v.as_str()),
+            Some("testuser")
+        );
+    }
+
+    #[test]
+    fn test_id_token_claims_with_array_audience() {
+        let json = serde_json::json!({
+            "iss": "https://issuer.com",
+            "sub": "user-1",
+            "aud": ["client-a", "client-b"],
+            "exp": 9999999999_i64,
+            "iat": 1000000000
+        });
+        let claims: IdTokenClaims = serde_json::from_value(json).unwrap();
+        assert!(claims.aud.contains("client-a"));
+        assert!(claims.aud.contains("client-b"));
+        assert!(!claims.aud.contains("client-c"));
+    }
+}

@@ -1,0 +1,131 @@
+[workspace]
+resolver = "2"
+members = ["backend"]
+
+[workspace.package]
+version = "1.2.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/yourorg/artifact-keeper"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.50", features = ["full"] }
+
+# Web framework
+axum = { version = "0.7", features = ["multipart", "tokio"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Authentication
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
+bcrypt = "0.19"
+
+# Checksums
+sha2 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+
+# Encryption
+aes-gcm = "0.10"
+
+# Secret-material zeroization: wipes plaintext key buffers on drop so the
+# decrypted PEM / OpenPGP armor bytes don't linger in freed heap memory
+# between SigningService::load_openpgp_secret_key and the rPGP parser
+# (artifact-keeper #1328).
+zeroize = { version = "1.8", features = ["alloc", "derive"] }
+
+# S3 storage using Apache object_store crate (supports custom CA certs for TLS)
+object_store = { version = "0.13", features = ["aws"] }
+
+# HTTP types (used for presigned URL methods)
+http = "1"
+http-body-util = "0.1"
+
+# Logging/Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+
+# OpenTelemetry (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT)
+opentelemetry = "0.28"
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry-http = { version = "0.28", features = ["reqwest"] }
+opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic", "http-proto", "reqwest-client"] }
+tracing-opentelemetry = "0.29"
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Config
+dotenvy = "0.15"
+
+# UUID
+uuid = { version = "1.7", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
+
+# HTTP client (for proxy repos)
+reqwest = { version = "0.13", features = ["json", "stream", "form"] }
+
+# URL encoding
+serde_urlencoded = "0.7"
+
+# Async streams
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
+bytes = "1.5"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# WASM runtime
+wasmtime = { version = "36.0.11", features = ["component-model", "async"] }
+wasmtime-wasi = "36.0.11"
+
+# Git operations
+git2 = "0.20"
+
+# OpenSSL (vendored feature for cross-compilation in release builds)
+openssl = { version = "0.10" }
+opensearch = "2"
+
+# OpenAPI
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.1"
+utoipa-swagger-ui = { version = "8", features = ["axum"] }
+
+# gRPC
+tonic = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+
+# URL parsing and resolution
+url = "2.5"
+
+# XML Digital Signatures (SAML signature verification).
+# Pinned to 0.3.x: 0.4.0 pulls in `kryptering 0.1.0` (HSM/PKCS11 support),
+# which fails to cross-compile on Windows because it does u64.into() on
+# `cryptoki::types::Ulong`, but `Ulong: From<u32>` only on Windows targets
+# where CK_ULONG = u32. Unblock once kryptering ships a Windows-portable fix.
+bergshamra = "=0.5.1"
+
+# SMTP email delivery
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }

@@ -1,0 +1,1667 @@
+//! Promotion approval workflow handlers.
+//!
+//! Provides endpoints for requesting, reviewing (approve/reject), and querying
+//! promotion approvals. When a staging repository has `require_approval = true`,
+//! the normal promote endpoint redirects users here instead of promoting
+//! immediately.
+
+use axum::{
+    extract::{Extension, Path, Query, State},
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use utoipa::{OpenApi, ToSchema};
+use uuid::Uuid;
+
+use crate::api::dto::Pagination;
+use crate::api::handlers::promotion::validate_promotion_repos;
+use crate::api::handlers::repositories::require_visible;
+use crate::api::middleware::auth::AuthExtension;
+use crate::api::SharedState;
+use crate::error::{AppError, Result};
+use crate::services::promotion_policy_service::PromotionPolicyService;
+use crate::services::repository_service::RepositoryService;
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+pub fn router() -> Router<SharedState> {
+    Router::new()
+        .route("/request", post(request_approval))
+        .route("/pending", get(list_pending_approvals))
+        .route("/:id", get(get_approval))
+        .route("/:id/approve", post(approve_promotion))
+        .route("/:id/reject", post(reject_promotion))
+        .route("/history", get(list_approval_history))
+}
+
+// ---------------------------------------------------------------------------
+// Request / response types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ApprovalRequest {
+    /// Source staging repository key
+    pub source_repository: String,
+    /// Target release repository key
+    pub target_repository: String,
+    /// Artifact ID to promote
+    pub artifact_id: Uuid,
+    /// Skip policy evaluation
+    #[serde(default)]
+    pub skip_policy_check: bool,
+    /// Free-text justification
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApprovalResponse {
+    pub id: Uuid,
+    pub artifact_id: Uuid,
+    pub source_repository: String,
+    pub target_repository: String,
+    pub status: String,
+    pub requested_by: Uuid,
+    pub requested_at: DateTime<Utc>,
+    pub reviewed_by: Option<Uuid>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    pub review_notes: Option<String>,
+    #[schema(value_type = Option<Object>)]
+    pub policy_result: Option<serde_json::Value>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApprovalListResponse {
+    pub items: Vec<ApprovalResponse>,
+    pub pagination: Pagination,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReviewRequest {
+    /// Optional reviewer notes
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ApprovalHistoryQuery {
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+    pub status: Option<String>,
+    pub source_repository: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PendingQuery {
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+    pub source_repository: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Internal row type for SQL mapping
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, sqlx::FromRow)]
+#[allow(dead_code)]
+struct ApprovalRow {
+    id: Uuid,
+    artifact_id: Uuid,
+    source_repo_id: Uuid,
+    target_repo_id: Uuid,
+    requested_by: Uuid,
+    requested_at: DateTime<Utc>,
+    status: String,
+    reviewed_by: Option<Uuid>,
+    reviewed_at: Option<DateTime<Utc>>,
+    review_notes: Option<String>,
+    policy_result: Option<serde_json::Value>,
+    notes: Option<String>,
+    // Joined columns
+    source_repo_key: Option<String>,
+    target_repo_key: Option<String>,
+}
+
+impl ApprovalRow {
+    fn into_response(self) -> ApprovalResponse {
+        ApprovalResponse {
+            id: self.id,
+            artifact_id: self.artifact_id,
+            source_repository: self.source_repo_key.unwrap_or_default(),
+            target_repository: self.target_repo_key.unwrap_or_default(),
+            status: self.status,
+            requested_by: self.requested_by,
+            requested_at: self.requested_at,
+            reviewed_by: self.reviewed_by,
+            reviewed_at: self.reviewed_at,
+            review_notes: self.review_notes,
+            policy_result: self.policy_result,
+            notes: self.notes,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Check whether a repository requires approval for promotions.
+pub async fn check_approval_required(db: &sqlx::PgPool, repo_id: Uuid) -> Result<bool> {
+    let row: Option<(bool,)> =
+        sqlx::query_as("SELECT COALESCE(require_approval, false) FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row.map(|(v,)| v).unwrap_or(false))
+}
+
+const SELECT_APPROVAL: &str = r#"
+    SELECT
+        pa.id,
+        pa.artifact_id,
+        pa.source_repo_id,
+        pa.target_repo_id,
+        pa.requested_by,
+        pa.requested_at,
+        pa.status,
+        pa.reviewed_by,
+        pa.reviewed_at,
+        pa.review_notes,
+        pa.policy_result,
+        pa.notes,
+        sr.key AS source_repo_key,
+        tr.key AS target_repo_key
+    FROM promotion_approvals pa
+    LEFT JOIN repositories sr ON sr.id = pa.source_repo_id
+    LEFT JOIN repositories tr ON tr.id = pa.target_repo_id
+"#;
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+/// Request approval for promoting an artifact from staging to release.
+#[utoipa::path(
+    post,
+    path = "/request",
+    context_path = "/api/v1/approval",
+    tag = "approval",
+    request_body = ApprovalRequest,
+    responses(
+        (status = 201, description = "Approval request created", body = ApprovalResponse),
+        (status = 404, description = "Artifact or repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Pending approval already exists", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn request_approval(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(req): Json<ApprovalRequest>,
+) -> Result<(axum::http::StatusCode, Json<ApprovalResponse>)> {
+    let repo_service = RepositoryService::new(state.db.clone());
+    let source_repo = repo_service.get_by_key(&req.source_repository).await?;
+    let target_repo = repo_service.get_by_key(&req.target_repository).await?;
+    validate_promotion_repos(&source_repo, &target_repo)?;
+
+    // Close the cross-tenant existence oracle. The /approval surface resolves the
+    // source repository by key with NO caller visibility filter and then probes
+    // it for the artifact below; without this gate a non-member could use that
+    // probe as an existence oracle against another tenant's private repo and
+    // write a promotion_approvals row referencing it. require_visible derives the
+    // gate from is_public + per-repo role-assignment membership (NotFound on a
+    // private repo the caller cannot see), so the denial happens BEFORE the probe.
+    require_visible(&source_repo, &Some(auth.clone()), &repo_service).await?;
+
+    // Verify the artifact exists in the source repo
+    let artifact_exists: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM artifacts WHERE id = $1 AND repository_id = $2 AND is_deleted = false",
+    )
+    .bind(req.artifact_id)
+    .bind(source_repo.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if artifact_exists.is_none() {
+        return Err(AppError::NotFound(
+            "Artifact not found in source repository".to_string(),
+        ));
+    }
+
+    // Check for an existing pending approval for the same artifact + repos
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT id FROM promotion_approvals
+        WHERE artifact_id = $1
+          AND source_repo_id = $2
+          AND target_repo_id = $3
+          AND status = 'pending'
+        "#,
+    )
+    .bind(req.artifact_id)
+    .bind(source_repo.id)
+    .bind(target_repo.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if existing.is_some() {
+        return Err(AppError::Conflict(
+            "A pending approval request already exists for this artifact and repository pair"
+                .to_string(),
+        ));
+    }
+
+    // Optionally evaluate promotion policies
+    let policy_result = if !req.skip_policy_check {
+        let policy_service = PromotionPolicyService::new(state.db.clone());
+        match policy_service
+            .evaluate_artifact(req.artifact_id, source_repo.id)
+            .await
+        {
+            Ok(eval) => Some(serde_json::json!({
+                "passed": eval.passed,
+                "action": format!("{:?}", eval.action).to_lowercase(),
+                "violations": eval.violations,
+                "cve_summary": eval.cve_summary,
+                "license_summary": eval.license_summary,
+            })),
+            Err(e) => {
+                tracing::warn!("Policy evaluation failed during approval request: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO promotion_approvals (
+            id, artifact_id, source_repo_id, target_repo_id,
+            requested_by, requested_at, status, policy_result,
+            skip_policy_check, notes
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9)
+        "#,
+    )
+    .bind(id)
+    .bind(req.artifact_id)
+    .bind(source_repo.id)
+    .bind(target_repo.id)
+    .bind(auth.user_id)
+    .bind(now)
+    .bind(&policy_result)
+    .bind(req.skip_policy_check)
+    .bind(&req.notes)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    tracing::info!(
+        approval_id = %id,
+        artifact = %req.artifact_id,
+        source = %req.source_repository,
+        target = %req.target_repository,
+        requested_by = %auth.user_id,
+        "Promotion approval requested"
+    );
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(ApprovalResponse {
+            id,
+            artifact_id: req.artifact_id,
+            source_repository: req.source_repository,
+            target_repository: req.target_repository,
+            status: "pending".to_string(),
+            requested_by: auth.user_id,
+            requested_at: now,
+            reviewed_by: None,
+            reviewed_at: None,
+            review_notes: None,
+            policy_result,
+            notes: req.notes,
+        }),
+    ))
+}
+
+/// List pending approval requests. Optionally filter by source repository.
+#[utoipa::path(
+    get,
+    path = "/pending",
+    context_path = "/api/v1/approval",
+    tag = "approval",
+    params(
+        ("page" = Option<u32>, Query, description = "Page number (1-indexed)"),
+        ("per_page" = Option<u32>, Query, description = "Items per page (max 100)"),
+        ("source_repository" = Option<String>, Query, description = "Filter by source repository key"),
+    ),
+    responses(
+        (status = 200, description = "Pending approval requests", body = ApprovalListResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_pending_approvals(
+    State(state): State<SharedState>,
+    Query(query): Query<PendingQuery>,
+) -> Result<Json<ApprovalListResponse>> {
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(20).min(100);
+    let offset = ((page - 1) * per_page) as i64;
+
+    let (rows, total): (Vec<ApprovalRow>, i64) = if let Some(ref source_key) =
+        query.source_repository
+    {
+        let repo_service = RepositoryService::new(state.db.clone());
+        let source = repo_service.get_by_key(source_key).await?;
+
+        let rows: Vec<ApprovalRow> = sqlx::query_as(&format!(
+                "{} WHERE pa.status = 'pending' AND pa.source_repo_id = $1 ORDER BY pa.requested_at DESC LIMIT $2 OFFSET $3",
+                SELECT_APPROVAL
+            ))
+            .bind(source.id)
+            .bind(per_page as i64)
+            .bind(offset)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let total: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*)::BIGINT FROM promotion_approvals WHERE status = 'pending' AND source_repo_id = $1",
+            )
+            .bind(source.id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        (rows, total.0)
+    } else {
+        let rows: Vec<ApprovalRow> = sqlx::query_as(&format!(
+            "{} WHERE pa.status = 'pending' ORDER BY pa.requested_at DESC LIMIT $1 OFFSET $2",
+            SELECT_APPROVAL
+        ))
+        .bind(per_page as i64)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let total: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT FROM promotion_approvals WHERE status = 'pending'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        (rows, total.0)
+    };
+
+    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+
+    Ok(Json(ApprovalListResponse {
+        items: rows.into_iter().map(|r| r.into_response()).collect(),
+        pagination: Pagination {
+            page,
+            per_page,
+            total,
+            total_pages,
+        },
+    }))
+}
+
+/// Get a single approval request by ID.
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/approval",
+    tag = "approval",
+    params(
+        ("id" = Uuid, Path, description = "Approval request ID"),
+    ),
+    responses(
+        (status = 200, description = "Approval request details", body = ApprovalResponse),
+        (status = 404, description = "Approval request not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_approval(
+    State(state): State<SharedState>,
+    Path(approval_id): Path<Uuid>,
+) -> Result<Json<ApprovalResponse>> {
+    let row: ApprovalRow = sqlx::query_as(&format!("{} WHERE pa.id = $1", SELECT_APPROVAL))
+        .bind(approval_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Approval request not found".to_string()))?;
+
+    Ok(Json(row.into_response()))
+}
+
+/// Approve a pending promotion request. Admin-only.
+///
+/// This copies the artifact from the staging repo to the release repo,
+/// inserts the new artifact record, records promotion history, and
+/// updates the approval status to "approved".
+#[utoipa::path(
+    post,
+    path = "/{id}/approve",
+    context_path = "/api/v1/approval",
+    tag = "approval",
+    params(
+        ("id" = Uuid, Path, description = "Approval request ID"),
+    ),
+    request_body = ReviewRequest,
+    responses(
+        (status = 200, description = "Promotion approved and executed", body = ApprovalResponse),
+        (status = 403, description = "Admin access required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Approval request not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Approval already reviewed", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn approve_promotion(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(approval_id): Path<Uuid>,
+    Json(req): Json<ReviewRequest>,
+) -> Result<Json<ApprovalResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Only admins can approve promotions".to_string(),
+        ));
+    }
+
+    #[derive(sqlx::FromRow)]
+    #[allow(dead_code)]
+    struct SimpleRow {
+        id: Uuid,
+        artifact_id: Uuid,
+        source_repo_id: Uuid,
+        target_repo_id: Uuid,
+        status: String,
+    }
+
+    let approval: SimpleRow = sqlx::query_as(
+        "SELECT id, artifact_id, source_repo_id, target_repo_id, status FROM promotion_approvals WHERE id = $1",
+    )
+    .bind(approval_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Approval request not found".to_string()))?;
+
+    if approval.status != "pending" {
+        return Err(AppError::Conflict(format!(
+            "Approval request has already been {}",
+            approval.status
+        )));
+    }
+
+    let repo_service = RepositoryService::new(state.db.clone());
+
+    let source_repo_key: (String,) = sqlx::query_as("SELECT key FROM repositories WHERE id = $1")
+        .bind(approval.source_repo_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let target_repo_key: (String,) = sqlx::query_as("SELECT key FROM repositories WHERE id = $1")
+        .bind(approval.target_repo_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let source_repo = repo_service.get_by_key(&source_repo_key.0).await?;
+    let target_repo = repo_service.get_by_key(&target_repo_key.0).await?;
+
+    #[derive(sqlx::FromRow)]
+    #[allow(dead_code)]
+    struct ArtifactRow {
+        id: Uuid,
+        path: String,
+        name: String,
+        version: Option<String>,
+        size_bytes: i64,
+        checksum_sha256: String,
+        checksum_md5: Option<String>,
+        checksum_sha1: Option<String>,
+        content_type: String,
+        storage_key: String,
+    }
+
+    let artifact: ArtifactRow = sqlx::query_as(
+        r#"
+        SELECT id, path, name, version, size_bytes,
+               checksum_sha256, checksum_md5, checksum_sha1,
+               content_type, storage_key
+        FROM artifacts
+        WHERE id = $1 AND repository_id = $2 AND is_deleted = false
+        "#,
+    )
+    .bind(approval.artifact_id)
+    .bind(source_repo.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Artifact not found in source repository".to_string()))?;
+
+    // Copy storage content
+    let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
+    let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
+
+    let content = source_storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to read source artifact: {}", e)))?;
+    target_storage
+        .put(&artifact.storage_key, content)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to write promoted artifact: {}", e)))?;
+
+    super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
+
+    // Insert artifact in target repo
+    let new_artifact_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO artifacts (
+            id, repository_id, path, name, version, size_bytes,
+            checksum_sha256, checksum_md5, checksum_sha1,
+            content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        "#,
+    )
+    .bind(new_artifact_id)
+    .bind(target_repo.id)
+    .bind(&artifact.path)
+    .bind(&artifact.name)
+    .bind(&artifact.version)
+    .bind(artifact.size_bytes)
+    .bind(&artifact.checksum_sha256)
+    .bind(&artifact.checksum_md5)
+    .bind(&artifact.checksum_sha1)
+    .bind(&artifact.content_type)
+    .bind(&artifact.storage_key)
+    .bind(auth.user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("duplicate key") {
+            AppError::Conflict(format!(
+                "Artifact already exists in target repository: {}",
+                artifact.path
+            ))
+        } else {
+            AppError::Database(e.to_string())
+        }
+    })?;
+
+    // Record promotion history
+    let promotion_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO promotion_history (
+            id, artifact_id, source_repo_id, target_repo_id,
+            promoted_by, policy_result, notes
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(promotion_id)
+    .bind(approval.artifact_id)
+    .bind(source_repo.id)
+    .bind(target_repo.id)
+    .bind(auth.user_id)
+    .bind(serde_json::json!({"approved_via": "approval_workflow", "approval_id": approval_id.to_string()}))
+    .bind(&req.notes)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Update approval status
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        UPDATE promotion_approvals
+        SET status = 'approved', reviewed_by = $1, reviewed_at = $2, review_notes = $3
+        WHERE id = $4
+        "#,
+    )
+    .bind(auth.user_id)
+    .bind(now)
+    .bind(&req.notes)
+    .bind(approval_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    tracing::info!(
+        approval_id = %approval_id,
+        artifact = %approval.artifact_id,
+        source = %source_repo_key.0,
+        target = %target_repo_key.0,
+        approved_by = %auth.user_id,
+        "Promotion approved and executed"
+    );
+
+    // Return the updated approval
+    let row: ApprovalRow = sqlx::query_as(&format!("{} WHERE pa.id = $1", SELECT_APPROVAL))
+        .bind(approval_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(row.into_response()))
+}
+
+/// Reject a pending promotion request. Admin-only.
+#[utoipa::path(
+    post,
+    path = "/{id}/reject",
+    context_path = "/api/v1/approval",
+    tag = "approval",
+    params(
+        ("id" = Uuid, Path, description = "Approval request ID"),
+    ),
+    request_body = ReviewRequest,
+    responses(
+        (status = 200, description = "Promotion rejected", body = ApprovalResponse),
+        (status = 403, description = "Admin access required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Approval request not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Approval already reviewed", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reject_promotion(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(approval_id): Path<Uuid>,
+    Json(req): Json<ReviewRequest>,
+) -> Result<Json<ApprovalResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Only admins can reject promotions".to_string(),
+        ));
+    }
+
+    let current_status: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM promotion_approvals WHERE id = $1")
+            .bind(approval_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    match current_status {
+        None => return Err(AppError::NotFound("Approval request not found".to_string())),
+        Some((status,)) if status != "pending" => {
+            return Err(AppError::Conflict(format!(
+                "Approval request has already been {}",
+                status
+            )))
+        }
+        _ => {}
+    }
+
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        UPDATE promotion_approvals
+        SET status = 'rejected', reviewed_by = $1, reviewed_at = $2, review_notes = $3
+        WHERE id = $4
+        "#,
+    )
+    .bind(auth.user_id)
+    .bind(now)
+    .bind(&req.notes)
+    .bind(approval_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    tracing::info!(
+        approval_id = %approval_id,
+        rejected_by = %auth.user_id,
+        "Promotion request rejected"
+    );
+
+    let row: ApprovalRow = sqlx::query_as(&format!("{} WHERE pa.id = $1", SELECT_APPROVAL))
+        .bind(approval_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(row.into_response()))
+}
+
+/// List approval history with optional filtering by status or source repository.
+#[utoipa::path(
+    get,
+    path = "/history",
+    context_path = "/api/v1/approval",
+    tag = "approval",
+    params(
+        ("page" = Option<u32>, Query, description = "Page number (1-indexed)"),
+        ("per_page" = Option<u32>, Query, description = "Items per page (max 100)"),
+        ("status" = Option<String>, Query, description = "Filter by status (pending, approved, rejected)"),
+        ("source_repository" = Option<String>, Query, description = "Filter by source repository key"),
+    ),
+    responses(
+        (status = 200, description = "Approval history", body = ApprovalListResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_approval_history(
+    State(state): State<SharedState>,
+    Query(query): Query<ApprovalHistoryQuery>,
+) -> Result<Json<ApprovalListResponse>> {
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(20).min(100);
+    let offset = ((page - 1) * per_page) as i64;
+
+    // Build WHERE clauses dynamically
+    let mut conditions: Vec<String> = vec![];
+    let mut bind_idx = 1u32;
+
+    if let Some(ref status) = query.status {
+        if !["pending", "approved", "rejected"].contains(&status.as_str()) {
+            return Err(AppError::Validation(format!(
+                "Invalid status '{}'. Must be one of: pending, approved, rejected",
+                status
+            )));
+        }
+        conditions.push(format!("pa.status = ${}", bind_idx));
+        bind_idx += 1;
+    }
+
+    let source_repo_id: Option<Uuid> = if let Some(ref source_key) = query.source_repository {
+        let repo_service = RepositoryService::new(state.db.clone());
+        let repo = repo_service.get_by_key(source_key).await?;
+        conditions.push(format!("pa.source_repo_id = ${}", bind_idx));
+        bind_idx += 1;
+        Some(repo.id)
+    } else {
+        None
+    };
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
+    let list_sql = format!(
+        "{}{} ORDER BY pa.requested_at DESC LIMIT ${} OFFSET ${}",
+        SELECT_APPROVAL,
+        where_clause,
+        bind_idx,
+        bind_idx + 1,
+    );
+
+    let count_sql = format!(
+        "SELECT COUNT(*)::BIGINT FROM promotion_approvals pa{}",
+        where_clause
+    );
+
+    let mut list_query = sqlx::query_as::<_, ApprovalRow>(&list_sql);
+    let mut count_query = sqlx::query_as::<_, (i64,)>(&count_sql);
+
+    if let Some(ref status) = query.status {
+        list_query = list_query.bind(status);
+        count_query = count_query.bind(status);
+    }
+    if let Some(repo_id) = source_repo_id {
+        list_query = list_query.bind(repo_id);
+        count_query = count_query.bind(repo_id);
+    }
+
+    list_query = list_query.bind(per_page as i64).bind(offset);
+
+    let rows = list_query
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let (total,) = count_query
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+
+    Ok(Json(ApprovalListResponse {
+        items: rows.into_iter().map(|r| r.into_response()).collect(),
+        pagination: Pagination {
+            page,
+            per_page,
+            total,
+            total_pages,
+        },
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI
+// ---------------------------------------------------------------------------
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        request_approval,
+        list_pending_approvals,
+        get_approval,
+        approve_promotion,
+        reject_promotion,
+        list_approval_history,
+    ),
+    components(schemas(
+        ApprovalRequest,
+        ApprovalResponse,
+        ApprovalListResponse,
+        ReviewRequest,
+        ApprovalHistoryQuery,
+        PendingQuery,
+    ))
+)]
+pub struct ApprovalApiDoc;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cross-tenant oracle guard (xtenant-write-authz-systemic). `request_approval`
+    /// resolves the source repository by key and probes it for the artifact; it
+    /// must call `require_visible` on the source repo BEFORE that probe so a
+    /// non-member cannot use the probe as an existence oracle against another
+    /// tenant's private repo. String-grep because the handler needs a real DB.
+    #[test]
+    fn test_request_approval_gates_source_repo_before_probe() {
+        let source = include_str!("approval.rs");
+        let start = source
+            .find("pub async fn request_approval(")
+            .expect("request_approval not found");
+        let rest = &source[start..];
+        let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        let gate = body
+            .find("require_visible(")
+            .expect("request_approval must call require_visible on the source repo (xtenant)");
+        let probe = body
+            .find("SELECT id FROM artifacts WHERE id = $1")
+            .expect("artifact existence probe not found");
+        assert!(
+            gate < probe,
+            "require_visible must run BEFORE the artifact existence probe (xtenant oracle)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Extracted pure functions (moved into test module)
+    // -----------------------------------------------------------------------
+
+    /// Normalize pagination parameters with defaults and bounds.
+    fn normalize_approval_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, i64) {
+        let page = page.unwrap_or(1).max(1);
+        let per_page = per_page.unwrap_or(20).min(100);
+        let offset = ((page - 1) * per_page) as i64;
+        (page, per_page, offset)
+    }
+
+    /// Compute total pages from total items and per_page.
+    fn compute_approval_total_pages(total: i64, per_page: u32) -> u32 {
+        ((total as f64) / (per_page as f64)).ceil() as u32
+    }
+
+    /// Validate that a status filter is valid for approval queries.
+    fn validate_approval_status(status: &str) -> std::result::Result<(), String> {
+        if !["pending", "approved", "rejected"].contains(&status) {
+            return Err(format!(
+                "Invalid status '{}'. Must be one of: pending, approved, rejected",
+                status
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check if an approval is in a reviewable state (must be "pending").
+    fn check_reviewable(current_status: &str) -> std::result::Result<(), String> {
+        if current_status != "pending" {
+            return Err(format!(
+                "Approval request has already been {}",
+                current_status
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build the policy result JSON from an evaluation result.
+    fn build_policy_result_json(
+        passed: bool,
+        action: &str,
+        violations: &[String],
+        cve_summary: &serde_json::Value,
+        license_summary: &serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "passed": passed,
+            "action": action,
+            "violations": violations,
+            "cve_summary": cve_summary,
+            "license_summary": license_summary,
+        })
+    }
+
+    /// Build the promotion history metadata JSON for an approved promotion.
+    fn build_promotion_history_metadata(approval_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "approved_via": "approval_workflow",
+            "approval_id": approval_id,
+        })
+    }
+
+    /// Build dynamic WHERE clauses for the approval history query.
+    /// Returns (conditions, bind_index_after).
+    fn build_history_where_clauses(
+        status: &Option<String>,
+        has_source_repo: bool,
+        start_bind_idx: u32,
+    ) -> (Vec<String>, u32) {
+        let mut conditions = Vec::new();
+        let mut bind_idx = start_bind_idx;
+
+        if status.is_some() {
+            conditions.push(format!("pa.status = ${}", bind_idx));
+            bind_idx += 1;
+        }
+
+        if has_source_repo {
+            conditions.push(format!("pa.source_repo_id = ${}", bind_idx));
+            bind_idx += 1;
+        }
+
+        (conditions, bind_idx)
+    }
+
+    /// Combine conditions into a SQL WHERE clause string.
+    fn build_where_clause(conditions: &[String]) -> String {
+        if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        }
+    }
+
+    #[test]
+    fn test_approval_request_deserialize() {
+        let json = serde_json::json!({
+            "source_repository": "staging-maven",
+            "target_repository": "release-maven",
+            "artifact_id": "00000000-0000-0000-0000-000000000001",
+            "notes": "Ready for release"
+        });
+        let req: ApprovalRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.source_repository, "staging-maven");
+        assert_eq!(req.target_repository, "release-maven");
+        assert!(!req.skip_policy_check);
+        assert_eq!(req.notes.as_deref(), Some("Ready for release"));
+    }
+
+    #[test]
+    fn test_approval_request_skip_policy_default_false() {
+        let json = serde_json::json!({
+            "source_repository": "staging",
+            "target_repository": "release",
+            "artifact_id": "00000000-0000-0000-0000-000000000001"
+        });
+        let req: ApprovalRequest = serde_json::from_value(json).unwrap();
+        assert!(!req.skip_policy_check);
+    }
+
+    #[test]
+    fn test_approval_request_with_skip_policy() {
+        let json = serde_json::json!({
+            "source_repository": "staging",
+            "target_repository": "release",
+            "artifact_id": "00000000-0000-0000-0000-000000000001",
+            "skip_policy_check": true
+        });
+        let req: ApprovalRequest = serde_json::from_value(json).unwrap();
+        assert!(req.skip_policy_check);
+    }
+
+    #[test]
+    fn test_review_request_deserialize() {
+        let json = serde_json::json!({ "notes": "Looks good" });
+        let req: ReviewRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.notes.as_deref(), Some("Looks good"));
+    }
+
+    #[test]
+    fn test_review_request_empty() {
+        let json = serde_json::json!({});
+        let req: ReviewRequest = serde_json::from_value(json).unwrap();
+        assert!(req.notes.is_none());
+    }
+
+    #[test]
+    fn test_approval_response_serialize() {
+        let resp = ApprovalResponse {
+            id: Uuid::nil(),
+            artifact_id: Uuid::nil(),
+            source_repository: "staging-npm".to_string(),
+            target_repository: "release-npm".to_string(),
+            status: "pending".to_string(),
+            requested_by: Uuid::nil(),
+            requested_at: DateTime::from_timestamp(1700000000, 0).unwrap(),
+            reviewed_by: None,
+            reviewed_at: None,
+            review_notes: None,
+            policy_result: None,
+            notes: Some("Test".to_string()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["status"], "pending");
+        assert_eq!(json["source_repository"], "staging-npm");
+        assert!(json["reviewed_by"].is_null());
+    }
+
+    #[test]
+    fn test_approval_response_serialize_approved() {
+        let reviewer = Uuid::new_v4();
+        let resp = ApprovalResponse {
+            id: Uuid::nil(),
+            artifact_id: Uuid::nil(),
+            source_repository: "staging".to_string(),
+            target_repository: "release".to_string(),
+            status: "approved".to_string(),
+            requested_by: Uuid::nil(),
+            requested_at: DateTime::from_timestamp(1700000000, 0).unwrap(),
+            reviewed_by: Some(reviewer),
+            reviewed_at: Some(DateTime::from_timestamp(1700001000, 0).unwrap()),
+            review_notes: Some("LGTM".to_string()),
+            policy_result: Some(serde_json::json!({"passed": true})),
+            notes: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["status"], "approved");
+        assert_eq!(json["reviewed_by"], reviewer.to_string());
+        assert_eq!(json["review_notes"], "LGTM");
+    }
+
+    #[test]
+    fn test_approval_list_response_serialize() {
+        let resp = ApprovalListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 1,
+                per_page: 20,
+                total: 0,
+                total_pages: 0,
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["items"].as_array().unwrap().len(), 0);
+        assert_eq!(json["pagination"]["page"], 1);
+    }
+
+    #[test]
+    fn test_pending_query_deserialize() {
+        let json = serde_json::json!({
+            "page": 2,
+            "per_page": 50,
+            "source_repository": "staging-maven"
+        });
+        let query: PendingQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(query.page, Some(2));
+        assert_eq!(query.per_page, Some(50));
+        assert_eq!(query.source_repository.as_deref(), Some("staging-maven"));
+    }
+
+    #[test]
+    fn test_pending_query_defaults() {
+        let json = serde_json::json!({});
+        let query: PendingQuery = serde_json::from_value(json).unwrap();
+        assert!(query.page.is_none());
+        assert!(query.per_page.is_none());
+        assert!(query.source_repository.is_none());
+    }
+
+    #[test]
+    fn test_history_query_deserialize() {
+        let json = serde_json::json!({
+            "status": "approved",
+            "source_repository": "staging-npm",
+            "page": 1,
+            "per_page": 10
+        });
+        let query: ApprovalHistoryQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(query.status.as_deref(), Some("approved"));
+        assert_eq!(query.source_repository.as_deref(), Some("staging-npm"));
+    }
+
+    #[test]
+    fn test_approval_row_into_response() {
+        let row = ApprovalRow {
+            id: Uuid::nil(),
+            artifact_id: Uuid::nil(),
+            source_repo_id: Uuid::nil(),
+            target_repo_id: Uuid::nil(),
+            requested_by: Uuid::nil(),
+            requested_at: DateTime::from_timestamp(1700000000, 0).unwrap(),
+            status: "pending".to_string(),
+            reviewed_by: None,
+            reviewed_at: None,
+            review_notes: None,
+            policy_result: None,
+            notes: Some("test notes".to_string()),
+            source_repo_key: Some("staging-maven".to_string()),
+            target_repo_key: Some("release-maven".to_string()),
+        };
+        let resp = row.into_response();
+        assert_eq!(resp.source_repository, "staging-maven");
+        assert_eq!(resp.target_repository, "release-maven");
+        assert_eq!(resp.status, "pending");
+        assert_eq!(resp.notes.as_deref(), Some("test notes"));
+    }
+
+    #[test]
+    fn test_approval_row_into_response_missing_keys() {
+        let row = ApprovalRow {
+            id: Uuid::nil(),
+            artifact_id: Uuid::nil(),
+            source_repo_id: Uuid::nil(),
+            target_repo_id: Uuid::nil(),
+            requested_by: Uuid::nil(),
+            requested_at: DateTime::from_timestamp(1700000000, 0).unwrap(),
+            status: "rejected".to_string(),
+            reviewed_by: Some(Uuid::nil()),
+            reviewed_at: Some(DateTime::from_timestamp(1700001000, 0).unwrap()),
+            review_notes: Some("Not ready".to_string()),
+            policy_result: Some(serde_json::json!({"passed": false})),
+            notes: None,
+            source_repo_key: None,
+            target_repo_key: None,
+        };
+        let resp = row.into_response();
+        assert_eq!(resp.source_repository, "");
+        assert_eq!(resp.target_repository, "");
+        assert_eq!(resp.status, "rejected");
+        assert_eq!(resp.review_notes.as_deref(), Some("Not ready"));
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_staging_to_local() {
+        use crate::models::repository::*;
+        let source = Repository {
+            id: Uuid::nil(),
+            key: "staging-maven".to_string(),
+            name: "Staging Maven".to_string(),
+            description: None,
+            format: RepositoryFormat::Maven,
+            repo_type: RepositoryType::Staging,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/tmp/staging".to_string(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::LocalOnly,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let target = Repository {
+            id: Uuid::nil(),
+            key: "release-maven".to_string(),
+            name: "Release Maven".to_string(),
+            description: None,
+            format: RepositoryFormat::Maven,
+            storage_backend: "filesystem".to_string(),
+            repo_type: RepositoryType::Local,
+            storage_path: "/tmp/release".to_string(),
+            upstream_url: None,
+            is_public: true,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::Immediate,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(validate_promotion_repos(&source, &target).is_ok());
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_source_not_hosted() {
+        // B12 / #1376: the source-shape check now rejects only non-hosted
+        // repositories (Remote/Virtual). A Remote source owns no bytes and
+        // cannot be promoted from. (A Local source is now allowed, see
+        // promotion.rs `test_validate_promotion_repos_source_local_is_allowed`.)
+        use crate::models::repository::*;
+        let source = Repository {
+            id: Uuid::nil(),
+            key: "remote-maven".to_string(),
+            name: "Remote Maven".to_string(),
+            description: None,
+            format: RepositoryFormat::Maven,
+            storage_backend: "filesystem".to_string(),
+            repo_type: RepositoryType::Remote,
+            storage_path: "/tmp/remote".to_string(),
+            upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
+            is_public: false,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::LocalOnly,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let target = Repository {
+            id: Uuid::nil(),
+            key: "release-maven".to_string(),
+            name: "Release Maven".to_string(),
+            description: None,
+            format: RepositoryFormat::Maven,
+            storage_backend: "filesystem".to_string(),
+            repo_type: RepositoryType::Local,
+            storage_path: "/tmp/release".to_string(),
+            upstream_url: None,
+            is_public: true,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::Immediate,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let result = validate_promotion_repos(&source, &target);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("hosted"), "Error: {}", err_msg);
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_format_mismatch() {
+        use crate::models::repository::*;
+        let source = Repository {
+            id: Uuid::nil(),
+            key: "staging-maven".to_string(),
+            name: "Staging Maven".to_string(),
+            description: None,
+            format: RepositoryFormat::Maven,
+            storage_backend: "filesystem".to_string(),
+            repo_type: RepositoryType::Staging,
+            storage_path: "/tmp/staging".to_string(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::LocalOnly,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let target = Repository {
+            id: Uuid::nil(),
+            key: "release-npm".to_string(),
+            name: "Release NPM".to_string(),
+            description: None,
+            format: RepositoryFormat::Npm,
+            storage_backend: "filesystem".to_string(),
+            repo_type: RepositoryType::Local,
+            storage_path: "/tmp/release".to_string(),
+            upstream_url: None,
+            is_public: true,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::Immediate,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let result = validate_promotion_repos(&source, &target);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("mismatch"), "Error: {}", err_msg);
+    }
+
+    #[test]
+    fn test_pagination_in_list_response() {
+        let resp = ApprovalListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 3,
+                per_page: 25,
+                total: 100,
+                total_pages: 4,
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["pagination"]["page"], 3);
+        assert_eq!(json["pagination"]["per_page"], 25);
+        assert_eq!(json["pagination"]["total"], 100);
+        assert_eq!(json["pagination"]["total_pages"], 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_approval_pagination
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_approval_pagination_defaults() {
+        let (page, per_page, offset) = normalize_approval_pagination(None, None);
+        assert_eq!(page, 1);
+        assert_eq!(per_page, 20);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_normalize_approval_pagination_custom() {
+        let (page, per_page, offset) = normalize_approval_pagination(Some(3), Some(50));
+        assert_eq!(page, 3);
+        assert_eq!(per_page, 50);
+        assert_eq!(offset, 100);
+    }
+
+    #[test]
+    fn test_normalize_approval_pagination_zero_page_clamps() {
+        let (page, _, offset) = normalize_approval_pagination(Some(0), None);
+        assert_eq!(page, 1);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_normalize_approval_pagination_per_page_capped() {
+        let (_, per_page, _) = normalize_approval_pagination(None, Some(200));
+        assert_eq!(per_page, 100);
+    }
+
+    #[test]
+    fn test_normalize_approval_pagination_offset_computation() {
+        let (_, _, offset) = normalize_approval_pagination(Some(5), Some(10));
+        assert_eq!(offset, 40);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_approval_total_pages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_approval_total_pages_exact() {
+        assert_eq!(compute_approval_total_pages(100, 20), 5);
+    }
+
+    #[test]
+    fn test_compute_approval_total_pages_remainder() {
+        assert_eq!(compute_approval_total_pages(101, 20), 6);
+    }
+
+    #[test]
+    fn test_compute_approval_total_pages_zero() {
+        assert_eq!(compute_approval_total_pages(0, 20), 0);
+    }
+
+    #[test]
+    fn test_compute_approval_total_pages_one_item() {
+        assert_eq!(compute_approval_total_pages(1, 100), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_approval_status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_approval_status_pending() {
+        assert!(validate_approval_status("pending").is_ok());
+    }
+
+    #[test]
+    fn test_validate_approval_status_approved() {
+        assert!(validate_approval_status("approved").is_ok());
+    }
+
+    #[test]
+    fn test_validate_approval_status_rejected() {
+        assert!(validate_approval_status("rejected").is_ok());
+    }
+
+    #[test]
+    fn test_validate_approval_status_invalid() {
+        assert!(validate_approval_status("unknown").is_err());
+        assert!(validate_approval_status("").is_err());
+        assert!(validate_approval_status("PENDING").is_err());
+    }
+
+    #[test]
+    fn test_validate_approval_status_error_contains_value() {
+        let err = validate_approval_status("bad").unwrap_err();
+        assert!(err.contains("bad"));
+    }
+
+    // -----------------------------------------------------------------------
+    // check_reviewable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_reviewable_pending() {
+        assert!(check_reviewable("pending").is_ok());
+    }
+
+    #[test]
+    fn test_check_reviewable_approved() {
+        let err = check_reviewable("approved").unwrap_err();
+        assert!(err.contains("approved"));
+    }
+
+    #[test]
+    fn test_check_reviewable_rejected() {
+        let err = check_reviewable("rejected").unwrap_err();
+        assert!(err.contains("rejected"));
+    }
+
+    #[test]
+    fn test_check_reviewable_unknown_status() {
+        assert!(check_reviewable("unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_policy_result_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_policy_result_json_passed() {
+        let json = build_policy_result_json(
+            true,
+            "allow",
+            &[],
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        );
+        assert_eq!(json["passed"], true);
+        assert_eq!(json["action"], "allow");
+        assert!(json["violations"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_policy_result_json_failed() {
+        let violations = vec!["CVE-2024-1234: critical".to_string()];
+        let json = build_policy_result_json(
+            false,
+            "block",
+            &violations,
+            &serde_json::json!({"total": 1, "critical": 1}),
+            &serde_json::json!({"allowed": ["MIT"]}),
+        );
+        assert_eq!(json["passed"], false);
+        assert_eq!(json["action"], "block");
+        assert_eq!(json["violations"].as_array().unwrap().len(), 1);
+        assert_eq!(json["cve_summary"]["critical"], 1);
+    }
+
+    #[test]
+    fn test_build_policy_result_json_all_fields_present() {
+        let json = build_policy_result_json(
+            true,
+            "warn",
+            &[],
+            &serde_json::json!(null),
+            &serde_json::json!(null),
+        );
+        assert!(json.get("passed").is_some());
+        assert!(json.get("action").is_some());
+        assert!(json.get("violations").is_some());
+        assert!(json.get("cve_summary").is_some());
+        assert!(json.get("license_summary").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_promotion_history_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_promotion_history_metadata() {
+        let json = build_promotion_history_metadata("abc-123");
+        assert_eq!(json["approved_via"], "approval_workflow");
+        assert_eq!(json["approval_id"], "abc-123");
+    }
+
+    #[test]
+    fn test_build_promotion_history_metadata_uuid() {
+        let id = Uuid::new_v4().to_string();
+        let json = build_promotion_history_metadata(&id);
+        assert_eq!(json["approval_id"].as_str().unwrap(), id);
+    }
+
+    #[test]
+    fn test_build_promotion_history_metadata_has_both_fields() {
+        let json = build_promotion_history_metadata("x");
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_history_where_clauses
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_history_where_clauses_none() {
+        let (conditions, bind_idx) = build_history_where_clauses(&None, false, 1);
+        assert!(conditions.is_empty());
+        assert_eq!(bind_idx, 1);
+    }
+
+    #[test]
+    fn test_build_history_where_clauses_status_only() {
+        let (conditions, bind_idx) =
+            build_history_where_clauses(&Some("approved".to_string()), false, 1);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0], "pa.status = $1");
+        assert_eq!(bind_idx, 2);
+    }
+
+    #[test]
+    fn test_build_history_where_clauses_repo_only() {
+        let (conditions, bind_idx) = build_history_where_clauses(&None, true, 1);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0], "pa.source_repo_id = $1");
+        assert_eq!(bind_idx, 2);
+    }
+
+    #[test]
+    fn test_build_history_where_clauses_both() {
+        let (conditions, bind_idx) =
+            build_history_where_clauses(&Some("pending".to_string()), true, 1);
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0], "pa.status = $1");
+        assert_eq!(conditions[1], "pa.source_repo_id = $2");
+        assert_eq!(bind_idx, 3);
+    }
+
+    #[test]
+    fn test_build_history_where_clauses_custom_start_idx() {
+        let (conditions, bind_idx) =
+            build_history_where_clauses(&Some("rejected".to_string()), true, 5);
+        assert_eq!(conditions[0], "pa.status = $5");
+        assert_eq!(conditions[1], "pa.source_repo_id = $6");
+        assert_eq!(bind_idx, 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_where_clause
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_where_clause_empty() {
+        assert_eq!(build_where_clause(&[]), "");
+    }
+
+    #[test]
+    fn test_build_where_clause_single() {
+        let conditions = vec!["pa.status = $1".to_string()];
+        assert_eq!(build_where_clause(&conditions), " WHERE pa.status = $1");
+    }
+
+    #[test]
+    fn test_build_where_clause_multiple() {
+        let conditions = vec![
+            "pa.status = $1".to_string(),
+            "pa.source_repo_id = $2".to_string(),
+        ];
+        assert_eq!(
+            build_where_clause(&conditions),
+            " WHERE pa.status = $1 AND pa.source_repo_id = $2"
+        );
+    }
+
+    #[test]
+    fn test_build_where_clause_starts_with_space() {
+        let conditions = vec!["x = 1".to_string()];
+        let clause = build_where_clause(&conditions);
+        assert!(clause.starts_with(" WHERE"));
+    }
+}

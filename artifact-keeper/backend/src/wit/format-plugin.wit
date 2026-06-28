@@ -1,0 +1,131 @@
+package artifact-keeper:format@1.0.0;
+
+/// Format handler interface for WASM plugins.
+///
+/// Plugins implement this interface to provide custom artifact format handling.
+/// The host (Artifact Keeper) calls these functions when processing artifacts.
+interface handler {
+    /// Artifact metadata returned by parse-metadata.
+    record metadata {
+        /// The artifact path within the repository.
+        path: string,
+        /// Extracted version (if applicable to the format).
+        version: option<string>,
+        /// MIME content type for the artifact.
+        content-type: string,
+        /// Size of the artifact in bytes.
+        size-bytes: u64,
+        /// SHA-256 checksum (host may calculate if not provided).
+        checksum-sha256: option<string>,
+    }
+
+    /// Validation error details.
+    record validation-error {
+        /// Human-readable error message.
+        message: string,
+        /// Field or path component that caused the error (if applicable).
+        field: option<string>,
+    }
+
+    /// Returns the format key this handler supports.
+    /// Must match the format.key in plugin.toml.
+    format-key: func() -> string;
+
+    /// Parse metadata from artifact content.
+    /// Called when an artifact is uploaded to extract format-specific metadata.
+    ///
+    /// # Arguments
+    /// * `path` - The artifact path within the repository
+    /// * `data` - The artifact content bytes
+    ///
+    /// # Returns
+    /// * `Ok(metadata)` - Successfully parsed metadata
+    /// * `Err(message)` - Parse failed with error description
+    parse-metadata: func(path: string, data: list<u8>) -> result<metadata, string>;
+
+    /// Validate artifact before storage.
+    /// Called to verify the artifact is valid for this format.
+    ///
+    /// # Arguments
+    /// * `path` - The artifact path within the repository
+    /// * `data` - The artifact content bytes
+    ///
+    /// # Returns
+    /// * `Ok(())` - Artifact is valid
+    /// * `Err(message)` - Artifact is invalid with error description
+    validate: func(path: string, data: list<u8>) -> result<_, string>;
+
+    /// Generate index files for repository.
+    /// Called to generate format-specific index/metadata files (e.g., maven-metadata.xml).
+    ///
+    /// # Arguments
+    /// * `artifacts` - List of artifact metadata in the repository
+    ///
+    /// # Returns
+    /// * `Ok(Some(files))` - List of (path, content) tuples for index files
+    /// * `Ok(None)` - No index files needed for this format
+    /// * `Err(message)` - Index generation failed
+    generate-index: func(artifacts: list<metadata>) -> result<option<list<tuple<string, list<u8>>>>, string>;
+}
+
+/// World definition for format handler plugins.
+/// Plugins must export the handler interface.
+world format-plugin {
+    /// Export the format handler interface.
+    export handler;
+}
+
+/// HTTP request/response interface for native protocol serving.
+///
+/// Plugins that implement this interface can serve native client protocols
+/// (e.g., PEP 503 for pip, repodata for dnf) directly from WASM.
+interface request-handler {
+    use handler.{metadata};
+
+    /// Incoming HTTP request from a native client.
+    record http-request {
+        /// HTTP method (GET, POST, PUT, DELETE, HEAD)
+        method: string,
+        /// Request path relative to the plugin mount point
+        path: string,
+        /// Query string (without leading "?"), empty if none
+        query: string,
+        /// Request headers as key-value pairs
+        headers: list<tuple<string, string>>,
+        /// Request body bytes (empty for GET/HEAD)
+        body: list<u8>,
+    }
+
+    /// Repository context so the plugin can generate correct URLs.
+    record repo-context {
+        /// Repository key (e.g., "my-rpm-repo")
+        repo-key: string,
+        /// Base URL for this plugin's mount point
+        base-url: string,
+        /// Base URL for downloading artifacts from storage
+        download-base-url: string,
+    }
+
+    /// HTTP response returned by the plugin.
+    record http-response {
+        /// HTTP status code
+        status: u16,
+        /// Response headers
+        headers: list<tuple<string, string>>,
+        /// Response body bytes
+        body: list<u8>,
+    }
+
+    /// Handle an HTTP request for this format's native protocol.
+    handle-request: func(
+        request: http-request,
+        context: repo-context,
+        artifacts: list<metadata>,
+    ) -> result<http-response, string>;
+}
+
+/// Extended world for plugins that serve native client protocols.
+world format-plugin-v2 {
+    export handler;
+    export request-handler;
+}

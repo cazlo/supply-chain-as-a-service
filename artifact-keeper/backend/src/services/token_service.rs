@@ -1,0 +1,1153 @@
+//! API Token Service.
+//!
+//! Provides token management functionality including creation, validation,
+//! revocation, and listing of API tokens. This service can be used independently
+//! or in conjunction with AuthService for comprehensive authentication needs.
+
+use std::sync::Arc;
+
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::config::Config;
+use crate::error::{AppError, Result};
+use crate::models::api_token::{ApiToken, ApiTokenCreated};
+use crate::services::auth_service::AuthService;
+
+/// Token validation result
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenValidation {
+    /// Whether the token is valid
+    pub is_valid: bool,
+    /// The user ID associated with the token
+    pub user_id: Option<Uuid>,
+    /// Token scopes
+    pub scopes: Vec<String>,
+    /// Time until expiration (None if no expiration)
+    pub expires_in: Option<i64>,
+    /// Error message if invalid
+    pub error: Option<String>,
+}
+
+/// Request for creating a new API token
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateTokenRequest {
+    /// Display name for the token
+    pub name: String,
+    /// Scopes/permissions for the token
+    pub scopes: Vec<String>,
+    /// Days until expiration (None for no expiration)
+    pub expires_in_days: Option<i64>,
+}
+
+/// Token information (without the actual token value)
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenInfo {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub name: String,
+    pub token_prefix: String,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub is_expired: bool,
+    pub is_revoked: bool,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_ip: Option<String>,
+    pub last_used_user_agent: Option<String>,
+}
+
+impl From<ApiToken> for TokenInfo {
+    fn from(token: ApiToken) -> Self {
+        let is_expired = is_token_expired(token.expires_at);
+        let is_revoked = is_token_revoked(token.revoked_at);
+
+        Self {
+            id: token.id,
+            user_id: token.user_id,
+            name: token.name,
+            token_prefix: token.token_prefix,
+            scopes: token.scopes,
+            expires_at: token.expires_at,
+            last_used_at: token.last_used_at,
+            created_at: token.created_at,
+            is_expired,
+            is_revoked,
+            revoked_at: token.revoked_at,
+            last_used_ip: token.last_used_ip,
+            last_used_user_agent: token.last_used_user_agent,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helper functions (no DB, testable in isolation)
+// ---------------------------------------------------------------------------
+
+/// The canonical list of allowed API token scopes.
+pub(crate) const ALLOWED_SCOPES: &[&str] = &[
+    "read:artifacts",
+    "write:artifacts",
+    "delete:artifacts",
+    "read:repositories",
+    "write:repositories",
+    "delete:repositories",
+    "read:users",
+    "write:users",
+    "admin",
+    "*",
+];
+
+/// Validate token scopes against the allowed scope list.
+/// Returns Ok(()) if all scopes are valid, Err(message) otherwise.
+pub(crate) fn validate_scopes_pure(scopes: &[String]) -> std::result::Result<(), String> {
+    for scope in scopes {
+        if !ALLOWED_SCOPES.contains(&scope.as_str()) {
+            return Err(format!(
+                "Invalid scope: '{}'. Allowed scopes: {:?}",
+                scope, ALLOWED_SCOPES
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Scopes that grant elevated, admin-class capabilities and may not be
+/// embedded in a token issued by a non-admin caller. The restriction is
+/// purely on token issuance — a non-admin can still hold such a token if
+/// an admin minted it for them.
+///
+/// Includes:
+///   * `admin`, `*` — short-circuit any scope check via
+///     [`scopes_grant_access`]. A non-admin minting one of these would
+///     have a token that satisfies every scope-only authorization gate
+///     (anywhere the request is API-token-authenticated and the
+///     authorization decision rests solely on the token's scope set).
+///   * `delete:artifacts`, `delete:repositories` — destructive
+///     scope-gated operations.
+///   * `write:users` — user-management write capability.
+///
+/// `write:artifacts` and `write:repositories` are deliberately NOT on
+/// this list: artifact publishing is a routine non-admin action and
+/// repository creation is sometimes delegated to non-admin users via
+/// permission grants. If your deployment wants to lock those down,
+/// add them in a follow-up alongside a configurable policy knob.
+pub(crate) const ADMIN_ONLY_SCOPES: &[&str] = &[
+    "admin",
+    "*",
+    "delete:artifacts",
+    "delete:repositories",
+    "write:users",
+];
+
+/// Enforce that a non-admin caller may not grant any admin-class scope
+/// from [`ADMIN_ONLY_SCOPES`] to a token.
+///
+/// Returns `Ok(())` when the caller is admin, or when none of the
+/// requested scopes are admin-class. Otherwise returns `Err` naming the
+/// first admin-class scope encountered so the caller can produce an
+/// actionable error message.
+pub(crate) fn enforce_admin_only_scopes(
+    scopes: &[String],
+    caller_is_admin: bool,
+) -> std::result::Result<(), String> {
+    if caller_is_admin {
+        return Ok(());
+    }
+    for scope in scopes {
+        if ADMIN_ONLY_SCOPES.contains(&scope.as_str()) {
+            return Err(format!(
+                "Scope '{}' is admin-only and cannot be granted by a non-admin caller. \
+                 Admin-only scopes: {:?}",
+                scope, ADMIN_ONLY_SCOPES,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Determine if a token is expired given an optional expiration timestamp.
+pub(crate) fn is_token_expired(expires_at: Option<DateTime<Utc>>) -> bool {
+    expires_at.map(|exp| exp < Utc::now()).unwrap_or(false)
+}
+
+/// Determine if a token has been revoked.
+pub(crate) fn is_token_revoked(revoked_at: Option<DateTime<Utc>>) -> bool {
+    revoked_at.is_some()
+}
+
+/// Check if a set of scopes grants access for a required scope.
+/// Scopes match if the exact scope is present, or `*` or `admin` is present.
+pub(crate) fn scopes_grant_access(scopes: &[String], required_scope: &str) -> bool {
+    scopes.contains(&required_scope.to_string())
+        || scopes.contains(&"*".to_string())
+        || scopes.contains(&"admin".to_string())
+}
+
+/// API Token Service for managing programmatic access tokens.
+///
+/// This service provides a higher-level API for token management,
+/// delegating core operations to AuthService while adding additional
+/// functionality like listing, filtering, and bulk operations.
+pub struct TokenService {
+    db: PgPool,
+    config: Arc<Config>,
+}
+
+impl TokenService {
+    /// Create a new token service instance.
+    pub fn new(db: PgPool, config: Arc<Config>) -> Self {
+        Self { db, config }
+    }
+
+    /// Create a new API token for a user.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user to create the token for
+    /// * `request` - Token creation parameters
+    ///
+    /// # Returns
+    /// * `Ok(ApiTokenCreated)` - The created token with the actual token value
+    /// * `Err(AppError)` - If creation fails
+    ///
+    /// Note: The actual token value is only returned once at creation time
+    /// and cannot be retrieved later.
+    pub async fn create_token(
+        &self,
+        user_id: Uuid,
+        request: CreateTokenRequest,
+    ) -> Result<ApiTokenCreated> {
+        // Validate scopes
+        self.validate_scopes(&request.scopes)?;
+
+        // Validate expiration
+        if let Some(days) = request.expires_in_days {
+            if !(1..=365).contains(&days) {
+                return Err(AppError::Validation(
+                    "Token expiration must be between 1 and 365 days".to_string(),
+                ));
+            }
+        }
+
+        // Delegate to AuthService for actual token generation
+        let auth_service = AuthService::new(self.db.clone(), self.config.clone());
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                &request.name,
+                request.scopes.clone(),
+                request.expires_in_days,
+            )
+            .await?;
+
+        let expires_at = request
+            .expires_in_days
+            .map(|days| Utc::now() + Duration::days(days));
+
+        Ok(ApiTokenCreated {
+            id: token_id,
+            user_id,
+            name: request.name,
+            token,
+            token_prefix: token_id.to_string()[..8].to_string(),
+            scopes: request.scopes,
+            expires_at,
+            created_at: Utc::now(),
+            description: None,
+            repository_ids: vec![],
+        })
+    }
+
+    /// Validate token scopes against allowed scopes.
+    fn validate_scopes(&self, scopes: &[String]) -> Result<()> {
+        validate_scopes_pure(scopes).map_err(AppError::Validation)
+    }
+
+    /// List all tokens for a user.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user to list tokens for
+    ///
+    /// # Returns
+    /// * `Ok(Vec<TokenInfo>)` - List of token information (without actual token values)
+    pub async fn list_tokens(&self, user_id: Uuid) -> Result<Vec<TokenInfo>> {
+        let tokens = sqlx::query_as::<_, ApiToken>(
+            r#"
+            SELECT id, user_id, name, token_hash, token_prefix, scopes,
+                   expires_at, last_used_at, created_at,
+                   created_by_user_id, description, repo_selector,
+                   revoked_at, last_used_ip, last_used_user_agent
+            FROM api_tokens
+            WHERE user_id = $1 AND revoked_at IS NULL
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(tokens.into_iter().map(TokenInfo::from).collect())
+    }
+
+    /// Get a specific token by ID.
+    ///
+    /// # Arguments
+    /// * `token_id` - The token ID
+    /// * `user_id` - The user ID (for authorization)
+    ///
+    /// # Returns
+    /// * `Ok(TokenInfo)` - Token information
+    /// * `Err(AppError::NotFound)` - If token doesn't exist or belongs to another user
+    pub async fn get_token(&self, token_id: Uuid, user_id: Uuid) -> Result<TokenInfo> {
+        let token = sqlx::query_as::<_, ApiToken>(
+            r#"
+            SELECT id, user_id, name, token_hash, token_prefix, scopes,
+                   expires_at, last_used_at, created_at,
+                   created_by_user_id, description, repo_selector,
+                   revoked_at, last_used_ip, last_used_user_agent
+            FROM api_tokens
+            WHERE id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(token_id)
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("API token not found".to_string()))?;
+
+        Ok(TokenInfo::from(token))
+    }
+
+    /// Revoke (delete) an API token.
+    ///
+    /// # Arguments
+    /// * `token_id` - The token ID to revoke
+    /// * `user_id` - The user ID (for authorization)
+    ///
+    /// # Returns
+    /// * `Ok(())` - Token successfully revoked
+    /// * `Err(AppError::NotFound)` - If token doesn't exist or belongs to another user
+    pub async fn revoke_token(&self, token_id: Uuid, user_id: Uuid) -> Result<()> {
+        let auth_service = AuthService::new(self.db.clone(), self.config.clone());
+        auth_service.revoke_api_token(token_id, user_id).await
+    }
+
+    /// Revoke all tokens for a user.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user to revoke all tokens for
+    ///
+    /// # Returns
+    /// * `Ok(u64)` - Number of tokens revoked
+    pub async fn revoke_all_tokens(&self, user_id: Uuid) -> Result<u64> {
+        // Fetch active token IDs before revoking so we can invalidate the
+        // in-memory cache for each one.
+        let token_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM api_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let result = sqlx::query(
+            "UPDATE api_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        for id in &token_ids {
+            crate::services::auth_service::mark_api_token_revoked(*id);
+        }
+
+        Ok(result.rows_affected())
+    }
+
+    /// Validate a token and return its details.
+    ///
+    /// This is useful for checking if a token is valid without performing
+    /// full authentication.
+    ///
+    /// # Arguments
+    /// * `token` - The full token string
+    ///
+    /// # Returns
+    /// * `TokenValidation` - Validation result with details
+    pub async fn validate_token(&self, token: &str) -> TokenValidation {
+        let auth_service = AuthService::new(self.db.clone(), self.config.clone());
+
+        match auth_service.validate_api_token(token).await {
+            Ok(validation) => {
+                // Get token details
+                if token.len() >= 8 {
+                    let prefix = &token[..8];
+                    if let Ok(Some(token_info)) = sqlx::query!(
+                        "SELECT scopes, expires_at FROM api_tokens WHERE token_prefix = $1",
+                        prefix
+                    )
+                    .fetch_optional(&self.db)
+                    .await
+                    {
+                        let expires_in = token_info
+                            .expires_at
+                            .map(|exp| (exp - Utc::now()).num_seconds())
+                            .filter(|&s| s > 0);
+
+                        return TokenValidation {
+                            is_valid: true,
+                            user_id: Some(validation.user.id),
+                            scopes: token_info.scopes,
+                            expires_in,
+                            error: None,
+                        };
+                    }
+                }
+
+                TokenValidation {
+                    is_valid: true,
+                    user_id: Some(validation.user.id),
+                    scopes: vec![],
+                    expires_in: None,
+                    error: None,
+                }
+            }
+            Err(e) => TokenValidation {
+                is_valid: false,
+                user_id: None,
+                scopes: vec![],
+                expires_in: None,
+                error: Some(e.to_string()),
+            },
+        }
+    }
+
+    /// Check if a token has a specific scope.
+    ///
+    /// # Arguments
+    /// * `token` - The full token string
+    /// * `required_scope` - The scope to check for
+    ///
+    /// # Returns
+    /// * `Ok(bool)` - Whether the token has the scope
+    pub async fn has_scope(&self, token: &str, required_scope: &str) -> Result<bool> {
+        if token.len() < 8 {
+            return Err(AppError::Authentication("Invalid token format".to_string()));
+        }
+
+        let prefix = &token[..8];
+        let token_info = sqlx::query!(
+            "SELECT scopes FROM api_tokens WHERE token_prefix = $1",
+            prefix
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::Authentication("Invalid token".to_string()))?;
+
+        // Check if token has the required scope or wildcard
+        Ok(scopes_grant_access(&token_info.scopes, required_scope))
+    }
+
+    /// Clean up expired tokens.
+    ///
+    /// This should be run periodically to remove expired tokens from the database.
+    ///
+    /// # Returns
+    /// * `Ok(u64)` - Number of expired tokens deleted
+    pub async fn cleanup_expired_tokens(&self) -> Result<u64> {
+        let result = sqlx::query!(
+            "DELETE FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at < NOW()"
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Get token usage statistics for a user.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user to get statistics for
+    ///
+    /// # Returns
+    /// * `Ok(TokenStats)` - Token statistics
+    pub async fn get_token_stats(&self, user_id: Uuid) -> Result<TokenStats> {
+        let stats = sqlx::query!(
+            r#"
+            SELECT
+                COUNT(*)::bigint as "total!: i64",
+                (COUNT(*) FILTER (WHERE expires_at IS NOT NULL AND expires_at < NOW()))::bigint as "expired!: i64",
+                (COUNT(*) FILTER (WHERE last_used_at > NOW() - INTERVAL '24 hours'))::bigint as "used_last_24h!: i64",
+                (COUNT(*) FILTER (WHERE last_used_at IS NULL))::bigint as "never_used!: i64"
+            FROM api_tokens
+            WHERE user_id = $1
+            "#,
+            user_id
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(TokenStats {
+            total: stats.total,
+            expired: stats.expired,
+            used_last_24h: stats.used_last_24h,
+            never_used: stats.never_used,
+        })
+    }
+}
+
+/// Token usage statistics
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenStats {
+    /// Total number of tokens
+    pub total: i64,
+    /// Number of expired tokens
+    pub expired: i64,
+    /// Number of tokens used in the last 24 hours
+    pub used_last_24h: i64,
+    /// Number of tokens never used
+    pub never_used: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn validate_expiration_days(days: Option<i64>) -> std::result::Result<(), String> {
+        if let Some(d) = days {
+            if !(1..=365).contains(&d) {
+                return Err("Token expiration must be between 1 and 365 days".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn compute_expiry(days: Option<i64>) -> Option<DateTime<Utc>> {
+        days.map(|d| Utc::now() + Duration::days(d))
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    fn make_api_token(
+        expires_at: Option<DateTime<Utc>>,
+        last_used_at: Option<DateTime<Utc>>,
+        scopes: Vec<String>,
+    ) -> ApiToken {
+        ApiToken {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            name: "test-token".to_string(),
+            token_hash: "hash".to_string(),
+            token_prefix: "abc12345".to_string(),
+            scopes,
+            expires_at,
+            last_used_at,
+            created_at: Utc::now(),
+            created_by_user_id: None,
+            description: None,
+            repo_selector: None,
+            revoked_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenInfo::from (existing tests + new ones)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_info_from_api_token() {
+        let token = ApiToken {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            name: "test-token".to_string(),
+            token_hash: "hash".to_string(),
+            token_prefix: "abc12345".to_string(),
+            scopes: vec!["read:artifacts".to_string()],
+            expires_at: Some(Utc::now() + Duration::days(30)),
+            last_used_at: None,
+            created_at: Utc::now(),
+            created_by_user_id: None,
+            description: None,
+            repo_selector: None,
+            revoked_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
+        };
+
+        let info = TokenInfo::from(token.clone());
+        assert_eq!(info.id, token.id);
+        assert_eq!(info.name, token.name);
+        assert!(!info.is_expired);
+    }
+
+    #[test]
+    fn test_expired_token_info() {
+        let token = ApiToken {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            name: "expired-token".to_string(),
+            token_hash: "hash".to_string(),
+            token_prefix: "abc12345".to_string(),
+            scopes: vec!["read:artifacts".to_string()],
+            expires_at: Some(Utc::now() - Duration::days(1)),
+            last_used_at: None,
+            created_at: Utc::now() - Duration::days(30),
+            created_by_user_id: None,
+            description: None,
+            repo_selector: None,
+            revoked_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
+        };
+
+        let info = TokenInfo::from(token);
+        assert!(info.is_expired);
+    }
+
+    #[test]
+    fn test_token_info_no_expiration_is_not_expired() {
+        let token = make_api_token(None, None, vec!["*".to_string()]);
+        let info = TokenInfo::from(token);
+        assert!(!info.is_expired);
+        assert!(info.expires_at.is_none());
+    }
+
+    #[test]
+    fn test_token_info_preserves_all_fields() {
+        let user_id = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let now = Utc::now();
+        let last_used = now - Duration::hours(2);
+
+        let token = ApiToken {
+            id: token_id,
+            user_id,
+            name: "my-ci-token".to_string(),
+            token_hash: "sha256hash".to_string(),
+            token_prefix: "xy789012".to_string(),
+            scopes: vec!["read:artifacts".to_string(), "write:artifacts".to_string()],
+            expires_at: Some(now + Duration::days(90)),
+            last_used_at: Some(last_used),
+            created_at: now - Duration::days(10),
+            created_by_user_id: None,
+            description: None,
+            repo_selector: None,
+            revoked_at: None,
+            last_used_ip: Some("192.168.1.1".to_string()),
+            last_used_user_agent: Some("curl/7.88".to_string()),
+        };
+
+        let info = TokenInfo::from(token);
+        assert_eq!(info.id, token_id);
+        assert_eq!(info.user_id, user_id);
+        assert_eq!(info.name, "my-ci-token");
+        assert_eq!(info.token_prefix, "xy789012");
+        assert_eq!(info.scopes.len(), 2);
+        assert!(info.expires_at.is_some());
+        assert!(info.last_used_at.is_some());
+        assert!(!info.is_expired);
+        assert!(!info.is_revoked);
+        assert_eq!(info.last_used_ip.as_deref(), Some("192.168.1.1"));
+        assert_eq!(info.last_used_user_agent.as_deref(), Some("curl/7.88"));
+    }
+
+    #[test]
+    fn test_token_info_just_expired() {
+        // Token expired 1 second ago
+        let token = make_api_token(
+            Some(Utc::now() - Duration::seconds(1)),
+            None,
+            vec!["read:artifacts".to_string()],
+        );
+        let info = TokenInfo::from(token);
+        assert!(info.is_expired);
+    }
+
+    #[test]
+    fn test_token_info_empty_scopes() {
+        let token = make_api_token(None, None, vec![]);
+        let info = TokenInfo::from(token);
+        assert!(info.scopes.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_scopes_pure (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_scopes_all_valid() {
+        let scopes = vec![
+            "read:artifacts".to_string(),
+            "write:artifacts".to_string(),
+            "admin".to_string(),
+        ];
+        assert!(validate_scopes_pure(&scopes).is_ok());
+    }
+
+    #[test]
+    fn test_validate_scopes_wildcard() {
+        let scopes = vec!["*".to_string()];
+        assert!(validate_scopes_pure(&scopes).is_ok());
+    }
+
+    #[test]
+    fn test_validate_scopes_invalid_scope() {
+        let scopes = vec!["read:artifacts".to_string(), "hack:system".to_string()];
+        let result = validate_scopes_pure(&scopes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("hack:system"));
+    }
+
+    #[test]
+    fn test_validate_scopes_empty() {
+        let scopes: Vec<String> = vec![];
+        assert!(validate_scopes_pure(&scopes).is_ok());
+    }
+
+    #[test]
+    fn test_validate_scopes_all_allowed_scopes() {
+        let all: Vec<String> = ALLOWED_SCOPES.iter().map(|s| s.to_string()).collect();
+        assert!(validate_scopes_pure(&all).is_ok());
+    }
+
+    #[test]
+    fn test_validate_scopes_case_sensitive() {
+        let scopes = vec!["Admin".to_string()];
+        assert!(validate_scopes_pure(&scopes).is_err());
+    }
+
+    #[test]
+    fn test_validate_scopes_partial_match_fails() {
+        let scopes = vec!["read:artifact".to_string()]; // missing 's'
+        assert!(validate_scopes_pure(&scopes).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_admin_only_scopes (privilege-escalation gate on token issuance)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_enforce_admin_only_scopes_admin_caller_always_allowed() {
+        // An admin may grant any scope. Sanity-check across the full
+        // ADMIN_ONLY_SCOPES list plus an arbitrary non-listed scope.
+        for s in ADMIN_ONLY_SCOPES {
+            let scopes = vec![(*s).to_string()];
+            assert!(
+                enforce_admin_only_scopes(&scopes, true).is_ok(),
+                "admin must be allowed to grant {}",
+                s
+            );
+        }
+        let mixed = vec!["read:artifacts".to_string(), "admin".to_string()];
+        assert!(enforce_admin_only_scopes(&mixed, true).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_non_admin_blocked_on_each_admin_scope() {
+        // Each ADMIN_ONLY_SCOPES entry, taken alone, must be refused.
+        // Asserting each in turn pins the policy so a future change that
+        // accidentally drops one (e.g. removes `delete:repositories`)
+        // forces an explicit decision via this test.
+        for s in ADMIN_ONLY_SCOPES {
+            let scopes = vec![(*s).to_string()];
+            let res = enforce_admin_only_scopes(&scopes, false);
+            assert!(res.is_err(), "non-admin granting {} must be refused", s);
+            assert!(
+                res.as_ref().unwrap_err().contains(s),
+                "error must name the offending scope ({})",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_non_admin_with_safe_scopes_allowed() {
+        // Routine non-admin scopes pass.
+        let scopes = vec![
+            "read:artifacts".to_string(),
+            "write:artifacts".to_string(),
+            "read:repositories".to_string(),
+            "write:repositories".to_string(),
+            "read:users".to_string(),
+        ];
+        assert!(enforce_admin_only_scopes(&scopes, false).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_non_admin_with_admin_scope_mixed_in_blocked() {
+        // A single admin-only entry anywhere in the list MUST trip the
+        // refusal; a non-admin can't smuggle `admin` past us by burying
+        // it among safe scopes.
+        let scopes = vec![
+            "read:artifacts".to_string(),
+            "write:artifacts".to_string(),
+            "admin".to_string(), // ← the smuggled one
+        ];
+        let res = enforce_admin_only_scopes(&scopes, false);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("admin"));
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_non_admin_empty_scopes_allowed() {
+        let scopes: Vec<String> = vec![];
+        assert!(enforce_admin_only_scopes(&scopes, false).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_admin_only_scopes_wildcard_blocked_for_non_admin() {
+        // `*` short-circuits `scopes_grant_access` to true on every
+        // required-scope check, so it MUST be admin-only.
+        let scopes = vec!["*".to_string()];
+        let res = enforce_admin_only_scopes(&scopes, false);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains('*'));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_expiration_days (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_expiration_days_valid() {
+        assert!(validate_expiration_days(Some(1)).is_ok());
+        assert!(validate_expiration_days(Some(30)).is_ok());
+        assert!(validate_expiration_days(Some(365)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_expiration_days_invalid() {
+        assert!(validate_expiration_days(Some(0)).is_err());
+        assert!(validate_expiration_days(Some(-1)).is_err());
+        assert!(validate_expiration_days(Some(366)).is_err());
+        assert!(validate_expiration_days(Some(1000)).is_err());
+    }
+
+    #[test]
+    fn test_validate_expiration_days_none_is_valid() {
+        assert!(validate_expiration_days(None).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_token_expired (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_token_expired_future() {
+        assert!(!is_token_expired(Some(Utc::now() + Duration::days(30))));
+    }
+
+    #[test]
+    fn test_is_token_expired_past() {
+        assert!(is_token_expired(Some(Utc::now() - Duration::days(1))));
+    }
+
+    #[test]
+    fn test_is_token_expired_none() {
+        assert!(!is_token_expired(None));
+    }
+
+    #[test]
+    fn test_is_token_expired_just_expired() {
+        assert!(is_token_expired(Some(Utc::now() - Duration::seconds(1))));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_token_revoked (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_token_revoked_none() {
+        assert!(!is_token_revoked(None));
+    }
+
+    #[test]
+    fn test_is_token_revoked_some() {
+        assert!(is_token_revoked(Some(Utc::now())));
+    }
+
+    #[test]
+    fn test_is_token_revoked_past_timestamp() {
+        assert!(is_token_revoked(Some(Utc::now() - Duration::days(30))));
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenInfo revocation fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_info_revoked_token() {
+        let revoked_at = Some(Utc::now() - Duration::hours(1));
+        let mut token = make_api_token(None, None, vec!["read:artifacts".to_string()]);
+        token.revoked_at = revoked_at;
+
+        let info = TokenInfo::from(token);
+        assert!(info.is_revoked);
+        assert!(info.revoked_at.is_some());
+    }
+
+    #[test]
+    fn test_token_info_active_token_not_revoked() {
+        let token = make_api_token(None, None, vec!["read:artifacts".to_string()]);
+        let info = TokenInfo::from(token);
+        assert!(!info.is_revoked);
+        assert!(info.revoked_at.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // scopes_grant_access (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scopes_grant_access_exact_match() {
+        let scopes = vec!["read:artifacts".to_string()];
+        assert!(scopes_grant_access(&scopes, "read:artifacts"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_wildcard() {
+        let scopes = vec!["*".to_string()];
+        assert!(scopes_grant_access(&scopes, "read:artifacts"));
+        assert!(scopes_grant_access(&scopes, "write:repositories"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_admin() {
+        let scopes = vec!["admin".to_string()];
+        assert!(scopes_grant_access(&scopes, "delete:artifacts"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_no_match() {
+        let scopes = vec!["read:artifacts".to_string()];
+        assert!(!scopes_grant_access(&scopes, "write:artifacts"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_empty_scopes() {
+        let scopes: Vec<String> = vec![];
+        assert!(!scopes_grant_access(&scopes, "read:artifacts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_expiry (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_expiry_some() {
+        let expiry = compute_expiry(Some(30));
+        assert!(expiry.is_some());
+        let diff = expiry.unwrap() - Utc::now();
+        assert!(diff.num_days() >= 29 && diff.num_days() <= 30);
+    }
+
+    #[test]
+    fn test_compute_expiry_none() {
+        assert!(compute_expiry(None).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenStats structure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_stats_serialization() {
+        let stats = TokenStats {
+            total: 10,
+            expired: 2,
+            used_last_24h: 5,
+            never_used: 3,
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["total"], 10);
+        assert_eq!(json["expired"], 2);
+        assert_eq!(json["used_last_24h"], 5);
+        assert_eq!(json["never_used"], 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenValidation structure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_validation_serialization() {
+        let valid = TokenValidation {
+            is_valid: true,
+            user_id: Some(Uuid::new_v4()),
+            scopes: vec!["read:artifacts".to_string()],
+            expires_in: Some(3600),
+            error: None,
+        };
+        let json = serde_json::to_value(&valid).unwrap();
+        assert_eq!(json["is_valid"], true);
+        assert!(json["user_id"].is_string());
+        assert!(json["error"].is_null());
+
+        let invalid = TokenValidation {
+            is_valid: false,
+            user_id: None,
+            scopes: vec![],
+            expires_in: None,
+            error: Some("Token expired".to_string()),
+        };
+        let json = serde_json::to_value(&invalid).unwrap();
+        assert_eq!(json["is_valid"], false);
+        assert!(json["user_id"].is_null());
+        assert_eq!(json["error"], "Token expired");
+    }
+
+    // -----------------------------------------------------------------------
+    // Token-minting endpoint surface pin (issue #1315, epic #1617 -> #1615)
+    //
+    // WHY THIS CONSTANT PIN IS LOAD-BEARING
+    // -------------------------------------
+    // Every token-minting HTTP handler ultimately calls the single mint
+    // primitive `AuthService::generate_api_token`. Each such handler MUST,
+    // before minting, refuse admin-class scopes from a non-admin caller --
+    // either by funnelling the requested scopes through
+    // `enforce_admin_only_scopes` (self-or-admin endpoints), or by gating the
+    // whole handler behind `require_admin` (admin-only endpoints).
+    //
+    // PRs #1261 and #1306 patched the scope-content policy on each existing
+    // endpoint individually. The structural risk #1315 guards against is that
+    // a future, additional token-minting endpoint silently re-opens the
+    // privilege-escalation hole because the author forgot the reject rule.
+    //
+    // This test re-derives the set of production token-minting handlers
+    // straight from source (every `generate_api_token` call site in
+    // `api/handlers`, excluding `#[cfg(test)]` modules) and asserts it equals
+    // the reviewed `EXPECTED` set below. Adding a new token-minting endpoint
+    // fails this test until `EXPECTED` is updated -- forcing a deliberate,
+    // reviewed change. It also asserts each pinned handler still references its
+    // required reject rule, so the guard cannot be quietly removed.
+    //
+    // This runs in `cargo test --lib` (no database needed) and is the Rust-side
+    // companion to the CI grep gate at
+    // `scripts/ci/check-token-mint-surface.sh`.
+    // -----------------------------------------------------------------------
+
+    /// Strip `#[cfg(test)]` module bodies so only production source remains.
+    /// Mirrors the cfg(test)-skipping logic in the CI gate.
+    fn strip_test_modules(src: &str) -> String {
+        let mut out = String::new();
+        let mut in_test = false;
+        let mut test_depth: i32 = 0;
+        let mut depth: i32 = 0;
+        let mut pending_cfg_test = false;
+        for line in src.lines() {
+            let stripped = line.trim();
+            let braces =
+                |s: &str| -> i32 { s.matches('{').count() as i32 - s.matches('}').count() as i32 };
+            if !in_test {
+                if stripped.starts_with("#[cfg(test)]") {
+                    pending_cfg_test = true;
+                } else if pending_cfg_test && stripped.contains("mod ") {
+                    if line.contains('{') {
+                        in_test = true;
+                        test_depth = depth;
+                        depth += braces(line);
+                        pending_cfg_test = false;
+                        continue;
+                    }
+                } else if !stripped.is_empty()
+                    && !stripped.starts_with("//")
+                    && pending_cfg_test
+                    && !stripped.contains("mod ")
+                {
+                    pending_cfg_test = false;
+                }
+            }
+            if in_test {
+                depth += braces(line);
+                if depth <= test_depth {
+                    in_test = false;
+                }
+                continue;
+            }
+            depth += braces(line);
+            // Drop trailing line comments so a `// generate_api_token` note
+            // never counts as a mint site.
+            let code = line.split("//").next().unwrap_or("");
+            out.push_str(code);
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn token_mint_endpoint_surface_is_pinned() {
+        use std::collections::BTreeMap;
+
+        // The reviewed set: handler file -> required reject-rule marker.
+        //   enforce_admin_only_scopes => self-or-admin endpoint that screens
+        //                                requested scopes.
+        //   require_admin             => admin-only endpoint (mint unreachable
+        //                                by non-admins).
+        // To add a token-minting endpoint, add it here in the same PR that
+        // adds the route -- the deliberate review #1315 requires.
+        let expected: BTreeMap<&str, &str> = BTreeMap::from([
+            ("auth.rs", "enforce_admin_only_scopes"), // POST /api/v1/auth/tokens
+            ("profile.rs", "enforce_admin_only_scopes"), // POST /api/v1/profile/access-tokens
+            ("users.rs", "enforce_admin_only_scopes"), // POST /api/v1/users/:id/tokens
+            ("repo_tokens.rs", "enforce_admin_only_scopes"), // POST /api/v1/repositories/:key/tokens
+            ("service_accounts.rs", "require_admin"), // POST /api/v1/service-accounts/:id/tokens
+        ]);
+
+        let handlers_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/handlers");
+
+        // Derive production mint sites straight from source.
+        let mut found: BTreeMap<String, String> = BTreeMap::new();
+        for entry in std::fs::read_dir(&handlers_dir).expect("read handlers dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("file name")
+                .to_string();
+            let raw = std::fs::read_to_string(&path).expect("read handler");
+            let production = strip_test_modules(&raw);
+            if production.contains("generate_api_token") {
+                found.insert(name, raw);
+            }
+        }
+
+        let found_names: Vec<&str> = found.keys().map(String::as_str).collect();
+        let expected_names: Vec<&str> = expected.keys().copied().collect();
+        assert_eq!(
+            found_names, expected_names,
+            "token-minting endpoint surface drift (#1315): the set of handlers \
+             calling generate_api_token changed. If you added a new \
+             token-minting endpoint, add it to `expected` here AND to \
+             scripts/ci/check-token-mint-surface.sh, and ensure it enforces a \
+             reject rule. If you removed one, drop it from both."
+        );
+
+        // Each pinned handler must still carry its required reject rule.
+        for (name, raw) in &found {
+            let marker = expected[name.as_str()];
+            assert!(
+                raw.contains(marker),
+                "token-minting endpoint {name} is pinned to use `{marker}` but \
+                 that reject rule is absent -- the privilege-escalation guard \
+                 appears to have been removed or weakened (#1315)."
+            );
+        }
+    }
+}

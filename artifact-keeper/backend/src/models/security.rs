@@ -1,0 +1,484 @@
+//! Security scanning models: configs, results, findings, scores, and policies.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+/// Type of scan performed on an artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "VARCHAR", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ScanType {
+    Dependency,
+    Image,
+    License,
+    Malware,
+}
+
+/// Current status of a scan execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "VARCHAR", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ScanStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    /// Terminal status for "this scanner does not apply to the artifact's
+    /// format" (#1470). Distinct from `Failed`, which is reserved for a scanner
+    /// that started running and crashed / timed out / errored. A
+    /// `NotApplicable` scan is a benign terminal state: neither a
+    /// pass-with-findings nor a failure, and it must never be treated as an
+    /// error when statuses are interpreted (promotion gating, findings display,
+    /// "did the scan fail" predicates).
+    NotApplicable,
+}
+
+/// Severity of a finding. Ordered from most severe to least.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, sqlx::Type,
+)]
+#[sqlx(type_name = "VARCHAR", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Critical = 0,
+    High = 1,
+    Medium = 2,
+    Low = 3,
+    Info = 4,
+}
+
+impl Severity {
+    /// Penalty weight used in security score calculation.
+    pub fn penalty_weight(self) -> i32 {
+        match self {
+            Severity::Critical => 25,
+            Severity::High => 10,
+            Severity::Medium => 3,
+            Severity::Low => 1,
+            Severity::Info => 0,
+        }
+    }
+
+    /// Parse from string (case-insensitive).
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "critical" => Some(Severity::Critical),
+            "high" => Some(Severity::High),
+            "medium" | "moderate" => Some(Severity::Medium),
+            "low" => Some(Severity::Low),
+            "info" | "informational" | "none" => Some(Severity::Info),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this severity is at or above the given threshold.
+    pub fn meets_threshold(self, threshold: Severity) -> bool {
+        self <= threshold
+    }
+}
+
+/// Quarantine status for artifacts fetched via proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "VARCHAR", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum QuarantineStatus {
+    Unscanned,
+    Clean,
+    Flagged,
+}
+
+/// Security grade derived from numeric score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Grade {
+    A,
+    B,
+    C,
+    D,
+    F,
+}
+
+impl Grade {
+    pub fn from_score(score: i32) -> Self {
+        match score {
+            90.. => Grade::A,
+            75..=89 => Grade::B,
+            50..=74 => Grade::C,
+            25..=49 => Grade::D,
+            _ => Grade::F,
+        }
+    }
+
+    pub fn as_char(self) -> char {
+        match self {
+            Grade::A => 'A',
+            Grade::B => 'B',
+            Grade::C => 'C',
+            Grade::D => 'D',
+            Grade::F => 'F',
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Database row structs
+// ---------------------------------------------------------------------------
+
+/// Per-repository scan configuration.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ScanConfig {
+    pub id: Uuid,
+    pub repository_id: Uuid,
+    pub scan_enabled: bool,
+    pub scan_on_upload: bool,
+    pub scan_on_proxy: bool,
+    pub block_on_policy_violation: bool,
+    pub severity_threshold: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ScanConfig {
+    /// Parse the severity_threshold field into a Severity enum.
+    pub fn threshold(&self) -> Severity {
+        Severity::from_str_loose(&self.severity_threshold).unwrap_or(Severity::High)
+    }
+}
+
+/// A single scan execution record.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ScanResult {
+    pub id: Uuid,
+    pub artifact_id: Uuid,
+    pub repository_id: Uuid,
+    pub scan_type: String,
+    pub status: String,
+    pub findings_count: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub info_count: i32,
+    pub scanner_version: Option<String>,
+    pub error_message: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    /// True when this row was synthesized by `copy_scan_results` because
+    /// `find_reusable_scan` matched a prior scan with the same checksum.
+    /// No scanner was actually invoked; counts and findings were copied.
+    pub is_reused: bool,
+    /// When `is_reused` is true, the id of the source scan whose results
+    /// were copied. None for original (non-reused) scans.
+    pub source_scan_id: Option<Uuid>,
+}
+
+/// An individual vulnerability finding within a scan.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ScanFinding {
+    pub id: Uuid,
+    pub scan_result_id: Uuid,
+    pub artifact_id: Uuid,
+    pub severity: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub cve_id: Option<String>,
+    pub affected_component: Option<String>,
+    pub affected_version: Option<String>,
+    pub fixed_version: Option<String>,
+    pub source: Option<String>,
+    pub source_url: Option<String>,
+    pub is_acknowledged: bool,
+    pub acknowledged_by: Option<Uuid>,
+    pub acknowledged_reason: Option<String>,
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Materialized security score for a repository.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct RepoSecurityScore {
+    pub id: Uuid,
+    pub repository_id: Uuid,
+    pub score: i32,
+    pub grade: String,
+    pub total_findings: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub acknowledged_count: i32,
+    pub last_scan_at: Option<DateTime<Utc>>,
+    pub calculated_at: DateTime<Utc>,
+}
+
+/// A scan policy that can block downloads based on findings.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ScanPolicy {
+    pub id: Uuid,
+    pub name: String,
+    pub repository_id: Option<Uuid>,
+    pub max_severity: String,
+    pub block_unscanned: bool,
+    pub block_on_fail: bool,
+    pub is_enabled: bool,
+    pub min_staging_hours: Option<i32>,
+    pub max_artifact_age_days: Option<i32>,
+    pub require_signature: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
+// Non-persisted types used by the scanner service
+// ---------------------------------------------------------------------------
+
+/// A raw finding produced by a scanner before it is persisted.
+#[derive(Debug, Clone, Serialize)]
+pub struct RawFinding {
+    pub severity: Severity,
+    pub title: String,
+    pub description: Option<String>,
+    pub cve_id: Option<String>,
+    pub affected_component: Option<String>,
+    pub affected_version: Option<String>,
+    pub fixed_version: Option<String>,
+    pub source: Option<String>,
+    pub source_url: Option<String>,
+}
+
+/// A package observed by a scanner during inventory enumeration, regardless
+/// of whether it has any active CVEs. Persisted into `scan_packages` and
+/// consumed by SBOM generation so an artifact's component list reflects
+/// the full dependency tree, not just the CVE-bearing subset (#903).
+///
+/// `name` is the bare package identifier (e.g. `"body-parser"`); the
+/// scanner-internal context where it was discovered lives in `source_target`
+/// (e.g. `"package-lock.json"`, `"requirements.txt"`, `"Java"`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RawPackage {
+    pub name: String,
+    pub version: Option<String>,
+    pub purl: Option<String>,
+    pub license: Option<String>,
+    pub source_target: Option<String>,
+}
+
+/// Result of a policy evaluation for an artifact download.
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyResult {
+    pub allowed: bool,
+    pub violations: Vec<String>,
+}
+
+/// Summary statistics for the security dashboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardSummary {
+    pub repos_with_scanning: i64,
+    pub total_scans: i64,
+    pub total_findings: i64,
+    pub critical_findings: i64,
+    pub high_findings: i64,
+    pub policy_violations_blocked: i64,
+    pub repos_grade_a: i64,
+    pub repos_grade_f: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Severity
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // ScanStatus (#1470)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_status_not_applicable_serializes_snake_case() {
+        // The DB CHECK constraint (migration 124) and every status-string
+        // consumer use the literal `not_applicable`; the serde wire form must
+        // match so API responses round-trip cleanly.
+        let json = serde_json::to_string(&ScanStatus::NotApplicable).expect("serialize");
+        assert_eq!(json, "\"not_applicable\"");
+    }
+
+    #[test]
+    fn test_scan_status_not_applicable_round_trips() {
+        for status in [
+            ScanStatus::Pending,
+            ScanStatus::Running,
+            ScanStatus::Completed,
+            ScanStatus::Failed,
+            ScanStatus::NotApplicable,
+        ] {
+            let json = serde_json::to_string(&status).expect("serialize");
+            let back: ScanStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(status, back);
+        }
+    }
+
+    #[test]
+    fn test_scan_status_not_applicable_is_distinct_from_failed() {
+        assert_ne!(ScanStatus::NotApplicable, ScanStatus::Failed);
+        assert_ne!(ScanStatus::NotApplicable, ScanStatus::Completed);
+    }
+
+    #[test]
+    fn test_severity_penalty_weights() {
+        assert_eq!(Severity::Critical.penalty_weight(), 25);
+        assert_eq!(Severity::High.penalty_weight(), 10);
+        assert_eq!(Severity::Medium.penalty_weight(), 3);
+        assert_eq!(Severity::Low.penalty_weight(), 1);
+        assert_eq!(Severity::Info.penalty_weight(), 0);
+    }
+
+    #[test]
+    fn test_severity_from_str_loose_standard() {
+        assert_eq!(
+            Severity::from_str_loose("critical"),
+            Some(Severity::Critical)
+        );
+        assert_eq!(Severity::from_str_loose("high"), Some(Severity::High));
+        assert_eq!(Severity::from_str_loose("medium"), Some(Severity::Medium));
+        assert_eq!(Severity::from_str_loose("low"), Some(Severity::Low));
+        assert_eq!(Severity::from_str_loose("info"), Some(Severity::Info));
+    }
+
+    #[test]
+    fn test_severity_from_str_loose_aliases() {
+        assert_eq!(Severity::from_str_loose("moderate"), Some(Severity::Medium));
+        assert_eq!(
+            Severity::from_str_loose("informational"),
+            Some(Severity::Info)
+        );
+        assert_eq!(Severity::from_str_loose("none"), Some(Severity::Info));
+    }
+
+    #[test]
+    fn test_severity_from_str_loose_case_insensitive() {
+        assert_eq!(
+            Severity::from_str_loose("CRITICAL"),
+            Some(Severity::Critical)
+        );
+        assert_eq!(Severity::from_str_loose("High"), Some(Severity::High));
+        assert_eq!(Severity::from_str_loose("MEDIUM"), Some(Severity::Medium));
+    }
+
+    #[test]
+    fn test_severity_from_str_loose_unknown() {
+        assert_eq!(Severity::from_str_loose("unknown"), None);
+        assert_eq!(Severity::from_str_loose(""), None);
+        assert_eq!(Severity::from_str_loose("very-high"), None);
+    }
+
+    #[test]
+    fn test_severity_meets_threshold() {
+        // Critical meets all thresholds
+        assert!(Severity::Critical.meets_threshold(Severity::Critical));
+        assert!(Severity::Critical.meets_threshold(Severity::High));
+        assert!(Severity::Critical.meets_threshold(Severity::Info));
+
+        // High meets High and below but not Critical
+        assert!(!Severity::High.meets_threshold(Severity::Critical));
+        assert!(Severity::High.meets_threshold(Severity::High));
+        assert!(Severity::High.meets_threshold(Severity::Info));
+
+        // Info only meets Info
+        assert!(!Severity::Info.meets_threshold(Severity::Critical));
+        assert!(!Severity::Info.meets_threshold(Severity::Low));
+        assert!(Severity::Info.meets_threshold(Severity::Info));
+    }
+
+    #[test]
+    fn test_severity_ordering() {
+        // Critical < High < Medium < Low < Info (by discriminant values)
+        assert!(Severity::Critical < Severity::High);
+        assert!(Severity::High < Severity::Medium);
+        assert!(Severity::Medium < Severity::Low);
+        assert!(Severity::Low < Severity::Info);
+    }
+
+    // -----------------------------------------------------------------------
+    // Grade
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_grade_from_score_boundaries() {
+        assert_eq!(Grade::from_score(100), Grade::A);
+        assert_eq!(Grade::from_score(90), Grade::A);
+        assert_eq!(Grade::from_score(89), Grade::B);
+        assert_eq!(Grade::from_score(75), Grade::B);
+        assert_eq!(Grade::from_score(74), Grade::C);
+        assert_eq!(Grade::from_score(50), Grade::C);
+        assert_eq!(Grade::from_score(49), Grade::D);
+        assert_eq!(Grade::from_score(25), Grade::D);
+        assert_eq!(Grade::from_score(24), Grade::F);
+        assert_eq!(Grade::from_score(0), Grade::F);
+    }
+
+    #[test]
+    fn test_grade_from_score_negative() {
+        assert_eq!(Grade::from_score(-1), Grade::F);
+        assert_eq!(Grade::from_score(-100), Grade::F);
+    }
+
+    #[test]
+    fn test_grade_from_score_above_100() {
+        // Scores > 100 clamp to A via the unbounded 90.. range
+        assert_eq!(Grade::from_score(101), Grade::A);
+        assert_eq!(Grade::from_score(200), Grade::A);
+    }
+
+    #[test]
+    fn test_grade_as_char() {
+        assert_eq!(Grade::A.as_char(), 'A');
+        assert_eq!(Grade::B.as_char(), 'B');
+        assert_eq!(Grade::C.as_char(), 'C');
+        assert_eq!(Grade::D.as_char(), 'D');
+        assert_eq!(Grade::F.as_char(), 'F');
+    }
+
+    // -----------------------------------------------------------------------
+    // ScanConfig::threshold
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_config_threshold_known() {
+        let config = ScanConfig {
+            id: uuid::Uuid::new_v4(),
+            repository_id: uuid::Uuid::new_v4(),
+            scan_enabled: true,
+            scan_on_upload: true,
+            scan_on_proxy: false,
+            block_on_policy_violation: true,
+            severity_threshold: "critical".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert_eq!(config.threshold(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_scan_config_threshold_unknown_defaults_to_high() {
+        let config = ScanConfig {
+            id: uuid::Uuid::new_v4(),
+            repository_id: uuid::Uuid::new_v4(),
+            scan_enabled: true,
+            scan_on_upload: false,
+            scan_on_proxy: false,
+            block_on_policy_violation: false,
+            severity_threshold: "garbage".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert_eq!(config.threshold(), Severity::High);
+    }
+}

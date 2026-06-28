@@ -1,0 +1,210 @@
+# ---------- Base: Rust toolchain on UBI 9 ----------
+# syntax=docker/dockerfile:1
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
+RUN dnf install -y --nodocs \
+    gcc gcc-c++ make pkg-config perl-core \
+    openssl-devel zlib-devel xz-devel bzip2-devel \
+    unzip \
+    && dnf clean all && \
+    ARCH=$(uname -m) && \
+    case "$ARCH" in \
+      x86_64)  PROTOC_ARCH="linux-x86_64" ;; \
+      aarch64) PROTOC_ARCH="linux-aarch_64" ;; \
+      *)       echo "Unsupported architecture: $ARCH" && exit 1 ;; \
+    esac && \
+    curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PROTOC_ARCH}.zip" \
+      -o /tmp/protoc.zip && \
+    unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 && \
+    . "$HOME/.cargo/env" && \
+    cargo install cargo-chef --locked
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ---------- Stage 1: Plan dependencies ----------
+FROM rust-base AS planner
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY backend ./backend
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---------- Stage 2: Build dependencies (cached) ----------
+FROM rust-base AS deps
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+ENV SQLX_OFFLINE=true
+ARG CARGO_FEATURES=""
+RUN if [ -n "$CARGO_FEATURES" ]; then \
+      cargo chef cook --release --features "$CARGO_FEATURES" --recipe-path recipe.json; \
+    else \
+      cargo chef cook --release --recipe-path recipe.json; \
+    fi
+
+# ---------- Stage 3: Build binary ----------
+FROM rust-base AS builder
+WORKDIR /app
+COPY --from=deps /app/target target
+COPY --from=deps /root/.cargo/registry /root/.cargo/registry
+COPY Cargo.toml Cargo.lock ./
+COPY .sqlx ./.sqlx
+COPY backend ./backend
+ARG GIT_SHA=unknown
+ARG CARGO_FEATURES=""
+ARG APP_VERSION=""
+ENV SQLX_OFFLINE=true
+ENV GIT_SHA=${GIT_SHA}
+RUN if [ -n "${APP_VERSION}" ]; then \
+      CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
+      sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
+    fi && \
+    if [ -n "$CARGO_FEATURES" ]; then \
+      cargo build --release --features "$CARGO_FEATURES" --bin artifact-keeper; \
+    else \
+      cargo build --release --bin artifact-keeper; \
+    fi
+
+# ---------- Stage 4: Build minimal rootfs ----------
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
+
+# Install only essential runtime libraries into a clean rootfs.
+# --refresh forces fresh repo metadata and the follow-up upgrade pulls
+# z-stream errata (e.g. jq el9_7 security fixes) that the install step
+# alone may miss when the cache is stale. The reposdir override is
+# required on the upgrade step because once the installroot has a
+# populated /etc, dnf reads repos from inside it (which is empty)
+# instead of falling back to the host's /etc/yum.repos.d.
+RUN mkdir -p /mnt/rootfs && \
+    dnf install --installroot /mnt/rootfs --releasever 9 --refresh \
+        --setopt=reposdir=/etc/yum.repos.d/ \
+        --setopt install_weak_deps=0 --nodocs -y \
+        glibc-minimal-langpack \
+        ca-certificates \
+        openssl-libs \
+        zlib \
+        xz-libs \
+        bzip2-libs \
+        curl-minimal \
+        jq \
+        tar \
+        gzip \
+        zstd \
+    && dnf --installroot /mnt/rootfs --releasever 9 \
+        --setopt=reposdir=/etc/yum.repos.d/ upgrade -y \
+    && dnf --installroot /mnt/rootfs clean all \
+    && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
+
+# Create non-root user and required directories in the rootfs
+RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mnt/rootfs/etc/passwd && \
+    echo 'artifact:x:1001:' >> /mnt/rootfs/etc/group && \
+    mkdir -p /mnt/rootfs/app \
+             /mnt/rootfs/data/storage \
+             /mnt/rootfs/data/backups \
+             /mnt/rootfs/data/plugins \
+             /mnt/rootfs/scan-workspace \
+             /mnt/rootfs/shared \
+             /mnt/rootfs/home/artifact/.cache/grype \
+             /mnt/rootfs/home/artifact/.cache/trivy \
+             /mnt/rootfs/usr/local/bin && \
+    chown -R 1001:0 /mnt/rootfs/data /mnt/rootfs/scan-workspace \
+                     /mnt/rootfs/home/artifact /mnt/rootfs/app \
+                     /mnt/rootfs/shared
+
+# ---------- STIG hardening (applicable subset for ubi-micro) ----------
+# Derived from DISA STIG controls applied in registry.access.redhat.com/ubi9/ubi-stig
+
+# Crypto policy: FIPS-grade defaults for OpenSSL
+RUN if [ -f /mnt/rootfs/etc/pki/tls/openssl.cnf ]; then \
+      echo -e "\n[algorithm_sect]\ndefault_properties = fips=yes" >> /mnt/rootfs/etc/pki/tls/openssl.cnf; \
+    fi
+
+# Disable core dumps (xccdf_org.ssgproject.content_rule_disable_users_coredumps)
+RUN mkdir -p /mnt/rootfs/etc/security/limits.d && \
+    echo "* hard core 0" > /mnt/rootfs/etc/security/limits.d/50-coredump.conf
+
+# Max concurrent login sessions (xccdf_org.ssgproject.content_rule_accounts_max_concurrent_login_sessions)
+RUN echo "* hard maxlogins 10" > /mnt/rootfs/etc/security/limits.d/50-maxlogins.conf
+
+# Ensure no empty passwords (xccdf_org.ssgproject.content_rule_no_empty_passwords)
+RUN sed -i 's/\bnullok\b//g' /mnt/rootfs/etc/pam.d/* 2>/dev/null || true
+
+# Restrictive umask (xccdf_org.ssgproject.content_rule_accounts_umask_etc_login_defs)
+RUN if [ -f /mnt/rootfs/etc/login.defs ]; then \
+      sed -i 's/^UMASK.*/UMASK\t\t077/' /mnt/rootfs/etc/login.defs; \
+    fi
+
+# Clean machine-id (regenerated at runtime)
+RUN rm -f /mnt/rootfs/etc/machine-id && \
+    touch /mnt/rootfs/etc/machine-id && \
+    chmod 0444 /mnt/rootfs/etc/machine-id
+
+# Ensure GPG checking for packages (xccdf_org.ssgproject.content_rule_ensure_gpgcheck_local_packages)
+RUN if [ -f /mnt/rootfs/etc/dnf/dnf.conf ]; then \
+      sed -i 's/^localpkg_gpgcheck.*/localpkg_gpgcheck=1/' /mnt/rootfs/etc/dnf/dnf.conf || \
+      echo "localpkg_gpgcheck=1" >> /mnt/rootfs/etc/dnf/dnf.conf; \
+    fi
+
+# Remove any leftover cache/tmp artifacts
+RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
+
+# ---------- Stage 5: Copy scanner CLIs from official images ----------
+FROM ghcr.io/aquasecurity/trivy:0.71.0 AS trivy-bin
+FROM ghcr.io/anchore/grype:v0.114.0 AS grype-bin
+
+# ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
+# Populates the Grype DB at build time so the image works on egress-restricted
+# networks (e.g. ARC runner pods) without a first-scan network fetch from
+# grype.anchore.io. See artifact-keeper#1001.
+#
+# Uses the GHCR mirror (maintained by .github/workflows/mirror-images.yml) to
+# avoid Docker Hub anonymous-pull rate limits that intermittently break CI.
+FROM ghcr.io/artifact-keeper/ci-mirror/alpine:3.23 AS grype-db-seed
+RUN apk add --no-cache ca-certificates
+COPY --from=grype-bin /grype /usr/local/bin/grype
+ENV GRYPE_DB_CACHE_DIR=/grype-db
+RUN mkdir -p /grype-db && grype db update && grype db status
+
+# ---------- Stage 6: UBI 9 Micro runtime ----------
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
+
+# Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
+COPY --from=rootfs-builder /mnt/rootfs /
+
+# Copy scanner CLIs from official images
+COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/
+COPY --from=grype-bin /grype /usr/local/bin/
+
+# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch)
+COPY --from=grype-db-seed --chown=1001:0 /grype-db /home/artifact/.cache/grype
+
+# Copy application binary
+COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
+
+WORKDIR /app
+USER 1001
+
+# Grype defaults `db.auto-update=true` and `db.validate-age=true`. With those
+# defaults, Grype at scan time checks the pre-seeded DB's build timestamp; if
+# it is older than `db.max-allowed-built-age` (5 days), Grype refuses to use
+# it and tries to download a fresh copy from grype.anchore.io. In the
+# network-restricted environments PR #1002 (#1001) was meant to fix (ARC
+# runner pods, release-gate jobs), that fetch fails and Grype exits 1 with
+# no stderr (because the scanner invocation passes `-q`). We disable both
+# knobs so the seeded DB is honored for the full image lifetime; the DB is
+# refreshed by rebuilding the image, not at runtime. See artifact-keeper#1001
+# and PR #1002 (commit 23d9743) which added the seed stage.
+ENV RUST_LOG=info \
+    DATABASE_URL=set-database-url-at-runtime \
+    STORAGE_PATH=/data/storage \
+    BACKUP_PATH=/data/backups \
+    GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
+    GRYPE_DB_AUTO_UPDATE=false \
+    GRYPE_DB_VALIDATE_AGE=false \
+    GRYPE_CHECK_FOR_APP_UPDATE=false \
+    HOST=0.0.0.0 \
+    PORT=8080
+
+EXPOSE 8080 9090
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["curl", "-sf", "http://localhost:8080/health"]
+
+CMD ["artifact-keeper"]

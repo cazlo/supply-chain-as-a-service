@@ -1,0 +1,700 @@
+//! Webhook producer service.
+//!
+//! Subscribes to the EventBus and writes a row into `webhook_deliveries` for
+//! every webhook whose `events` array contains the mapped event type and whose
+//! `repository_id` matches (or is NULL, meaning "global"). The row is enqueued
+//! with `next_retry_at = NOW()`, `attempts = 0`, `success = false`. The retry
+//! scheduler in `crate::api::handlers::webhooks::process_webhook_retries`
+//! (driven from `scheduler_service`) picks rows up on its 30-second tick and
+//! performs the actual HTTP POST.
+//!
+//! This module is the missing producer in v1.1.9. Before it existed, the
+//! retry scheduler had nothing to retry: no code path inserted into
+//! `webhook_deliveries`. The result was that webhook delivery was dead code.
+//!
+//! Companion ticket E2 (HMAC signing) and E4 (richer payload schema) are
+//! independent and can land before or after this PR. This module emits a
+//! minimal v1 payload. HMAC signing happens at delivery time, not enqueue
+//! time, so it is the retry scheduler's responsibility, not this producer's.
+
+use std::sync::Arc;
+
+use sqlx::{PgPool, Row};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+
+use crate::services::event_bus::{DomainEvent, EventBus};
+
+/// Map an EventBus event type (e.g. "artifact.created", "repository.deleted")
+/// to the underscore-form string used in the `webhooks.events` text array
+/// (e.g. "artifact_uploaded", "repository_deleted").
+///
+/// The webhook system uses snake_case underscore identifiers to match
+/// `WebhookEvent::Display` in `crate::api::handlers::webhooks`. The EventBus
+/// uses dotted, lower-case identifiers. This function bridges the two.
+///
+/// Returns `None` for events that do not have a corresponding `WebhookEvent`
+/// variant. Such events are silently skipped (no rows are enqueued).
+pub fn map_event_type(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        // Artifact uploads: both ".created" (legacy) and ".uploaded" (new) emit
+        // the artifact_uploaded webhook. Same alias as email_dispatcher.
+        "artifact.created" | "artifact.uploaded" => Some("artifact_uploaded"),
+        "artifact.deleted" => Some("artifact_deleted"),
+        "repository.created" => Some("repository_created"),
+        "repository.deleted" => Some("repository_deleted"),
+        "user.created" => Some("user_created"),
+        "user.deleted" => Some("user_deleted"),
+        "build.started" => Some("build_started"),
+        "build.completed" => Some("build_completed"),
+        "build.failed" => Some("build_failed"),
+        _ => None,
+    }
+}
+
+/// Build the v1 JSON payload that gets stored in `webhook_deliveries.payload`.
+///
+/// The shape is intentionally minimal in v1.1.9. E4 will add
+/// `event_schema_version` and richer event-specific fields. Consumers that
+/// rely on these fields today should pin to a specific producer version.
+///
+/// v1 OMITS the `payload` key entirely (rather than serialising it as
+/// `null`) when no enriched payload is available yet, so receivers can
+/// distinguish "v1 producer with no enrichment" from "v2 producer that
+/// chose to emit a null payload". E4 will populate the key.
+pub fn build_event_payload(event: &DomainEvent, mapped_event: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "event".into(),
+        serde_json::Value::String(mapped_event.into()),
+    );
+    map.insert(
+        "entity_id".into(),
+        serde_json::Value::String(event.entity_id.clone()),
+    );
+    map.insert(
+        "actor".into(),
+        match &event.actor {
+            Some(a) => serde_json::Value::String(a.clone()),
+            None => serde_json::Value::Null,
+        },
+    );
+    map.insert(
+        "timestamp".into(),
+        serde_json::Value::String(event.timestamp.clone()),
+    );
+    // v1 omits `payload` when not yet enriched; v2 (E4) will populate it.
+    serde_json::Value::Object(map)
+}
+
+/// Row type for the webhook lookup query.
+#[derive(Debug)]
+struct MatchingWebhookRow {
+    id: uuid::Uuid,
+}
+
+/// SQL used to batch-insert webhook delivery rows.
+///
+/// Extracted into a constant so the unit test in this module can verify the
+/// UNNEST-over-uuid[] pattern stays intact, and so the integration test in
+/// issue #952 can re-execute the exact same string against a real Postgres.
+/// Keep the trailing newline and indentation: equality compared in tests.
+const BATCH_INSERT_DELIVERIES_SQL: &str = r#"
+        INSERT INTO webhook_deliveries
+            (webhook_id, event, payload, attempts, next_retry_at, success)
+        SELECT id, $2, $3, 0, NOW(), false
+        FROM UNNEST($1::uuid[]) AS t(id)
+        "#;
+
+/// Collect the uuids from a slice of matching webhook rows.
+///
+/// Pulled out so we can unit-test the trivial "owned `Vec<Uuid>` for SQLx
+/// bind" step without needing a Postgres pool. Order is preserved so the
+/// per-row metric loop counts the same number of rows that were bound.
+fn collect_webhook_ids(webhooks: &[MatchingWebhookRow]) -> Vec<uuid::Uuid> {
+    webhooks.iter().map(|w| w.id).collect()
+}
+
+/// Emit per-row enqueue metrics for a completed batch insert.
+///
+/// `success = true` records `record_webhook_delivery_enqueued` once per row
+/// in the batch; `success = false` records `record_webhook_delivery_enqueue_failed`
+/// with reason `"db_error"`. Splitting this out keeps `enqueue_for_event`
+/// readable and gives unit tests a deterministic surface to assert on (the
+/// metrics layer is an in-process counter, so it is safe to drive from tests).
+fn record_batch_enqueue_outcome(mapped_event: &str, batch_size: usize, success: bool) {
+    if success {
+        for _ in 0..batch_size {
+            crate::services::metrics_service::record_webhook_delivery_enqueued(mapped_event);
+        }
+    } else {
+        for _ in 0..batch_size {
+            crate::services::metrics_service::record_webhook_delivery_enqueue_failed(
+                mapped_event,
+                "db_error",
+            );
+        }
+    }
+}
+
+/// Start the webhook producer background task.
+///
+/// Spawns a tokio task that subscribes to the EventBus and, for each received
+/// event, looks up all enabled matching webhooks and enqueues a row into
+/// `webhook_deliveries`. The task runs until either the broadcast channel is
+/// closed (the EventBus was dropped) or `shutdown_token` is cancelled by the
+/// HTTP/gRPC server lifecycle.
+///
+/// # Delivery semantics: at-most-once with explicit lag drops
+///
+/// Tokio broadcast channels DO NOT duplicate events. On subscriber lag they
+/// surface `RecvError::Lagged(n)` which means the n oldest events were
+/// silently DROPPED from this subscriber's view. The producer logs lag at
+/// warn-level but cannot recover the dropped events: at-most-once is the
+/// best the in-process bus can offer. Customers requiring at-least-once for
+/// missed deliveries must fall back to the polling/manual-replay UI on
+/// `/api/v1/webhooks/{id}/deliveries` (or the GET-then-redeliver flow).
+/// This is acceptable for v1.1.9; v1.2.0 will introduce a durable event log
+/// if reviewers determine in-process broadcast is insufficient.
+pub fn start_webhook_producer(
+    event_bus: Arc<EventBus>,
+    db: PgPool,
+    shutdown_token: CancellationToken,
+) {
+    let mut rx = event_bus.subscribe();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => {
+                    tracing::info!(
+                        "Shutdown signalled, webhook producer draining and exiting"
+                    );
+                    break;
+                }
+                recv = rx.recv() => {
+                    match recv {
+                        Ok(event) => {
+                            if let Err(e) = enqueue_for_event(&db, &event).await {
+                                tracing::warn!(
+                                    event_type = %event.event_type,
+                                    entity_id = %event.entity_id,
+                                    error = %e,
+                                    "Failed to enqueue webhook deliveries for event"
+                                );
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                skipped = n,
+                                "Webhook producer lagged; events were dropped (at-most-once)"
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::info!(
+                                "EventBus closed, webhook producer shutting down"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Enqueue webhook_deliveries rows for a single domain event.
+///
+/// Looks up enabled webhooks whose `events` array contains the mapped event
+/// type and whose `repository_id` is either NULL (global) or matches the
+/// event's `repository_id` field. For each match, INSERTs a row into
+/// `webhook_deliveries` with `attempts = 0`, `next_retry_at = NOW()`,
+/// `success = false`. The retry scheduler picks these up on its tick.
+///
+/// # Repository scoping (#948)
+///
+/// Repo scoping uses the publisher-set `event.repository_id` field, not a
+/// parse of `entity_id`. For repo-scoped events (`repository.*`) the
+/// publisher calls `EventBus::emit_for_repo` which threads the repo UUID
+/// through. For non-repo events (`user.*`, `group.*`, etc.) the field is
+/// `None`, so only global webhooks (`repository_id IS NULL`) match. The
+/// pre-#948 implementation parsed `entity_id` as a UUID, which was a
+/// category error for non-repo events whose `entity_id` is the user/group
+/// UUID rather than the owning repo's UUID.
+///
+/// Uses `sqlx::query()` (not the macro) to avoid contention on the offline
+/// SQLx query cache while parallel webhook PRs are in flight (E1, E2, E4).
+async fn enqueue_for_event(db: &PgPool, event: &DomainEvent) -> std::result::Result<(), String> {
+    let mapped_event = match map_event_type(&event.event_type) {
+        Some(m) => m,
+        None => {
+            // No webhook subscribers for this event type. Silently skip.
+            return Ok(());
+        }
+    };
+
+    let repo_id: Option<uuid::Uuid> = event.repository_id;
+
+    let raw_rows = sqlx::query(
+        r#"
+        SELECT id
+        FROM webhooks
+        WHERE is_enabled = true
+          AND $1 = ANY(events)
+          AND (repository_id IS NULL OR repository_id = $2)
+        "#,
+    )
+    .bind(mapped_event)
+    .bind(repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("Failed to query webhooks: {}", e))?;
+
+    let webhooks: Vec<MatchingWebhookRow> = raw_rows
+        .into_iter()
+        .map(|row| MatchingWebhookRow { id: row.get("id") })
+        .collect();
+
+    if webhooks.is_empty() {
+        return Ok(());
+    }
+
+    let payload = build_event_payload(event, mapped_event);
+
+    // Batch insert (issue #949). The previous implementation issued one
+    // INSERT per matching webhook, which is N+1 for high-fanout events
+    // (e.g. a global webhook subscribed to every artifact upload). We now
+    // issue a single multi-row INSERT keyed by an UNNEST of the matching
+    // webhook ids. `event` and `payload` are scalar broadcasts: every row
+    // shares the same event/payload, so we bind them once and reference
+    // them by name in the SELECT.
+    //
+    // Per-row failure granularity is lost (a single failing webhook id
+    // fails the whole batch), but the only realistic failure here is a
+    // database/connection error that would fail every row anyway. We log
+    // and record metrics at the batch level instead.
+    let webhook_ids = collect_webhook_ids(&webhooks);
+    let batch_size = webhook_ids.len();
+
+    let result = sqlx::query(BATCH_INSERT_DELIVERIES_SQL)
+        .bind(&webhook_ids)
+        .bind(mapped_event)
+        .bind(&payload)
+        .execute(db)
+        .await;
+
+    match result {
+        Ok(_) => record_batch_enqueue_outcome(mapped_event, batch_size, true),
+        Err(e) => {
+            tracing::warn!(
+                event = mapped_event,
+                batch_size,
+                error = %e,
+                "Failed to batch insert webhook_deliveries rows"
+            );
+            record_batch_enqueue_outcome(mapped_event, batch_size, false);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_event(event_type: &str) -> DomainEvent {
+        DomainEvent {
+            event_type: event_type.to_string(),
+            entity_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            repository_id: None,
+            actor: Some("alice".into()),
+            timestamp: "2026-04-08T12:00:00Z".into(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // map_event_type: every WebhookEvent variant must map
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_artifact_uploaded() {
+        assert_eq!(
+            map_event_type("artifact.uploaded"),
+            Some("artifact_uploaded")
+        );
+    }
+
+    #[test]
+    fn test_map_artifact_created_aliases_uploaded() {
+        // The EventBus uses ".created"; the webhook system uses "uploaded".
+        // The same alias also lives in email_dispatcher::map_event_type.
+        assert_eq!(
+            map_event_type("artifact.created"),
+            Some("artifact_uploaded")
+        );
+    }
+
+    #[test]
+    fn test_map_artifact_deleted() {
+        assert_eq!(map_event_type("artifact.deleted"), Some("artifact_deleted"));
+    }
+
+    #[test]
+    fn test_map_repository_created() {
+        assert_eq!(
+            map_event_type("repository.created"),
+            Some("repository_created")
+        );
+    }
+
+    #[test]
+    fn test_map_repository_deleted() {
+        assert_eq!(
+            map_event_type("repository.deleted"),
+            Some("repository_deleted")
+        );
+    }
+
+    #[test]
+    fn test_map_user_created() {
+        assert_eq!(map_event_type("user.created"), Some("user_created"));
+    }
+
+    #[test]
+    fn test_map_user_deleted() {
+        assert_eq!(map_event_type("user.deleted"), Some("user_deleted"));
+    }
+
+    #[test]
+    fn test_map_build_started() {
+        assert_eq!(map_event_type("build.started"), Some("build_started"));
+    }
+
+    #[test]
+    fn test_map_build_completed() {
+        assert_eq!(map_event_type("build.completed"), Some("build_completed"));
+    }
+
+    #[test]
+    fn test_map_build_failed() {
+        assert_eq!(map_event_type("build.failed"), Some("build_failed"));
+    }
+
+    #[test]
+    fn test_map_unknown_returns_none() {
+        // Unmapped events are silently skipped, not panicked over.
+        assert_eq!(map_event_type("permission.created"), None);
+        assert_eq!(map_event_type("group.member_added"), None);
+        assert_eq!(map_event_type(""), None);
+        assert_eq!(map_event_type("totally.bogus"), None);
+    }
+
+    #[test]
+    fn test_map_covers_all_webhook_event_variants() {
+        // Compile-time fence: an exhaustive match over `WebhookEvent`
+        // produces the (event_bus_input, expected_output) pair for every
+        // variant. If a new variant is added to `WebhookEvent`, this match
+        // FAILS TO COMPILE until both the match arm here AND the runtime
+        // dispatch in `map_event_type` above are updated. That is the
+        // entire point: hand-maintained lists drift silently.
+        use crate::api::handlers::webhooks::WebhookEvent;
+
+        fn expected_pair(v: &WebhookEvent) -> (&'static str, &'static str) {
+            match v {
+                WebhookEvent::ArtifactUploaded => ("artifact.uploaded", "artifact_uploaded"),
+                WebhookEvent::ArtifactDeleted => ("artifact.deleted", "artifact_deleted"),
+                WebhookEvent::RepositoryCreated => ("repository.created", "repository_created"),
+                WebhookEvent::RepositoryDeleted => ("repository.deleted", "repository_deleted"),
+                WebhookEvent::UserCreated => ("user.created", "user_created"),
+                WebhookEvent::UserDeleted => ("user.deleted", "user_deleted"),
+                WebhookEvent::BuildStarted => ("build.started", "build_started"),
+                WebhookEvent::BuildCompleted => ("build.completed", "build_completed"),
+                WebhookEvent::BuildFailed => ("build.failed", "build_failed"),
+            }
+        }
+
+        // Hand-listed for the body of the test; the exhaustive match above
+        // is what the fence relies on. If you add a variant, the compiler
+        // forces you to extend `expected_pair`, and you should also extend
+        // this list so the runtime side actually exercises every variant.
+        let all_variants = [
+            WebhookEvent::ArtifactUploaded,
+            WebhookEvent::ArtifactDeleted,
+            WebhookEvent::RepositoryCreated,
+            WebhookEvent::RepositoryDeleted,
+            WebhookEvent::UserCreated,
+            WebhookEvent::UserDeleted,
+            WebhookEvent::BuildStarted,
+            WebhookEvent::BuildCompleted,
+            WebhookEvent::BuildFailed,
+        ];
+
+        for variant in &all_variants {
+            let (bus_input, expected) = expected_pair(variant);
+            assert_eq!(
+                map_event_type(bus_input),
+                Some(expected),
+                "variant {:?} maps {} -> {}",
+                variant,
+                bus_input,
+                expected
+            );
+            // Also assert the WebhookEvent::Display matches the mapped form
+            // so the wire identifier stays in lockstep with the Rust enum.
+            assert_eq!(variant.to_string(), expected);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_event_payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_event_payload_shape() {
+        let event = sample_event("artifact.created");
+        let payload = build_event_payload(&event, "artifact_uploaded");
+        let obj = payload.as_object().unwrap();
+
+        // v1 emits exactly four keys: event, entity_id, actor, timestamp.
+        // The `payload` key is OMITTED (not serialized as null) until E4
+        // wires up the per-event enrichment. Receivers see a missing key,
+        // not a null value, so they can tell v1 apart from a deliberate
+        // v2-null-payload.
+        assert_eq!(obj.len(), 4);
+        assert_eq!(payload["event"], "artifact_uploaded");
+        assert_eq!(payload["entity_id"], "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(payload["actor"], "alice");
+        assert_eq!(payload["timestamp"], "2026-04-08T12:00:00Z");
+        assert!(
+            obj.get("payload").is_none(),
+            "v1 must omit the payload key entirely, not emit null"
+        );
+    }
+
+    #[test]
+    fn test_build_event_payload_omits_payload_key_not_null() {
+        // Explicit fence: serialising-then-parsing must not introduce a
+        // payload key. If a future change writes `"payload": null` instead
+        // of omitting it, this test fails loudly.
+        let event = sample_event("artifact.created");
+        let payload = build_event_payload(&event, "artifact_uploaded");
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !serialized.contains("\"payload\""),
+            "serialized v1 payload must not contain a payload key, got: {}",
+            serialized
+        );
+    }
+
+    #[test]
+    fn test_build_event_payload_uses_mapped_event_name() {
+        // The payload's "event" field is the underscore (mapped) form, not
+        // the dotted EventBus form. Consumers see snake_case identifiers.
+        let event = sample_event("artifact.created");
+        let payload = build_event_payload(&event, "artifact_uploaded");
+        assert_eq!(payload["event"], "artifact_uploaded");
+        assert_ne!(payload["event"], "artifact.created");
+    }
+
+    #[test]
+    fn test_build_event_payload_no_actor() {
+        let event = DomainEvent {
+            event_type: "user.deleted".into(),
+            entity_id: "u-7".into(),
+            repository_id: None,
+            actor: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+        };
+        let payload = build_event_payload(&event, "user_deleted");
+        assert!(payload["actor"].is_null());
+    }
+
+    #[test]
+    fn test_build_event_payload_is_valid_json() {
+        let event = sample_event("artifact.deleted");
+        let payload = build_event_payload(&event, "artifact_deleted");
+        let serialized = serde_json::to_string(&payload).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, payload);
+    }
+
+    #[test]
+    fn test_build_event_payload_preserves_timestamp_format() {
+        // The timestamp is passed through verbatim. Consumers parse RFC 3339.
+        let event = DomainEvent {
+            event_type: "build.failed".into(),
+            entity_id: "build-99".into(),
+            repository_id: None,
+            actor: Some("ci".into()),
+            timestamp: "2026-04-27T16:30:00.123456789Z".into(),
+        };
+        let payload = build_event_payload(&event, "build_failed");
+        assert_eq!(payload["timestamp"], "2026-04-27T16:30:00.123456789Z");
+    }
+
+    // -----------------------------------------------------------------------
+    // Skipped event types: producer must not panic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unmapped_event_returns_none_safely() {
+        // A handful of permission/group events fire but have no webhook
+        // counterpart. Make sure the mapper is total over a representative
+        // sample we observe in production grep.
+        let unmapped = [
+            "permission.created",
+            "permission.updated",
+            "permission.deleted",
+            "group.created",
+            "group.updated",
+            "group.deleted",
+            "group.member_added",
+            "group.member_removed",
+            "service_account.created",
+            "service_account.deleted",
+            "quality_gate.created",
+            "quality_gate.updated",
+            "quality_gate.deleted",
+            "quarantine.added",
+            "scan.completed",
+            "scan.vulnerability_found",
+        ];
+        for ev in unmapped {
+            assert_eq!(map_event_type(ev), None, "{} should be unmapped", ev);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Batched INSERT contract (issue #949)
+    // -----------------------------------------------------------------------
+    //
+    // The full end-to-end producer loop (publish event, look up webhooks,
+    // assert webhook_deliveries rows) is covered by issue #952 once the
+    // embedded-Postgres harness lands. Until then we exercise the pieces
+    // that are pure functions and document the SQL shape the batched
+    // path depends on.
+
+    #[test]
+    fn test_batch_insert_sql_uses_unnest_over_uuid_array() {
+        // Fence: if anyone reverts the producer to a per-row INSERT loop,
+        // this canary spot-checks that the batch SQL still contains the
+        // UNNEST-over-uuid[] pattern. The integration test in #952 will
+        // exercise the actual SQL against a real Postgres.
+        assert!(
+            BATCH_INSERT_DELIVERIES_SQL.contains("UNNEST($1::uuid[])"),
+            "webhook producer must batch-insert via UNNEST to avoid N+1 (issue #949)"
+        );
+    }
+
+    #[test]
+    fn test_batch_insert_sql_targets_webhook_deliveries_table() {
+        // The producer inserts into `webhook_deliveries`, not a renamed
+        // table. If the schema is renamed, both the migration and this
+        // string must change together.
+        assert!(
+            BATCH_INSERT_DELIVERIES_SQL.contains("INTO webhook_deliveries"),
+            "batch SQL must target the webhook_deliveries table"
+        );
+    }
+
+    #[test]
+    fn test_batch_insert_sql_binds_event_and_payload_as_scalars() {
+        // $2 is the event type, $3 is the JSON payload. They are broadcast
+        // across every row produced by the UNNEST; the SELECT list must
+        // reference them positionally so SQLx's bind order matches.
+        let sql = BATCH_INSERT_DELIVERIES_SQL;
+        assert!(sql.contains("$1::uuid[]"));
+        assert!(sql.contains("$2"));
+        assert!(sql.contains("$3"));
+        // The SELECT list shape: id (from UNNEST), $2 (event), $3 (payload),
+        // then constants for attempts/next_retry_at/success.
+        assert!(sql.contains("SELECT id, $2, $3, 0, NOW(), false"));
+    }
+
+    #[test]
+    fn test_batch_insert_sql_writes_zero_attempts_and_unscheduled_retry() {
+        // New rows start at attempts=0 and next_retry_at=NOW() so the retry
+        // scheduler picks them up on the next 30s tick. success=false marks
+        // them as needing a delivery attempt.
+        let sql = BATCH_INSERT_DELIVERIES_SQL;
+        assert!(sql.contains(", 0, NOW(), false"));
+    }
+
+    #[test]
+    fn test_collect_webhook_ids_empty_slice() {
+        let ids = collect_webhook_ids(&[]);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_collect_webhook_ids_preserves_order() {
+        // The metric loop emits one event per row in the batch and relies on
+        // the count matching `webhook_ids.len()`. Verify the helper keeps
+        // every row and preserves order so the per-row count is exact.
+        let a = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let b = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let c = uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let rows = vec![
+            MatchingWebhookRow { id: a },
+            MatchingWebhookRow { id: b },
+            MatchingWebhookRow { id: c },
+        ];
+        let ids = collect_webhook_ids(&rows);
+        assert_eq!(ids, vec![a, b, c]);
+    }
+
+    #[test]
+    fn test_collect_webhook_ids_keeps_duplicates() {
+        // The lookup query does not DISTINCT, so if the schema ever allows
+        // duplicate ids the producer would bind them all. Make sure the
+        // helper does not silently de-dup either.
+        let a = uuid::Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+        let rows = vec![MatchingWebhookRow { id: a }, MatchingWebhookRow { id: a }];
+        let ids = collect_webhook_ids(&rows);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], a);
+        assert_eq!(ids[1], a);
+    }
+
+    #[test]
+    fn test_record_batch_enqueue_outcome_success_does_not_panic() {
+        // The metrics layer is an in-process counter; we cannot easily read
+        // it back from a unit test without a recorder fixture. The behaviour
+        // we are pinning here is that the helper accepts both success and
+        // failure branches and does not panic on zero-batch or large-batch
+        // sizes. Future work (issue #952) wires up a real recorder.
+        record_batch_enqueue_outcome("artifact_uploaded", 0, true);
+        record_batch_enqueue_outcome("artifact_uploaded", 1, true);
+        record_batch_enqueue_outcome("artifact_uploaded", 250, true);
+    }
+
+    #[test]
+    fn test_record_batch_enqueue_outcome_failure_does_not_panic() {
+        record_batch_enqueue_outcome("artifact_uploaded", 0, false);
+        record_batch_enqueue_outcome("artifact_uploaded", 1, false);
+        record_batch_enqueue_outcome("artifact_uploaded", 250, false);
+    }
+
+    #[test]
+    fn test_record_batch_enqueue_outcome_accepts_every_mapped_event() {
+        // The mapped event string is whatever `map_event_type` returns. Make
+        // sure the metric helper accepts every value the mapper can produce.
+        for ev in [
+            "artifact.uploaded",
+            "artifact.created",
+            "artifact.deleted",
+            "repository.created",
+            "repository.deleted",
+            "user.created",
+            "user.deleted",
+            "build.started",
+            "build.completed",
+            "build.failed",
+        ] {
+            let mapped = map_event_type(ev).expect("mapper must cover this event");
+            record_batch_enqueue_outcome(mapped, 1, true);
+            record_batch_enqueue_outcome(mapped, 1, false);
+        }
+    }
+}

@@ -1,0 +1,570 @@
+//! Webhook secret encryption helpers.
+//!
+//! Stores webhook signing secrets at rest using AES-256-GCM. The raw secret
+//! is shown to the operator exactly once at creation or rotation time;
+//! afterwards only the ciphertext (and a short non-reversible digest, used
+//! for UI identification) is persisted.
+//!
+//! The 32-byte symmetric key is sourced from the `AK_WEBHOOK_SECRET_KEY`
+//! environment variable, base64 encoded. The encryption format is
+//! nonce-prefixed AES-256-GCM, identical to the layout used by
+//! [`crate::services::encryption::CredentialEncryption`]. Existing secrets
+//! that pre-date this module are stored as bcrypt hashes; those are
+//! unrecoverable and must be rotated by the operator before the backend
+//! can sign deliveries against them.
+//!
+//! This module is deliberately scoped to webhook secrets so that the key
+//! can be rotated independently from the SSO credential key.
+
+use base64::{
+    engine::general_purpose::{
+        STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD, URL_SAFE as B64_URL,
+        URL_SAFE_NO_PAD as B64_URL_NO_PAD,
+    },
+    Engine as _,
+};
+use rand::RngCore;
+use thiserror::Error;
+
+use crate::services::encryption::{CredentialEncryption, EncryptionError};
+
+/// Environment variable that holds the base64-encoded 32-byte AES key.
+pub const ENV_KEY: &str = "AK_WEBHOOK_SECRET_KEY";
+
+/// Length, in bytes, of a freshly generated webhook secret (before the
+/// `whsec_` prefix is added). Chosen to give 192 bits of entropy after
+/// URL-safe base64 encoding without padding.
+const RAW_SECRET_BYTES: usize = 24;
+
+/// Prefix advertised to operators so that webhook secrets are visually
+/// distinct from API tokens and other credentials.
+pub const SECRET_PREFIX: &str = "whsec_";
+
+/// Errors raised by the webhook secret crypto helpers.
+#[derive(Debug, Error)]
+pub enum WebhookSecretError {
+    #[error("AK_WEBHOOK_SECRET_KEY is not configured")]
+    KeyMissing,
+
+    #[error("AK_WEBHOOK_SECRET_KEY is not valid base64: {0}")]
+    KeyNotBase64(String),
+
+    #[error("AK_WEBHOOK_SECRET_KEY must decode to exactly 32 bytes, got {0}")]
+    KeyWrongLength(usize),
+
+    #[error("webhook secret encryption failed: {0}")]
+    Crypto(#[from] EncryptionError),
+
+    #[error("decrypted webhook secret is not valid UTF-8")]
+    NotUtf8,
+}
+
+/// Result type for webhook crypto operations.
+pub type Result<T> = std::result::Result<T, WebhookSecretError>;
+
+/// Decode an `AK_WEBHOOK_SECRET_KEY` value, accepting any of the common
+/// base64 alphabets: standard, standard-no-pad, URL-safe (base64url), and
+/// URL-safe-no-pad. Operators frequently generate these keys with tools that
+/// emit base64url (e.g. `openssl rand -base64 32 | tr '+/' '-_'`, `head -c
+/// 32 /dev/urandom | base64 -w0` on systems whose `base64` defaults to URL
+/// alphabet, or Kubernetes secret tooling). Refusing such values broke
+/// release-gate deploys when the generated key happened to contain `-` or
+/// `_` (see #1350, #1367), so we try every alphabet before giving up.
+fn decode_key_material(input: &str) -> std::result::Result<Vec<u8>, String> {
+    // The order matters only for the error message we propagate when every
+    // attempt fails: we want the most informative one. Standard base64 is
+    // tried first because it is the documented format.
+    let mut last_err: Option<String> = None;
+    for engine in [
+        &B64 as &dyn _Decoder,
+        &B64_NO_PAD,
+        &B64_URL,
+        &B64_URL_NO_PAD,
+    ] {
+        match engine.decode(input) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "no base64 alphabet matched".to_string()))
+}
+
+/// Erased decoder trait so the four `general_purpose::*` constants (which
+/// have distinct concrete types) can live in the same array.
+trait _Decoder {
+    fn decode(&self, input: &str) -> std::result::Result<Vec<u8>, String>;
+}
+
+impl<E: base64::Engine> _Decoder for E {
+    fn decode(&self, input: &str) -> std::result::Result<Vec<u8>, String> {
+        base64::Engine::decode(self, input).map_err(|e| e.to_string())
+    }
+}
+
+/// Load the 32-byte key from the environment, decoding base64 or base64url.
+fn load_key() -> Result<[u8; 32]> {
+    let raw = std::env::var(ENV_KEY).map_err(|_| WebhookSecretError::KeyMissing)?;
+    let trimmed = raw.trim();
+    let bytes = decode_key_material(trimmed).map_err(WebhookSecretError::KeyNotBase64)?;
+    if bytes.len() != 32 {
+        return Err(WebhookSecretError::KeyWrongLength(bytes.len()));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+fn encryptor() -> Result<CredentialEncryption> {
+    let key = load_key()?;
+    Ok(CredentialEncryption::new(&key)?)
+}
+
+/// Validate that `AK_WEBHOOK_SECRET_KEY` is configured and well-formed.
+///
+/// Intended for use at process startup so the operator gets a fast, loud
+/// failure when the encryption key is missing, mistyped, or the wrong
+/// length, instead of discovering it only when the first webhook create
+/// or rotate-secret request fails with HTTP 500. The decoded key is
+/// discarded immediately after validation.
+pub fn ensure_configured() -> Result<()> {
+    load_key().map(|_| ())
+}
+
+/// Generate a fresh webhook secret string of the form `whsec_<base64url>`.
+///
+/// Uses the OS CSPRNG. The unprefixed body has at least 192 bits of entropy.
+pub fn generate_secret() -> String {
+    let mut buf = [0u8; RAW_SECRET_BYTES];
+    rand::rng().fill_bytes(&mut buf);
+    let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
+    format!("{}{}", SECRET_PREFIX, body)
+}
+
+/// Encrypt a secret for at-rest storage.
+///
+/// Returns nonce-prefixed AES-256-GCM ciphertext. Callers should persist
+/// this directly into the `secret_encrypted` `bytea` column.
+pub fn encrypt_secret(plaintext: &str) -> Result<Vec<u8>> {
+    let enc = encryptor()?;
+    Ok(enc.encrypt(plaintext.as_bytes()))
+}
+
+/// Decrypt a previously stored webhook secret.
+pub fn decrypt_secret(ciphertext: &[u8]) -> Result<String> {
+    let enc = encryptor()?;
+    let plaintext = enc.decrypt(ciphertext)?;
+    String::from_utf8(plaintext).map_err(|_| WebhookSecretError::NotUtf8)
+}
+
+/// Compute a stable, non-reversible identifier suitable for surfacing in
+/// list/get responses so operators can distinguish secrets without exposing
+/// them. Format: `<prefix>...<last4>` where the prefix is the literal
+/// `whsec_` (or whatever prefix the secret already carries) and the last
+/// four *characters* of the secret body are the only material revealed.
+///
+/// For secrets shorter than 8 characters the digest is the full secret;
+/// such inputs only occur in tests. Operates over `char` boundaries (not
+/// raw byte indices) so a caller-supplied secret that contains multibyte
+/// UTF-8 cannot panic this function.
+pub fn digest_for_display(secret: &str) -> String {
+    let char_count = secret.chars().count();
+    if char_count < 8 {
+        return secret.to_string();
+    }
+    // Take the last 4 characters by iterating from the end, then reversing,
+    // so we never index into the middle of a multibyte UTF-8 sequence.
+    let last4: String = {
+        let mut tail: Vec<char> = secret.chars().rev().take(4).collect();
+        tail.reverse();
+        tail.into_iter().collect()
+    };
+    if let Some(rest) = secret.strip_prefix(SECRET_PREFIX) {
+        if rest.chars().count() <= 4 {
+            return secret.to_string();
+        }
+        return format!("{}...{}", SECRET_PREFIX, last4);
+    }
+    let head: String = secret.chars().take(4).collect();
+    format!("{}...{}", head, last4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes env mutation across the tests in this module so that
+    /// they do not race each other (Rust runs unit tests on a thread pool
+    /// by default and `std::env::set_var` is process-global).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn set_test_key() {
+        // 32 bytes of zeros, base64-encoded.
+        let key = B64.encode([0u8; 32]);
+        // SAFETY: ENV_LOCK serializes env access for tests in this module.
+        unsafe {
+            std::env::set_var(ENV_KEY, key);
+        }
+    }
+
+    fn set_alt_key() {
+        let mut k = [0u8; 32];
+        k[0] = 1;
+        let encoded = B64.encode(k);
+        unsafe {
+            std::env::set_var(ENV_KEY, encoded);
+        }
+    }
+
+    #[test]
+    fn test_generate_secret_has_prefix_and_entropy() {
+        let s1 = generate_secret();
+        let s2 = generate_secret();
+        assert!(s1.starts_with(SECRET_PREFIX));
+        assert!(s2.starts_with(SECRET_PREFIX));
+        assert_ne!(s1, s2);
+        // base64url of 24 bytes (no padding) is 32 chars.
+        assert_eq!(s1.len(), SECRET_PREFIX.len() + 32);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_test_key();
+        let plaintext = "whsec_super_secret_value";
+        let ct = encrypt_secret(plaintext).expect("encrypt");
+        let pt = decrypt_secret(&ct).expect("decrypt");
+        assert_eq!(pt, plaintext);
+    }
+
+    #[test]
+    fn test_nonce_uniqueness() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_test_key();
+        let plaintext = "same plaintext";
+        let a = encrypt_secret(plaintext).expect("encrypt a");
+        let b = encrypt_secret(plaintext).expect("encrypt b");
+        assert_ne!(a, b, "ciphertexts must differ due to random nonce");
+        // First 12 bytes are the nonce; they should differ.
+        assert_ne!(&a[..12], &b[..12]);
+    }
+
+    #[test]
+    fn test_nonce_uniqueness_at_scale() {
+        // Birthday-bound check: 1000 encryptions of the same plaintext
+        // must produce 1000 distinct nonces. AES-GCM is catastrophic on
+        // nonce reuse, so the bar is no collisions, ever.
+        let _g = ENV_LOCK.lock().unwrap();
+        set_test_key();
+        let plaintext = "same plaintext";
+        let mut nonces: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let ct = encrypt_secret(plaintext).expect("encrypt");
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&ct[..12]);
+            nonces.insert(nonce);
+        }
+        assert_eq!(
+            nonces.len(),
+            1000,
+            "expected 1000 unique nonces from 1000 encryptions, got {}",
+            nonces.len()
+        );
+    }
+
+    #[test]
+    fn test_wrong_key_rejected() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // Encrypt with key A.
+        set_test_key();
+        let ct = encrypt_secret("whsec_value").expect("encrypt");
+        // Switch to key B and try to decrypt.
+        set_alt_key();
+        let res = decrypt_secret(&ct);
+        assert!(matches!(res, Err(WebhookSecretError::Crypto(_))));
+    }
+
+    #[test]
+    fn test_bad_ciphertext_rejected() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_test_key();
+        let mut ct = encrypt_secret("whsec_value").expect("encrypt");
+        // Flip a byte in the AEAD tag region.
+        let last = ct.len() - 1;
+        ct[last] ^= 0xff;
+        let res = decrypt_secret(&ct);
+        assert!(matches!(res, Err(WebhookSecretError::Crypto(_))));
+    }
+
+    #[test]
+    fn test_truncated_ciphertext_rejected() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_test_key();
+        let res = decrypt_secret(&[0u8; 8]);
+        assert!(matches!(res, Err(WebhookSecretError::Crypto(_))));
+    }
+
+    #[test]
+    fn test_missing_key_yields_key_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_KEY);
+        }
+        let res = encrypt_secret("x");
+        assert!(matches!(res, Err(WebhookSecretError::KeyMissing)));
+    }
+
+    #[test]
+    fn test_invalid_base64_key() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_KEY, "@@@not-base64@@@");
+        }
+        let res = encrypt_secret("x");
+        assert!(matches!(res, Err(WebhookSecretError::KeyNotBase64(_))));
+    }
+
+    #[test]
+    fn test_wrong_length_key() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_KEY, B64.encode([0u8; 16]));
+        }
+        let res = encrypt_secret("x");
+        assert!(matches!(res, Err(WebhookSecretError::KeyWrongLength(16))));
+    }
+
+    #[test]
+    fn test_digest_format() {
+        let secret = "whsec_abcdef0123456789";
+        let digest = digest_for_display(secret);
+        assert_eq!(digest, "whsec_...6789");
+    }
+
+    #[test]
+    fn test_digest_short_secret_returns_self() {
+        assert_eq!(digest_for_display("abc"), "abc");
+    }
+
+    #[test]
+    fn test_digest_non_prefixed_secret() {
+        let digest = digest_for_display("hello-world-1234");
+        assert_eq!(digest, "hell...1234");
+    }
+
+    #[test]
+    fn test_digest_does_not_panic_on_multibyte_utf8() {
+        // Regression: `&secret[secret.len() - 4..]` panics if the byte at
+        // that offset is mid-multibyte. Operate on chars and the function
+        // is total over any &str input.
+        let secret = "whsec_naïveöü";
+        let digest = digest_for_display(secret);
+        // Just make sure it does not panic and returns a non-empty result;
+        // the exact suffix is implementation-defined for non-ASCII tails.
+        assert!(!digest.is_empty());
+    }
+
+    #[test]
+    fn test_digest_handles_emoji_tail() {
+        // A pathological caller-supplied secret with a 4-byte char tail.
+        let secret = "whsec_abcdefghi😀";
+        let digest = digest_for_display(secret);
+        assert!(digest.starts_with(SECRET_PREFIX));
+    }
+
+    #[test]
+    fn test_ensure_configured_ok() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_test_key();
+        assert!(ensure_configured().is_ok());
+    }
+
+    #[test]
+    fn test_ensure_configured_missing_key() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_KEY);
+        }
+        assert!(matches!(
+            ensure_configured(),
+            Err(WebhookSecretError::KeyMissing)
+        ));
+    }
+
+    #[test]
+    fn test_url_safe_base64_key_accepted() {
+        // Regression for #1367: backend refused to start when
+        // AK_WEBHOOK_SECRET_KEY was base64url-encoded (contains `-` or `_`).
+        // A 32-byte key whose URL-safe encoding contains `_`:
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut bytes = [0u8; 32];
+        // Pick bytes whose standard-base64 form contains `/` and `+`, so
+        // the URL-safe form contains `_` and `-`. Byte values 0xFB and 0xFE
+        // map to alphabet chars `+` and `/`. Cycling 0xFB/0xFE produces an
+        // encoding rich in both `+/`, ensuring the URL-safe variant differs.
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0xFB } else { 0xFE };
+        }
+        let url_safe = base64::engine::general_purpose::URL_SAFE.encode(bytes);
+        assert!(
+            url_safe.contains('_') || url_safe.contains('-'),
+            "test fixture should exercise base64url alphabet, got {}",
+            url_safe
+        );
+        unsafe {
+            std::env::set_var(ENV_KEY, &url_safe);
+        }
+        assert!(
+            ensure_configured().is_ok(),
+            "base64url-encoded key must be accepted; got error for input {}",
+            url_safe
+        );
+    }
+
+    #[test]
+    fn test_url_safe_no_pad_base64_key_accepted() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0xFB } else { 0xFE };
+        }
+        let url_safe_no_pad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        unsafe {
+            std::env::set_var(ENV_KEY, &url_safe_no_pad);
+        }
+        assert!(ensure_configured().is_ok());
+    }
+
+    #[test]
+    fn test_garbage_key_still_rejected_as_invalid_base64() {
+        // A key with characters that are neither in the standard nor the
+        // URL-safe alphabet must still be rejected with KeyNotBase64 so
+        // the operator gets a clear diagnostic.
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_KEY, "!!! definitely not base64 !!!");
+        }
+        let res = ensure_configured();
+        assert!(matches!(res, Err(WebhookSecretError::KeyNotBase64(_))));
+    }
+
+    #[test]
+    fn test_ensure_configured_wrong_length() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_KEY, B64.encode([0u8; 16]));
+        }
+        assert!(matches!(
+            ensure_configured(),
+            Err(WebhookSecretError::KeyWrongLength(16))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_key_material: pure decoder used by load_key. Direct tests so
+    // we can pin every alphabet without paying the env-mutation cost the
+    // ensure_configured tests serialize on.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_key_material_standard_base64_padded() {
+        // Standard alphabet, padded — the documented format.
+        let raw = [0xAAu8; 32];
+        let encoded = B64.encode(raw);
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_standard_base64_unpadded() {
+        // The padding-tolerant engine must accept a payload whose length
+        // is a multiple of 4 but with the `=` characters stripped.
+        let raw = [0xCCu8; 32];
+        let encoded = B64.encode(raw).trim_end_matches('=').to_string();
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_url_safe_padded() {
+        // URL-safe alphabet (`-`/`_`) must round-trip even when the input
+        // could not have come out of the standard engine.
+        let raw: [u8; 32] = std::array::from_fn(|i| if i % 2 == 0 { 0xFB } else { 0xFE });
+        let encoded = base64::engine::general_purpose::URL_SAFE.encode(raw);
+        assert!(encoded.contains('_') || encoded.contains('-'));
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_url_safe_unpadded() {
+        let raw: [u8; 32] = std::array::from_fn(|i| if i % 2 == 0 { 0xFB } else { 0xFE });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        assert!(!encoded.ends_with('='));
+        assert_eq!(decode_key_material(&encoded).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn test_decode_key_material_rejects_garbage() {
+        // Characters outside both alphabets must surface as an error.
+        let result = decode_key_material("!!! not base64 at all !!!");
+        assert!(result.is_err());
+        // And the error string is non-empty so operators see why.
+        assert!(!result.unwrap_err().is_empty());
+    }
+
+    #[test]
+    fn test_decode_key_material_empty_input_decodes_to_empty() {
+        // Empty input is a degenerate-but-valid base64 string. The decoder
+        // must succeed (returning empty bytes) so the caller's length check
+        // is what surfaces the diagnostic, not a generic base64 error.
+        assert_eq!(decode_key_material("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_decode_key_material_passes_shortest_informative_error() {
+        // When every alphabet fails, the last attempt's error message is
+        // propagated. We can't pin a specific message (engine-internal),
+        // but the result must be Err with a non-empty string so callers
+        // can render it.
+        let err = decode_key_material("@@@@@@").unwrap_err();
+        assert!(!err.is_empty(), "error message must not be empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // digest_for_display: pure helper. Extra edge cases on top of the
+    // existing prefix/short-secret tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_digest_for_display_no_prefix_uses_first4_dots_last4() {
+        // A secret without the standard `whsec_` prefix falls back to the
+        // generic `<first4>...<last4>` formatting.
+        let secret = "ABCD12345678WXYZ";
+        let digest = digest_for_display(secret);
+        assert!(digest.starts_with("ABCD"));
+        assert!(digest.ends_with("WXYZ"));
+        assert!(digest.contains("..."));
+        assert!(!digest.starts_with(SECRET_PREFIX));
+    }
+
+    #[test]
+    fn test_digest_for_display_prefix_with_short_body_returns_full_secret() {
+        // `whsec_` + a body shorter than 4 chars must surface verbatim so
+        // operators don't get a misleading `whsec_...xxx` rendering for a
+        // secret whose last4 *is* the entire body.
+        // 8+ chars total so the early "short secret" branch doesn't trip.
+        let secret = "whsec_xy"; // 8 chars total, 2-char body
+        let digest = digest_for_display(secret);
+        assert_eq!(digest, secret);
+    }
+
+    #[test]
+    fn test_digest_for_display_redaction_excludes_middle_bytes() {
+        // Anti-leak property: a `whsec_<body>` digest exposes only the
+        // first 6 characters (the prefix) and the last 4 of the body. The
+        // middle bytes must not appear in the rendered string.
+        let secret = "whsec_MIDDLE_SHOULD_NEVER_LEAKtail";
+        let digest = digest_for_display(secret);
+        assert!(digest.starts_with("whsec_"));
+        assert!(digest.ends_with("tail"));
+        assert!(!digest.contains("MIDDLE_SHOULD_NEVER_LEAK"));
+    }
+}

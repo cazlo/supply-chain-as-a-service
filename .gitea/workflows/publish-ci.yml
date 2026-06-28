@@ -121,6 +121,26 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
 
+      # Smoke passed: promote the exact signed digest into artifact-keeper-staging
+      # (cosign copy carries the signature; the digest is preserved). Tagged with
+      # the full build tag for traceability and the reconstructable source key
+      # (ci/source-key.sh) that the merge-to-main release lane re-finds it by.
+      - name: Promote the backend to staging
+        if: needs.gate.outputs.publish == 'true'
+        run: |
+          set -a
+          . /tmp/artifact-keeper-backend-record/images.env
+          set +a
+          staging_repo="${HARBOR_REGISTRY}/artifact-keeper-staging/artifact-keeper-backend"
+          ci/promote-image.sh \
+            "${BACKEND_IMAGE}@${BACKEND_DIGEST}" \
+            "${staging_repo}" \
+            "${BACKEND_TAG}" "$(ci/source-key.sh backend)"
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
   web-build:
     needs: gate
     runs-on: artifact-keeper-builder
@@ -173,3 +193,21 @@ jobs:
           path: /tmp/artifact-keeper-web-record/
           if-no-files-found: error
           retention-days: 14
+
+      # The web image has no client smoke; signing is its gate. Promote the signed
+      # digest into artifact-keeper-staging (see the backend step for the model).
+      - name: Promote the web image to staging
+        if: needs.gate.outputs.publish == 'true'
+        run: |
+          set -a
+          . /tmp/artifact-keeper-web-record/images.env
+          set +a
+          staging_repo="${HARBOR_REGISTRY}/artifact-keeper-staging/artifact-keeper-web"
+          ci/promote-image.sh \
+            "${WEB_IMAGE}@${WEB_DIGEST}" \
+            "${staging_repo}" \
+            "${WEB_TAG}" "$(ci/source-key.sh web)"
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}

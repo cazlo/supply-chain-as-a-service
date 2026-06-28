@@ -1,7 +1,10 @@
-.PHONY: source-check source-check-backend source-check-chart source-check-web vendor-check vendor-status vendor-update
+.PHONY: source-check source-check-backend source-check-chart source-check-web source-smoke vendor-check vendor-status vendor-update
 
 source-check:
 	ci/check-clean-snapshots.sh all
+
+source-smoke:
+	ci/smoke-test.sh
 
 source-check-backend:
 	ci/check-clean-snapshots.sh backend

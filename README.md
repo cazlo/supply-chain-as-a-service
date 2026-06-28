@@ -31,4 +31,6 @@ and non-squashed subtree synchronization commands.
 Common vendoring commands are `make vendor-check`, `make vendor-status`, and
 `make vendor-update NAME=<name> REF=<reviewed-ref> TAG=<tag-or-dash>`.
 Run `make source-check` to rebuild the pinned backend and web builder stages and
-lint/render the vendored chart without modifying the imported trees.
+lint/render the vendored chart without modifying the imported trees. Run
+`make source-smoke` for the heavier gate that builds the backend image and runs
+the vendored pypi, npm, and cargo smoke clients against it via Docker Compose.

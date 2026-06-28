@@ -26,15 +26,28 @@ The pinned snapshots passed the following unmodified-source gates on 2026-06-27:
   `artifact-keeper-web:source-check-3cfc8dd`, including its production Next.js
   compile, TypeScript check, and static-page generation;
 - Helm strict lint plus an offline Kubernetes client render using the chart's
-  lean CI values.
+  lean CI values;
+- the backend image built and serving the vendored `pypi`, `npm`, and `cargo`
+  Docker Compose smoke clients, all passing against a freshly bootstrapped
+  registry.
 
-Run all three gates, or one named gate, with:
+Run all three fast gates, or one named gate, with:
 
 ```sh
 make source-check
 make source-check-backend
 make source-check-web
 make source-check-chart
+```
+
+The heavier smoke gate builds the backend image and runs the vendored native
+clients end to end via `artifact-keeper/docker-compose.test.yml` (its `smoke`
+profile). The wrapper drives that compose project directly because the upstream
+`run-e2e-tests.sh` smoke path also expects a Playwright service that the compose
+file does not define.
+
+```sh
+make source-smoke
 ```
 
 The web dependency install reported seven audit findings (one low, four

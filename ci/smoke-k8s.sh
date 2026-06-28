@@ -138,6 +138,7 @@ YAML
 
 main() {
   local tests=("$@")
+  local private_image_args=()
   [[ ${#tests[@]} -gt 0 ]] || tests=(pypi npm cargo)
 
   build_bundle
@@ -156,6 +157,13 @@ main() {
       --docker-password="${HARBOR_PASSWORD}" >/dev/null
     kubectl -n "${ns}" patch serviceaccount default \
       -p '{"imagePullSecrets":[{"name":"harbor"}]}' >/dev/null
+    # The vendored chart creates a dedicated backend ServiceAccount but does
+    # not expose imagePullSecrets on it. For a private CI image, select the
+    # already-patched default account without modifying the vendored chart.
+    private_image_args=(
+      --set backend.serviceAccount.create=false
+      --set backend.serviceAccount.name=default
+    )
   fi
 
   kubectl -n "${ns}" create configmap test-bundle \
@@ -169,6 +177,7 @@ main() {
     --set backend.image.repository="${backend_repo}" \
     --set backend.image.tag="${backend_tag}" \
     --set backend.image.pullPolicy=IfNotPresent \
+    "${private_image_args[@]}" \
     --wait --timeout 5m
 
   # Bootstrap the test repositories before any client runs.

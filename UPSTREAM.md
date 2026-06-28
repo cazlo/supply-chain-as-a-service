@@ -15,6 +15,32 @@ Local build identities and image digests will be recorded when reproducible CI
 is introduced. There are currently no local behavioral patches, related
 upstream issues, or pull requests.
 
+## Clean snapshot validation
+
+The pinned snapshots passed the following unmodified-source gates on 2026-06-27:
+
+- backend Docker `builder` target with identity
+  `artifact-keeper-backend:source-check-ea6f5ed` and application version
+  `v1.2.1`;
+- web Docker `build` target with identity
+  `artifact-keeper-web:source-check-3cfc8dd`, including its production Next.js
+  compile, TypeScript check, and static-page generation;
+- Helm strict lint plus an offline Kubernetes client render using the chart's
+  lean CI values.
+
+Run all three gates, or one named gate, with:
+
+```sh
+make source-check
+make source-check-backend
+make source-check-web
+make source-check-chart
+```
+
+The web dependency install reported seven audit findings (one low, four
+moderate, and two high). The clean upstream snapshot still builds; vulnerability
+evaluation and disposition belong to the reproducible CI milestone.
+
 ## Verify the pinned snapshots
 
 The imported upstream commits remain reachable through the subtree merge

@@ -1,4 +1,16 @@
-.PHONY: vendor-check vendor-status vendor-update
+.PHONY: source-check source-check-backend source-check-chart source-check-web vendor-check vendor-status vendor-update
+
+source-check:
+	ci/check-clean-snapshots.sh all
+
+source-check-backend:
+	ci/check-clean-snapshots.sh backend
+
+source-check-web:
+	ci/check-clean-snapshots.sh web
+
+source-check-chart:
+	ci/check-clean-snapshots.sh chart
 
 vendor-check:
 	ci/subtree-sync.sh check

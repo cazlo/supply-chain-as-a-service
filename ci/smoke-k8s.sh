@@ -4,12 +4,22 @@ set -euo pipefail
 # K8s-native Artifact Keeper smoke suite (pypi, npm, cargo native clients).
 #
 # Replaces the rootless-hostile docker-compose smoke path: it helm-installs the
-# vendored chart with its CI values into an ephemeral namespace (backend +
+# vendored chart with its CI values into a single fixed namespace (backend +
 # postgres come up as real pods, which also exercises the chart), bootstraps the
 # test repositories, runs the vendored native client scripts as Jobs over cluster
-# HTTP, then deletes the namespace. The vendored chart and test scripts are used
+# HTTP, then tears the release down. The vendored chart and test scripts are used
 # unmodified; the scripts are shipped into the Jobs as a gzipped ConfigMap that
 # mirrors the compose /scripts, /assets, and /setup.sh mounts.
+#
+# Namespace model: the CI runner's ServiceAccount is intentionally NOT allowed to
+# create or delete namespaces (RBAC cannot pattern-match namespace names, so a
+# cluster-scoped create/delete grant would let the runner touch ANY namespace).
+# Instead a single fixed `ak-smoke` namespace is provisioned out-of-band, the SA
+# holds admin only WITHIN it (a namespaced Role), and teardown deletes the run's
+# resources rather than the namespace. The namespace is reused between runs, so
+# runs serialize; the runner capacity is 1, which already serializes them. See
+# the RBAC + namespace manifest in the home-assistant repo (apps/gitea-runners).
+# Locally (with a cluster-admin kubeconfig) the namespace is created on demand.
 #
 # Requirements: kubectl + helm pointed at a cluster, and the freshly built
 # backend image reachable by the cluster (locally: preloaded into the node;
@@ -18,10 +28,10 @@ set -euo pipefail
 # Inputs (env):
 #   BACKEND_IMAGE_REPO  backend image repository (default: vendored upstream ref)
 #   BACKEND_IMAGE_TAG   backend image tag        (default: pinned short revision)
-#   NAMESPACE           ephemeral namespace      (default: ak-smoke-<rev>)
+#   NAMESPACE           smoke namespace          (default: ak-smoke)
 #   HARBOR_REGISTRY / HARBOR_USERNAME / HARBOR_PASSWORD
 #                       if set, create an image pull secret for the backend image
-#   KEEP_NAMESPACE      set to keep the namespace after the run (debugging)
+#   KEEP_RELEASE        set to keep the release + resources after the run (debug)
 
 readonly root="$(git rev-parse --show-toplevel)"
 readonly chart="${root}/artifact-keeper-iac/charts/artifact-keeper"
@@ -37,14 +47,27 @@ readonly admin_pass="CI-test-password-not-for-prod"
 revision="$(awk -F '\t' '$1 == "artifact-keeper" { print $5; exit }' "${metadata}")"
 readonly backend_repo="${BACKEND_IMAGE_REPO:-ghcr.io/artifact-keeper/artifact-keeper-backend}"
 readonly backend_tag="${BACKEND_IMAGE_TAG:-${revision:0:7}}"
-readonly ns="${NAMESPACE:-ak-smoke-${revision:0:7}}"
+readonly ns="${NAMESPACE:-ak-smoke}"
 readonly backend_url="http://${release}-backend:8080"
 
 workdir=""
+# Tear down the run's own resources, not the namespace: the runner SA has admin
+# only inside ${ns} and cannot delete the namespace itself. helm uninstall drops
+# the chart objects; the rest (postgres StatefulSet PVC, the test bundle, the
+# native-client Jobs, the optional pull secret) are deleted explicitly so the
+# namespace starts clean. Run both before install (in case a prior run was
+# killed mid-flight) and on exit.
+reset_release() {
+  helm uninstall "${release}" --namespace "${ns}" --wait --timeout 2m >/dev/null 2>&1 || true
+  kubectl -n "${ns}" delete pvc --all --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "${ns}" delete job --all --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "${ns}" delete configmap test-bundle --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "${ns}" delete secret harbor --ignore-not-found >/dev/null 2>&1 || true
+}
 cleanup() {
   [[ -n "${workdir}" ]] && rm -rf "${workdir}"
-  [[ -n "${KEEP_NAMESPACE:-}" ]] && return
-  kubectl delete namespace "${ns}" --wait=false --ignore-not-found >/dev/null 2>&1 || true
+  [[ -n "${KEEP_RELEASE:-}" ]] && return
+  reset_release
 }
 trap cleanup EXIT
 
@@ -119,7 +142,12 @@ main() {
 
   build_bundle
 
-  kubectl create namespace "${ns}" --dry-run=client -o yaml | kubectl apply -f -
+  # The namespace is provisioned out-of-band in CI (the SA cannot create it);
+  # create it on demand only when running locally with a privileged kubeconfig.
+  kubectl get namespace "${ns}" >/dev/null 2>&1 || kubectl create namespace "${ns}"
+
+  # Clear anything a previous interrupted run left behind so install is clean.
+  reset_release
 
   if [[ -n "${HARBOR_REGISTRY:-}" ]]; then
     kubectl -n "${ns}" create secret docker-registry harbor \

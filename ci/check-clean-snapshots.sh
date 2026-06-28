@@ -4,6 +4,11 @@ set -euo pipefail
 readonly root="$(git rev-parse --show-toplevel)"
 readonly metadata="${root}/vendor/upstreams.tsv"
 
+# Build with buildx so the same wrapper runs against the local default builder
+# and, in CI, a non-privileged rootless BuildKit daemon selected through the
+# BUILDX_BUILDER environment variable. These checks only prove the snapshot
+# builds, so the result is discarded rather than --load-ed or --push-ed.
+
 revision_for() {
   awk -F '\t' -v name="$1" '$1 == name { print $5; exit }' "${metadata}"
 }
@@ -18,7 +23,7 @@ check_backend() {
   tag="$(tag_for artifact-keeper)"
   [[ "${tag}" != "-" ]] || tag="${revision:0:12}"
 
-  docker build --target builder \
+  docker buildx build --target builder \
     --build-arg "GIT_SHA=${revision}" \
     --build-arg "APP_VERSION=${tag}" \
     --tag "artifact-keeper-backend:source-check-${revision:0:7}" \
@@ -30,7 +35,7 @@ check_web() {
   local revision
   revision="$(revision_for artifact-keeper-web)"
 
-  docker build --target build \
+  docker buildx build --target build \
     --build-arg "GIT_SHA=${revision}" \
     --build-arg "APP_VERSION=${revision:0:7}" \
     --tag "artifact-keeper-web:source-check-${revision:0:7}" \

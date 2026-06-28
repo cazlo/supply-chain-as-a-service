@@ -12,7 +12,7 @@ set -euo pipefail
 
 readonly bin_dir="${BIN_DIR:-/usr/local/bin}"
 readonly cosign_version="${COSIGN_VERSION:-v2.4.1}"
-readonly trivy_version="${TRIVY_VERSION:-0.58.1}"
+readonly trivy_version="${TRIVY_VERSION:-0.71.2}"
 readonly arch="linux-amd64"
 
 if command -v cosign >/dev/null; then

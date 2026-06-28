@@ -7,28 +7,28 @@ set -euo pipefail
 # digest (never a mutable tag), writes the JSON report next to the record, and
 # exits non-zero when findings meet the configured severity gate.
 #
-# Trivy runs as a pinned container so the runner needs no host install. The
-# scanner image is overridable so it can be sourced from a local mirror instead
-# of Docker Hub.
+# Trivy is invoked as a native binary (the build runners are daemonless rootless
+# act_runners with no Docker daemon, so `docker run` is not available). The
+# runner image ships `trivy`; override TRIVY_BIN to point elsewhere.
 #
 # Usage:
 #   ci/scan-image.sh <build-record.json> [more-records.json ...]
 #
 # Environment:
-#   HARBOR_REGISTRY, HARBOR_USERNAME, HARBOR_PASSWORD  registry auth (required)
+#   HARBOR_USERNAME, HARBOR_PASSWORD  registry auth (required)
+#   TRIVY_BIN          trivy binary (default: trivy on PATH)
 #   TRIVY_SEVERITY     comma list that fails the gate (default HIGH,CRITICAL)
 #   TRIVY_EXIT_CODE    exit code when the gate matches (default 1; set 0 to warn)
-#   TRIVY_IMAGE        scanner image (default pinned aquasec/trivy by digest)
 #   TRIVY_IGNORE_UNFIXED  set to 1 to ignore vulns with no upstream fix
 
 readonly username="${HARBOR_USERNAME:?HARBOR_USERNAME is required}"
 readonly password="${HARBOR_PASSWORD:?HARBOR_PASSWORD is required}"
+readonly trivy_bin="${TRIVY_BIN:-trivy}"
 readonly severity="${TRIVY_SEVERITY:-HIGH,CRITICAL}"
 readonly gate_exit="${TRIVY_EXIT_CODE:-1}"
-# Pinned by digest; tag kept in the ref for human readability only.
-readonly trivy_image="${TRIVY_IMAGE:-aquasec/trivy:0.58.1@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7}"
 
 (( $# >= 1 )) || { echo "usage: ci/scan-image.sh <build-record.json> ..." >&2; exit 2; }
+command -v "${trivy_bin}" >/dev/null || { echo "trivy not found (set TRIVY_BIN)" >&2; exit 2; }
 
 scan_one() {
   local record="$1" image digest report_dir component
@@ -44,11 +44,9 @@ scan_one() {
   local ignore_unfixed=()
   [[ "${TRIVY_IGNORE_UNFIXED:-0}" == "1" ]] && ignore_unfixed=(--ignore-unfixed)
 
-  # Two passes: a always-zero JSON report for the build record, then the gate.
-  docker run --rm \
-    -e "TRIVY_USERNAME=${username}" \
-    -e "TRIVY_PASSWORD=${password}" \
-    "${trivy_image}" image \
+  # Write an always-zero JSON report for the build record, then gate on it.
+  TRIVY_USERNAME="${username}" TRIVY_PASSWORD="${password}" \
+    "${trivy_bin}" image \
       --quiet --format json --severity "${severity}" \
       "${ignore_unfixed[@]}" "${target}" >"${report}"
   echo "Wrote ${report}"

@@ -69,6 +69,13 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
 
+      # The runners are daemonless (no `docker run`); cosign/trivy are native
+      # binaries. Install them here until they are baked into the runner image
+      # (apps/gitea-runners/runner-image), at which point this is a no-op.
+      - name: Set up cosign and trivy
+        if: needs.gate.outputs.publish == 'true'
+        run: ci/setup-image-tools.sh
+
       - name: Scan the backend image (Trivy)
         if: needs.gate.outputs.publish == 'true'
         run: ci/scan-image.sh /tmp/artifact-keeper-backend-record/backend-record.json
@@ -135,6 +142,10 @@ jobs:
           HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Set up cosign and trivy
+        if: needs.gate.outputs.publish == 'true'
+        run: ci/setup-image-tools.sh
 
       - name: Scan the web image (Trivy)
         if: needs.gate.outputs.publish == 'true'

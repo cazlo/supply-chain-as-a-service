@@ -7,27 +7,28 @@ set -euo pipefail
 # the transparency log is disabled because this is a private, key-pair trust root
 # rather than keyless/Fulcio. Verify with ci/verify-image.sh against ci/cosign.pub.
 #
-# cosign runs as a pinned container so the runner needs no host install. The
-# cosign image is overridable so it can be sourced from a local mirror.
+# cosign is invoked as a native binary (the build runners are daemonless rootless
+# act_runners with no Docker daemon). The runner image ships `cosign`; override
+# COSIGN_BIN to point elsewhere.
 #
 # Usage:
 #   ci/sign-image.sh <build-record.json> [more-records.json ...]
 #
 # Environment:
-#   HARBOR_REGISTRY, HARBOR_USERNAME, HARBOR_PASSWORD  registry auth (required)
+#   HARBOR_USERNAME, HARBOR_PASSWORD  registry auth (required)
 #   COSIGN_PRIVATE_KEY  PEM of the lab signing key (required)
-#   COSIGN_PASSWORD     passphrase for the key (required; may be empty string)
-#   COSIGN_IMAGE        cosign image (default pinned ghcr.io/sigstore/cosign)
+#   COSIGN_PASSWORD     passphrase (empty for the unencrypted lab key)
+#   COSIGN_BIN          cosign binary (default: cosign on PATH)
 
 readonly username="${HARBOR_USERNAME:?HARBOR_USERNAME is required}"
 readonly password="${HARBOR_PASSWORD:?HARBOR_PASSWORD is required}"
 : "${COSIGN_PRIVATE_KEY:?COSIGN_PRIVATE_KEY is required}"
 # Empty when the key is unencrypted (the lab key is); cosign reads it regardless.
-COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
-# TODO: pin by digest once ghcr egress/mirroring is available (see scan-image.sh).
-readonly cosign_image="${COSIGN_IMAGE:-ghcr.io/sigstore/cosign:v2.4.1}"
+export COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
+readonly cosign_bin="${COSIGN_BIN:-cosign}"
 
 (( $# >= 1 )) || { echo "usage: ci/sign-image.sh <build-record.json> ..." >&2; exit 2; }
+command -v "${cosign_bin}" >/dev/null || { echo "cosign not found (set COSIGN_BIN)" >&2; exit 2; }
 
 sign_one() {
   local record="$1" image digest target
@@ -37,17 +38,14 @@ sign_one() {
   target="${image}@${digest}"
 
   echo "Signing ${target}"
-  # cosign authenticates to the registry with these env vars; the key material
-  # and passphrase are passed by env and never written to disk or the record.
-  docker run --rm \
-    -e "COSIGN_PRIVATE_KEY=${COSIGN_PRIVATE_KEY}" \
-    -e "COSIGN_PASSWORD=${COSIGN_PASSWORD}" \
-    "${cosign_image}" sign --yes \
-      --tlog-upload=false \
-      --registry-username "${username}" \
-      --registry-password "${password}" \
-      --key env://COSIGN_PRIVATE_KEY \
-      "${target}"
+  # The key material and passphrase stay in the environment; never on disk or in
+  # the record. Registry auth is passed explicitly (there is no docker config).
+  "${cosign_bin}" sign --yes \
+    --tlog-upload=false \
+    --registry-username "${username}" \
+    --registry-password "${password}" \
+    --key env://COSIGN_PRIVATE_KEY \
+    "${target}"
   echo "Signed ${target}"
 }
 

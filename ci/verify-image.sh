@@ -7,6 +7,8 @@ set -euo pipefail
 # future admission check, or by hand). Transparency-log lookup is disabled to
 # match the offline key-based signing in ci/sign-image.sh.
 #
+# cosign is invoked as a native binary (daemonless runners, no `docker run`).
+#
 # Accepts either a build record (image+digest are read from it) or an explicit
 # image reference. Always pin to a digest in real use; a mutable tag is accepted
 # only for ad-hoc checks.
@@ -17,15 +19,16 @@ set -euo pipefail
 #
 # Environment:
 #   COSIGN_PUBLIC_KEY  path to the public key (default ci/cosign.pub)
+#   COSIGN_BIN         cosign binary (default: cosign on PATH)
 #   HARBOR_USERNAME, HARBOR_PASSWORD  registry auth (required for private repos)
-#   COSIGN_IMAGE       cosign image (default pinned ghcr.io/sigstore/cosign)
 
 readonly root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 readonly pubkey="${COSIGN_PUBLIC_KEY:-${root}/ci/cosign.pub}"
-readonly cosign_image="${COSIGN_IMAGE:-ghcr.io/sigstore/cosign:v2.4.1}"
+readonly cosign_bin="${COSIGN_BIN:-cosign}"
 
 [[ -f "${pubkey}" ]] || { echo "missing public key: ${pubkey}" >&2; exit 2; }
 (( $# >= 1 )) || { echo "usage: ci/verify-image.sh [--record <json>|<image@digest>] ..." >&2; exit 2; }
+command -v "${cosign_bin}" >/dev/null || { echo "cosign not found (set COSIGN_BIN)" >&2; exit 2; }
 
 targets=()
 if [[ "${1:-}" == "--record" ]]; then
@@ -46,12 +49,10 @@ fi
 
 for target in "${targets[@]}"; do
   echo "Verifying ${target}"
-  docker run --rm \
-    -v "${pubkey}:/cosign.pub:ro" \
-    "${cosign_image}" verify \
-      --insecure-ignore-tlog=true \
-      "${auth[@]}" \
-      --key /cosign.pub \
-      "${target}" >/dev/null
+  "${cosign_bin}" verify \
+    --insecure-ignore-tlog=true \
+    "${auth[@]}" \
+    --key "${pubkey}" \
+    "${target}" >/dev/null
   echo "OK ${target}"
 done

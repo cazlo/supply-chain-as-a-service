@@ -26,7 +26,9 @@ jobs:
       # Host-mode actions execute from the action cache, not necessarily the
       # checkout directory. Use an absolute path so upload-artifact sees it.
       - name: Retain the backend build record
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        # Gitea 1.26 implements the v3 artifact protocol; v4 detects the
+        # self-hosted endpoint as GHES and refuses to upload.
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
         with:
           name: backend-build-record-${{ gitea.sha }}
           path: /tmp/artifact-keeper-backend-record/
@@ -61,7 +63,7 @@ jobs:
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
 
       - name: Retain the web build record
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
         with:
           name: web-build-record-${{ gitea.sha }}
           path: /tmp/artifact-keeper-web-record/

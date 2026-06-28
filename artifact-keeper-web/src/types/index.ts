@@ -1,0 +1,275 @@
+export * from './groups';
+export * from './migration';
+export * from './permissions';
+export * from './packages';
+export * from './builds';
+export * from './search';
+export * from './tree';
+export * from './security';
+export * from './analytics';
+export * from './lifecycle';
+export * from './telemetry';
+export * from './monitoring';
+export * from './sbom';
+export * from './promotion';
+export * from './quality-gates';
+
+export type {
+  PeerInstance,
+  PeerIdentity,
+  PeerConnection,
+  ReplicationMode,
+  RegisterPeerRequest,
+  AssignRepoRequest as PeerAssignRepoRequest,
+} from '@/lib/api/replication';
+
+export interface User {
+  id: string;
+  username: string;
+  email: string;
+  display_name?: string;
+  is_admin: boolean;
+  is_active?: boolean;
+  must_change_password?: boolean;
+  password_expires_at?: string | null;
+  totp_enabled?: boolean;
+  auth_provider?: string;
+}
+
+export interface LoginResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+  token_type: string;
+  must_change_password: boolean;
+  totp_required?: boolean;
+  totp_token?: string;
+}
+
+export interface CreateUserResponse {
+  user: User;
+  generated_password?: string;
+}
+
+export interface Repository {
+  id: string;
+  key: string;
+  name: string;
+  description?: string;
+  format: RepositoryFormat;
+  repo_type: RepositoryType;
+  is_public: boolean;
+  storage_used_bytes: number;
+  quota_bytes?: number;
+  // For remote repositories
+  upstream_url?: string;
+  upstream_auth_type?: string | null;
+  upstream_auth_configured?: boolean;
+  // For virtual repositories
+  member_repos?: VirtualRepoMember[];
+  created_at: string;
+  updated_at: string;
+}
+
+export type RepositoryFormat =
+  | 'maven'
+  | 'gradle'
+  | 'pypi'
+  | 'npm'
+  | 'docker'
+  | 'helm'
+  | 'rpm'
+  | 'debian'
+  | 'go'
+  | 'nuget'
+  | 'rubygems'
+  | 'conan'
+  | 'cargo'
+  | 'generic'
+  | 'podman'
+  | 'buildx'
+  | 'oras'
+  | 'wasm_oci'
+  | 'helm_oci'
+  | 'poetry'
+  | 'conda'
+  | 'yarn'
+  | 'bower'
+  | 'pnpm'
+  | 'chocolatey'
+  | 'powershell'
+  | 'terraform'
+  | 'opentofu'
+  | 'alpine'
+  | 'conda_native'
+  | 'composer'
+  | 'hex'
+  | 'cocoapods'
+  | 'swift'
+  | 'pub'
+  | 'sbt'
+  | 'chef'
+  | 'puppet'
+  | 'ansible'
+  | 'gitlfs'
+  | 'vscode'
+  | 'jetbrains'
+  | 'huggingface'
+  | 'mlmodel'
+  | 'cran'
+  | 'vagrant'
+  | 'opkg'
+  | 'p2'
+  | 'bazel'
+  | 'protobuf'
+  | 'incus'
+  | 'lxc';
+
+export type RepositoryType = 'local' | 'remote' | 'virtual' | 'staging';
+
+export interface CreateRepositoryRequest {
+  key: string;
+  name: string;
+  description?: string;
+  format: RepositoryFormat;
+  repo_type: RepositoryType;
+  is_public?: boolean;
+  quota_bytes?: number;
+  // For remote repositories
+  upstream_url?: string;
+  upstream_auth_type?: string;
+  upstream_username?: string;
+  upstream_password?: string;
+  // For virtual repositories - array of member repo keys with priorities
+  member_repos?: VirtualRepoMemberInput[];
+}
+
+export interface VirtualRepoMemberInput {
+  repo_key: string;
+  priority: number;
+}
+
+export interface VirtualRepoMember {
+  id: string;
+  virtual_repo_id: string;
+  member_repo_id: string;
+  member_repo_key: string;
+  priority: number;
+  created_at: string;
+}
+
+export interface VirtualMembersResponse {
+  members: VirtualRepoMember[];
+}
+
+export interface Artifact {
+  id: string;
+  repository_key: string;
+  path: string;
+  name: string;
+  version?: string;
+  size_bytes: number;
+  checksum_sha256: string;
+  content_type: string;
+  download_count: number;
+  is_quarantined?: boolean;
+  quarantine_until?: string | null;
+  quarantine_reason?: string | null;
+  created_at: string;
+  metadata?: Record<string, unknown>;
+  /**
+   * When the proxy cache entry for this artifact was last written. Only
+   * populated for Remote (proxy) repositories whose backend has been
+   * upgraded with artifact-keeper#1541 (the new optional fields on
+   * `ArtifactResponse`). Renders the "Cached" row in the artifact details
+   * dialog when present.
+   */
+  cache_cached_at?: string | null;
+  /**
+   * When the proxy cache entry for this artifact will expire and be
+   * re-validated against upstream. Same gating as `cache_cached_at`.
+   * Renders the "Cache expires" row in the artifact details dialog when
+   * present.
+   */
+  cache_expires_at?: string | null;
+}
+
+export interface PaginatedResponse<T> {
+  items: T[];
+  pagination: {
+    page: number;
+    per_page: number;
+    total: number;
+    total_pages: number;
+  };
+}
+
+/**
+ * A Maven/Gradle component grouped by GAV (groupId, artifactId, version).
+ * Returned by `GET /api/v1/repositories/:key/artifacts?group_by=maven_component`
+ * (backend PR artifact-keeper#701, issue #254).
+ */
+export interface MavenComponent {
+  /** Representative artifact ID (the first file in the group). */
+  id: string;
+  /** Maven groupId with dots (e.g. `org.junit.jupiter`). */
+  group_id: string;
+  /** Maven artifactId (e.g. `junit-jupiter-api`). */
+  artifact_id: string;
+  /** Maven version string (e.g. `5.11.0`). */
+  version: string;
+  /** Repository key this component belongs to. */
+  repository_key: string;
+  /** Repository format — always `maven` or `gradle`. */
+  format: string;
+  /** Total size in bytes across all files in this component. */
+  size_bytes: number;
+  /** Total download count across all files in this component. */
+  download_count: number;
+  /** Earliest creation timestamp among the component files. */
+  created_at: string;
+  /** Individual filenames belonging to this component (jar, pom, checksums, …). */
+  artifact_files: string[];
+}
+
+/**
+ * Extended pagination response for grouped artifact listings.  Identical to
+ * `PaginatedResponse<Artifact>` plus an optional `components` array that the
+ * backend populates when `group_by=maven_component` is requested.
+ */
+export interface GroupedArtifactListResponse extends PaginatedResponse<Artifact> {
+  /** Present only when `group_by=maven_component` was requested. */
+  components?: MavenComponent[];
+}
+
+export interface HealthResponse {
+  status: string;
+  version: string;
+  commit?: string;
+  dirty?: boolean;
+  checks: {
+    database: { status: string; message?: string };
+    storage: { status: string; message?: string };
+    security_scanner?: { status: string; message?: string };
+    /**
+     * Search backend health. As of backend 1.2.0 the search index migrated
+     * from Meilisearch to OpenSearch and the health payload exposes this under
+     * `opensearch`. Older backends used `meilisearch`. Both are kept here so the
+     * UI renders the "Search Engine" card regardless of which backend answers.
+     */
+    opensearch?: { status: string; message?: string };
+    meilisearch?: { status: string; message?: string };
+  };
+}
+
+export interface AdminStats {
+  total_repositories: number;
+  total_artifacts: number;
+  total_storage_bytes: number;
+  total_users: number;
+}
+
+export interface ApiError {
+  code: string;
+  message: string;
+}

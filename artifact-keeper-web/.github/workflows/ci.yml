@@ -1,0 +1,586 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/artifact-keeper-web
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    name: Unit Tests
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:coverage
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14
+      - name: Coverage summary and gate
+        run: |
+          # Parse coverage summary from vitest output
+          if [ -f coverage/coverage-summary.json ]; then
+            RESULT=$(python3 -c "
+          import json
+          data = json.load(open('coverage/coverage-summary.json'))
+          total = data.get('total', {})
+          lines = total.get('lines', {})
+          pct = lines.get('pct', 0)
+          covered = lines.get('covered', 0)
+          total_lines = lines.get('total', 0)
+          print(f'{pct} {covered} {total_lines}')
+          ")
+            PCT=$(echo "$RESULT" | awk '{print $1}')
+            echo "### Coverage: ${PCT}% lines" >> $GITHUB_STEP_SUMMARY
+            echo "Total coverage: ${PCT}%"
+          else
+            echo "No coverage summary found"
+            PCT="0"
+          fi
+
+      - name: New code coverage gate
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin ${{ github.base_ref }}
+          # Only include Added/Copied/Modified/Renamed files; Deleted files have nothing to cover.
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR FETCH_HEAD -- 'src/**/*.ts' 'src/**/*.tsx' 2>/dev/null | grep -v '\.test\.\|\.spec\.\|__tests__' || true)
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No source files changed, skipping new code coverage check"
+            echo "### New Code Coverage: N/A (no source changes)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          if [ ! -f coverage/lcov.info ]; then
+            echo "No lcov.info found, skipping"
+            exit 0
+          fi
+
+          # Build a map of {file -> set of changed line numbers} so the gate
+          # measures only the lines this PR actually added/modified, not every
+          # instrumented line in the touched file.
+          export CHANGED_FILES
+          RESULT=$(python3 <<'PY'
+          import os
+          import subprocess
+
+          changed_files = os.environ['CHANGED_FILES'].split()
+          # Parse unified diff hunks for the added (right-side) line ranges per file.
+          changed_lines = {}
+          for f in changed_files:
+              out = subprocess.run(
+                  ['git', 'diff', '--unified=0', 'FETCH_HEAD', '--', f],
+                  capture_output=True, text=True,
+              ).stdout
+              line_set = set()
+              for line in out.splitlines():
+                  if line.startswith('@@'):
+                      # @@ -old,n +new,n @@
+                      try:
+                          plus = line.split('+', 1)[1].split(' ', 1)[0]
+                          if ',' in plus:
+                              start_s, count_s = plus.split(',')
+                              start, count = int(start_s), int(count_s)
+                          else:
+                              start, count = int(plus), 1
+                      except (ValueError, IndexError):
+                          continue
+                      for n in range(start, start + count):
+                          line_set.add(n)
+              changed_lines[f] = line_set
+
+          # Tally DA: hits/misses for changed lines only.
+          hit = miss = 0
+          active_file = None
+          active_set = None
+          for raw in open('coverage/lcov.info'):
+              line = raw.strip()
+              if line.startswith('SF:'):
+                  path = line[3:]
+                  active_file = None
+                  for f, ls in changed_lines.items():
+                      if path.endswith(f):
+                          active_file = f
+                          active_set = ls
+                          break
+              elif line.startswith('DA:') and active_file is not None and active_set:
+                  ln_s, count_s = line[3:].split(',')[:2]
+                  ln = int(ln_s)
+                  if ln in active_set:
+                      if int(count_s) > 0:
+                          hit += 1
+                      else:
+                          miss += 1
+          total = hit + miss
+          if total == 0:
+              print('none')
+          else:
+              pct = (hit * 100) // total
+              print(f'{pct} {hit} {total}')
+          PY
+          )
+
+          if [ "$RESULT" = "none" ]; then
+            echo "### New Code Coverage: N/A (no instrumented changed lines)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          PCT=$(echo "$RESULT" | awk '{print $1}')
+          HIT=$(echo "$RESULT" | awk '{print $2}')
+          TOTAL=$(echo "$RESULT" | awk '{print $3}')
+
+          echo "### New Code Coverage: ${PCT}% (${HIT}/${TOTAL} changed lines)" >> $GITHUB_STEP_SUMMARY
+          echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} changed lines)"
+
+          # Skip gate when the changed-line surface is tiny (matches MEMORY.md convention).
+          if [ "$TOTAL" -lt 10 ]; then
+            echo "Changed-line surface is below 10 lines; skipping gate."
+            exit 0
+          fi
+
+          if [ "$PCT" -lt 80 ]; then
+            echo "::error::New code coverage is ${PCT}%, below 80% threshold"
+            exit 1
+          fi
+
+      - name: Code duplication gate
+        if: always() && github.event_name == 'pull_request'
+        env:
+          JSCPD_REPORT: /tmp/jscpd-report/jscpd-report.json
+        run: |
+          set -euo pipefail
+          npm install -g jscpd@4 --silent
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+
+          # Exclude deleted files (--diff-filter=ACMR) — jscpd cannot lstat paths that no longer exist.
+          CHANGED_SRC=$(git diff --name-only --diff-filter=ACMR FETCH_HEAD -- 'src/**/*.ts' 'src/**/*.tsx' \
+            | grep -v '\.test\.\|\.spec\.\|__tests__' || true)
+
+          if [ -z "$CHANGED_SRC" ]; then
+            echo "No source files changed against ${{ github.base_ref }}"
+            echo "### Code Duplication: N/A (no source changes)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "Analyzing $(echo "$CHANGED_SRC" | wc -l | tr -d ' ') changed source file(s):"
+          echo "$CHANGED_SRC" | sed 's/^/  /'
+          echo
+
+          jscpd --min-lines 10 --threshold 100 --reporters json \
+            --format typescript,tsx --output /tmp/jscpd-report \
+            $(echo "$CHANGED_SRC" | tr '\n' ' ')
+
+          if [ ! -f "$JSCPD_REPORT" ]; then
+            echo "jscpd produced no report at $JSCPD_REPORT"
+            echo "### Code Duplication: 0% (no report)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          read -r PCT DUPS LINES CLONES < <(python3 <<'PY'
+          import json
+          with open("/tmp/jscpd-report/jscpd-report.json") as f:
+              data = json.load(f)
+          total = data.get("statistics", {}).get("total", {})
+          print(
+              f"{total.get('percentage', 0):.1f}",
+              total.get("duplicatedLines", 0),
+              total.get("lines", 0),
+              len(data.get("duplicates", [])),
+          )
+          PY
+          )
+
+          echo "Code duplication: ${PCT}% (${DUPS}/${LINES} duplicated lines across ${CLONES} clone pair(s))"
+          echo "### Code Duplication: ${PCT}% (${DUPS}/${LINES} lines, ${CLONES} clone pair(s))" >> "$GITHUB_STEP_SUMMARY"
+
+          PCT_INT=$(python3 -c "print(int(round(float('${PCT}') * 10)))")
+          if [ "$PCT_INT" -gt 30 ]; then
+            echo "::error::Code duplication is ${PCT}%, exceeding 3% threshold"
+            python3 <<'PY'
+          import json
+          with open("/tmp/jscpd-report/jscpd-report.json") as f:
+              data = json.load(f)
+          for d in data.get("duplicates", []):
+              fa, sa = d["firstFile"], d["secondFile"]
+              print(
+                  f"  {fa['name']}:{fa['startLoc']['line']}-{fa['endLoc']['line']}"
+                  f" <-> {sa['name']}:{sa['startLoc']['line']}-{sa['endLoc']['line']}"
+              )
+          PY
+            exit 1
+          fi
+
+  build:
+    name: Build
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  e2e-interactions:
+    name: E2E Interactions (shard ${{ matrix.shard }}/3)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start E2E stack
+        run: docker compose -f docker-compose.e2e.yml up -d --build --wait
+        env:
+          BACKEND_TAG: dev
+
+      - name: Run interaction tests
+        run: npx playwright test --project=interactions --shard=${{ matrix.shard }}/3 --reporter=list,github,html
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:3100
+          ADMIN_PASSWORD: TestRunner!2026secure
+
+      - name: Upload test report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: playwright-interactions-shard-${{ matrix.shard }}
+          path: playwright-report/
+          retention-days: 7
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.e2e.yml logs --tail=100
+
+      - name: Tear down E2E stack
+        if: always()
+        run: docker compose -f docker-compose.e2e.yml down -v
+
+  e2e-roles:
+    name: E2E RBAC Roles
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start E2E stack
+        run: docker compose -f docker-compose.e2e.yml up -d --build --wait
+        env:
+          BACKEND_TAG: dev
+
+      - name: Run RBAC role tests
+        run: npx playwright test --project=roles-admin --project=roles-developer --project=roles-viewer --project=roles-security --project=roles-restricted --project=roles-unauthenticated --reporter=list,github,html
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:3100
+          ADMIN_PASSWORD: TestRunner!2026secure
+
+      - name: Upload test report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: playwright-roles
+          path: playwright-report/
+          retention-days: 7
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.e2e.yml logs --tail=100
+
+      - name: Tear down E2E stack
+        if: always()
+        run: docker compose -f docker-compose.e2e.yml down -v
+
+  e2e-visual:
+    name: E2E Visual Regression
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start E2E stack
+        run: docker compose -f docker-compose.e2e.yml up -d --build --wait
+        env:
+          BACKEND_TAG: dev
+
+      - name: Run visual regression tests
+        run: npx playwright test --project=visual --update-snapshots --reporter=list,github,html
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:3100
+          ADMIN_PASSWORD: TestRunner!2026secure
+
+      - name: Upload visual baseline snapshots
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: visual-baseline-snapshots
+          path: e2e/suites/visual/**/*-snapshots/
+          retention-days: 30
+
+      - name: Upload visual diff images on failure
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: visual-regression-diffs
+          path: test-results/
+          retention-days: 7
+
+      - name: Upload test report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: playwright-visual
+          path: playwright-report/
+          retention-days: 7
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.e2e.yml logs --tail=100
+
+      - name: Tear down E2E stack
+        if: always()
+        run: docker compose -f docker-compose.e2e.yml down -v
+
+  e2e-docker-proxy:
+    name: E2E Docker /v2/* Header Forwarding
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # This suite uses Playwright's `request` API only — no browser is
+      # launched, so we skip `playwright install --with-deps` (saves ~90s
+      # plus chromium dependency install bandwidth).
+      #
+      # No docker compose stack either — the suite uses an in-process Node
+      # fixture registry to verify the Next.js middleware proxy preserves
+      # Docker request/response headers end to end. See issue #336.
+      - name: Run Docker /v2/* header-forwarding tests
+        run: npm run test:e2e:docker-proxy
+
+      - name: Upload test report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: playwright-docker-proxy
+          path: playwright-report/
+          retention-days: 7
+
+  e2e-docs-export:
+    name: E2E Docs Screenshot Export
+    if: github.ref == 'refs/heads/main'
+    needs: e2e-visual
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate docs manifest
+        run: npm run test:e2e:docs-export
+
+      - name: Upload docs screenshots
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-screenshots
+          path: e2e/docs-export/
+          retention-days: 30
+
+  docker:
+    name: Docker (${{ matrix.platform }})
+    needs: build
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=build-${{ matrix.platform }}
+          cache-to: type=gha,scope=build-${{ matrix.platform }},mode=max
+          sbom: true
+          provenance: mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest

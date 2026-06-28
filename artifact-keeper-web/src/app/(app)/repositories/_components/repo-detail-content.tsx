@@ -1,0 +1,1194 @@
+"use client";
+
+import { useState, useCallback } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  ArrowLeft,
+  Bell,
+  Download,
+  Trash2,
+  Search,
+  FileIcon,
+  Info,
+  Shield,
+  ExternalLink,
+  HeartPulse,
+  Layers,
+  Package as PackageIcon,
+  Settings,
+  RotateCcw,
+} from "lucide-react";
+
+import { repositoriesApi } from "@/lib/api/repositories";
+import { artifactsApi } from "@/lib/api/artifacts";
+import securityApi from "@/lib/api/security";
+import { mutationErrorToast } from "@/lib/error-utils";
+import { isActivelyQuarantined } from "@/lib/quarantine";
+import { buildPomDependencySnippet, parseMavenGav } from "@/lib/maven";
+import { formatRelativeTimestamp, formatCacheExpiry } from "@/lib/cache-time";
+import type { Artifact } from "@/types";
+import type { UpsertScanConfigRequest } from "@/types/security";
+import { SbomTabContent } from "./sbom-tab-content";
+import { SecurityTabContent } from "./security-tab-content";
+import { HealthTabContent } from "./health-tab-content";
+import { NotificationsTabContent } from "./notifications-tab-content";
+import { VirtualMembersPanel } from "./virtual-members-panel";
+import { PackagesTabContent } from "./packages-tab-content";
+import {
+  ArtifactBrowserToggle,
+  supportsGrouping,
+  type ArtifactViewMode,
+} from "./artifact-browser-toggle";
+import { MavenComponentList } from "./maven-component-list";
+import { DockerTagList } from "./docker-tag-list";
+import { QuarantineBadge } from "@/components/common/quarantine-badge";
+import { QuarantineBanner } from "@/components/common/quarantine-banner";
+import { RepoSettingsTab } from "./repo-settings-tab";
+import { formatBytes, REPO_TYPE_COLORS } from "@/lib/utils";
+import { useAuth } from "@/providers/auth-provider";
+import { useSystemConfig } from "@/providers/system-config-provider";
+import { toast } from "sonner";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  Breadcrumb,
+  BreadcrumbList,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbSeparator,
+  BreadcrumbPage,
+} from "@/components/ui/breadcrumb";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import {
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+} from "@/components/ui/tooltip";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+
+import { DataTable, type DataTableColumn } from "@/components/common/data-table";
+import { CopyButton } from "@/components/common/copy-button";
+import { FileUpload } from "@/components/common/file-upload";
+
+interface RepoDetailContentProps {
+  repoKey: string;
+  standalone?: boolean;
+}
+
+export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailContentProps) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const queryClient = useQueryClient();
+  const { isAuthenticated, user } = useAuth();
+  const { config: systemConfig } = useSystemConfig();
+
+  // artifact search / pagination
+  const [searchQuery, setSearchQuery] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+
+  // Grouped vs flat artifact-browser view (issues #254, #330).  The URL
+  // `?view=flat|grouped` query param is the source of truth so the choice
+  // survives a refresh and is shareable.  Absence falls back to the
+  // per-format default.
+  const urlView = searchParams.get("view");
+  const viewModeOverride: ArtifactViewMode | null =
+    urlView === "flat" || urlView === "grouped" ? urlView : null;
+
+  // artifact detail dialog
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null);
+
+  // Polite live region for destructive-action outcomes (delete / cache
+  // invalidate). Toasts alone are not reliably announced by screen readers,
+  // so the result is also written here. Kept separate from the view-mode
+  // status region below, whose content is derived from `viewMode`.
+  const [actionAnnounce, setActionAnnounce] = useState("");
+
+  // security form local state
+  const [secForm, setSecForm] = useState<UpsertScanConfigRequest | null>(null);
+
+  // --- queries ---
+  const { data: repository, isLoading: repoLoading } = useQuery({
+    queryKey: ["repository", repoKey],
+    queryFn: () => repositoriesApi.get(repoKey),
+    enabled: !!repoKey,
+  });
+
+  const repoFormat = repository?.format;
+  // Derive effective view mode: explicit user choice wins; otherwise default
+  // to `grouped` for formats that support grouping.
+  const viewMode: ArtifactViewMode =
+    viewModeOverride ??
+    (repoFormat && supportsGrouping(repoFormat) ? "grouped" : "flat");
+  // Server-side grouping is currently only Maven/Gradle (#254).  Docker
+  // grouping (#330) is performed client-side over the flat artifact list.
+  const useServerGrouping =
+    viewMode === "grouped" &&
+    (repoFormat === "maven" || repoFormat === "gradle");
+  const isDockerGrouped = viewMode === "grouped" && repoFormat === "docker";
+  // For Docker grouping we need all artifacts on one page so the client
+  // aggregation sees everything.  Bound by a high cap to avoid runaway
+  // responses on huge registries.
+  const effectivePageSize = isDockerGrouped ? 500 : pageSize;
+  const effectivePage = isDockerGrouped ? 1 : page;
+
+  const handleViewModeChange = useCallback(
+    (next: ArtifactViewMode) => {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("view", next);
+      // `replace` avoids polluting browser history with each toggle.
+      // `scroll: false` keeps the user anchored on the artifacts tab.
+      router.replace(`?${params.toString()}`, { scroll: false });
+      setPage(1);
+    },
+    [router, searchParams],
+  );
+
+  const { data: artifactsData, isLoading: artifactsLoading } = useQuery({
+    queryKey: [
+      "artifacts",
+      repoKey,
+      searchQuery,
+      effectivePage,
+      effectivePageSize,
+      useServerGrouping ? "grouped:maven" : "flat",
+    ],
+    queryFn: () =>
+      artifactsApi.listGrouped(repoKey, {
+        q: searchQuery || undefined,
+        per_page: effectivePageSize,
+        page: effectivePage,
+        ...(useServerGrouping ? { group_by: "maven_component" as const } : {}),
+      }),
+    enabled: !!repoKey,
+  });
+
+  const { data: repoSecurity, isLoading: securityLoading } = useQuery({
+    queryKey: ["repository-security", repoKey],
+    queryFn: () => securityApi.getRepoSecurity(repoKey),
+    enabled: !!repoKey && !!user?.is_admin,
+  });
+
+  // initialise security form from fetched data
+  const securityDefaults: UpsertScanConfigRequest = {
+    scan_enabled: repoSecurity?.config?.scan_enabled ?? false,
+    scan_on_upload: repoSecurity?.config?.scan_on_upload ?? true,
+    scan_on_proxy: repoSecurity?.config?.scan_on_proxy ?? false,
+    block_on_policy_violation: repoSecurity?.config?.block_on_policy_violation ?? false,
+    severity_threshold: repoSecurity?.config?.severity_threshold ?? "high",
+  };
+  const currentSecForm = secForm ?? securityDefaults;
+
+  // --- mutations ---
+  const deleteMutation = useMutation({
+    mutationFn: (path: string) => artifactsApi.delete(repoKey, path),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["artifacts", repoKey] });
+      queryClient.invalidateQueries({ queryKey: ["repository", repoKey] });
+      setDetailOpen(false);
+      setSelectedArtifact(null);
+      toast.success("Artifact deleted");
+      setActionAnnounce("Artifact deleted.");
+    },
+    onError: mutationErrorToast("Failed to delete artifact"),
+  });
+
+  const scanArtifactMutation = useMutation({
+    mutationFn: (artifactId: string) =>
+      securityApi.triggerScan({ artifact_id: artifactId }),
+    onSuccess: (res) => {
+      toast.success(`Scan queued for ${res.artifacts_queued} artifact(s).`);
+    },
+    onError: mutationErrorToast("Failed to trigger scan"),
+  });
+
+  // Invalidate a single cached entry on a Remote (proxy) repository
+  // (artifact-keeper#1539 / artifact-keeper-web#446). Backend rejects this on
+  // non-Remote repos with 400, but we also gate the button below on
+  // `repository.repo_type === "remote"` so the operation is never offered
+  // for repos without a cache.
+  const invalidateCacheMutation = useMutation({
+    mutationFn: (path: string) => artifactsApi.invalidateCache(repoKey, path),
+    onSuccess: () => {
+      // Drop the artifacts list and repo summary from the cache so the next
+      // fetch goes back to upstream (the underlying download endpoint will
+      // re-populate the proxy cache on the next access).
+      queryClient.invalidateQueries({ queryKey: ["artifacts", repoKey] });
+      queryClient.invalidateQueries({ queryKey: ["repository", repoKey] });
+      // The open dialog holds a stale copy of the artifact whose
+      // cache_cached_at / cache_expires_at fields no longer reflect reality.
+      // Close it rather than show outdated freshness fields; the artifacts
+      // list refetch above gives the operator the current state.
+      setDetailOpen(false);
+      setSelectedArtifact(null);
+      const message =
+        "Cache entry invalidated; next download will re-fetch from upstream.";
+      toast.success(message);
+      setActionAnnounce(message);
+    },
+    onError: mutationErrorToast("Failed to invalidate cache"),
+  });
+
+  const scanRepoMutation = useMutation({
+    mutationFn: () =>
+      securityApi.triggerScan({ repository_id: repository?.id }),
+    onSuccess: (res) => {
+      toast.success(`Scan queued for ${res.artifacts_queued} artifact(s).`);
+    },
+    onError: mutationErrorToast("Failed to trigger scan"),
+  });
+
+  const updateSecurityMutation = useMutation({
+    mutationFn: (values: UpsertScanConfigRequest) =>
+      securityApi.updateRepoSecurity(repoKey, values),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["repository-security", repoKey] });
+      setSecForm(null); // reset to refetched defaults
+      toast.success("Security settings saved");
+    },
+    onError: mutationErrorToast("Failed to save security settings"),
+  });
+
+  // --- handlers ---
+  const handleDownload = useCallback(
+    async (artifact: Artifact) => {
+      const url = artifactsApi.getDownloadUrl(repoKey, artifact.path);
+      try {
+        const ticket = await artifactsApi.createDownloadTicket(repoKey, artifact.path);
+        const link = document.createElement("a");
+        link.href = `${url}?ticket=${ticket}`;
+        link.download = artifact.name;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } catch {
+        // Fallback: try without ticket (backend may allow cookie auth)
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = artifact.name;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      }
+    },
+    [repoKey]
+  );
+
+  const handleUpload = useCallback(
+    async (file: File, path?: string) => {
+      await artifactsApi.upload(repoKey, file, path);
+      queryClient.invalidateQueries({ queryKey: ["artifacts", repoKey] });
+      queryClient.invalidateQueries({ queryKey: ["repository", repoKey] });
+    },
+    [repoKey, queryClient]
+  );
+
+  const handleChunkedComplete = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ["artifacts", repoKey] });
+    queryClient.invalidateQueries({ queryKey: ["repository", repoKey] });
+  }, [repoKey, queryClient]);
+
+  const showDetail = useCallback((artifact: Artifact) => {
+    setSelectedArtifact(artifact);
+    setDetailOpen(true);
+  }, []);
+
+  // Grouped (Maven) view only knows a file's path, not its full Artifact
+  // record.  Fetch the detail on demand so clicking a file row inside a GAV
+  // group opens the same dialog as the flat list (issues #444, #445).
+  const showDetailByPath = useCallback(
+    async (filePath: string, filename: string) => {
+      try {
+        const artifact = await artifactsApi.get(repoKey, filePath);
+        setSelectedArtifact(artifact);
+        setDetailOpen(true);
+      } catch {
+        toast.error(`Could not load details for ${filename}`);
+      }
+    },
+    [repoKey],
+  );
+
+  // --- artifact columns ---
+  const artifactColumns: DataTableColumn<Artifact>[] = [
+    {
+      id: "name",
+      header: "Name",
+      accessor: (a) => a.name,
+      sortable: true,
+      cell: (a) => (
+        <div className="flex items-center gap-2">
+          <button
+            className="flex items-center gap-2 text-sm font-medium text-primary hover:underline"
+            onClick={(e) => {
+              e.stopPropagation();
+              showDetail(a);
+            }}
+          >
+            <FileIcon className="size-4 text-muted-foreground" />
+            {a.name}
+          </button>
+          {isActivelyQuarantined(a) && (
+            <QuarantineBadge
+              reason={a.quarantine_reason}
+              quarantineUntil={a.quarantine_until}
+            />
+          )}
+        </div>
+      ),
+    },
+    {
+      id: "path",
+      header: "Path",
+      accessor: (a) => a.path,
+      cell: (a) => (
+        <code className="text-xs text-muted-foreground max-w-[200px] truncate block">
+          {a.path}
+        </code>
+      ),
+    },
+    {
+      id: "version",
+      header: "Version",
+      accessor: (a) => a.version ?? "",
+      cell: (a) =>
+        a.version ? (
+          <Badge variant="outline" className="text-xs font-normal">
+            {a.version}
+          </Badge>
+        ) : (
+          <span className="text-xs text-muted-foreground">-</span>
+        ),
+    },
+    {
+      id: "size",
+      header: "Size",
+      accessor: (a) => a.size_bytes,
+      sortable: true,
+      cell: (a) => (
+        <span className="text-sm text-muted-foreground">
+          {formatBytes(a.size_bytes)}
+        </span>
+      ),
+    },
+    {
+      id: "downloads",
+      header: "Downloads",
+      accessor: (a) => a.download_count,
+      sortable: true,
+      cell: (a) => (
+        <span className="text-sm text-muted-foreground">
+          {a.download_count.toLocaleString()}
+        </span>
+      ),
+    },
+    {
+      id: "created",
+      header: "Created",
+      accessor: (a) => a.created_at,
+      sortable: true,
+      cell: (a) => (
+        <span className="text-sm text-muted-foreground">
+          {new Date(a.created_at).toLocaleDateString()}
+        </span>
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      cell: (a) => (
+        <div
+          className="flex items-center gap-1 justify-end"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={() => showDetail(a)}
+              >
+                <Info className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Details</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={() => handleDownload(a)}
+              >
+                <Download className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Download</TooltipContent>
+          </Tooltip>
+          {user?.is_admin && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={() => scanArtifactMutation.mutate(a.id)}
+                  disabled={scanArtifactMutation.isPending}
+                >
+                  <Shield className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Scan</TooltipContent>
+            </Tooltip>
+          )}
+          {isAuthenticated && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="text-destructive hover:text-destructive"
+                  onClick={() => deleteMutation.mutate(a.path)}
+                >
+                  <Trash2 className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Delete</TooltipContent>
+            </Tooltip>
+          )}
+        </div>
+      ),
+    },
+  ];
+
+  // --- loading / not found ---
+  if (repoLoading) {
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-5 w-48" />
+        <Skeleton className="h-8 w-64" />
+        <div className="grid grid-cols-3 gap-4">
+          <Skeleton className="h-20" />
+          <Skeleton className="h-20" />
+          <Skeleton className="h-20" />
+        </div>
+        <Skeleton className="h-64" />
+      </div>
+    );
+  }
+
+  if (!repository) {
+    return (
+      <div className="flex flex-col items-center justify-center py-24 text-muted-foreground">
+        <p className="text-lg font-medium">Repository not found</p>
+        <Button
+          variant="outline"
+          className="mt-4"
+          onClick={() => router.push("/repositories")}
+        >
+          Back to Repositories
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header - conditional on standalone */}
+      {standalone ? (
+        <>
+          {/* Breadcrumb */}
+          <Breadcrumb>
+            <BreadcrumbList>
+              <BreadcrumbItem>
+                <BreadcrumbLink href="/repositories">Repositories</BreadcrumbLink>
+              </BreadcrumbItem>
+              <BreadcrumbSeparator />
+              <BreadcrumbItem>
+                <BreadcrumbPage>{repository.key}</BreadcrumbPage>
+              </BreadcrumbItem>
+            </BreadcrumbList>
+          </Breadcrumb>
+
+          {/* Repo metadata header */}
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => router.push("/repositories")}
+              >
+                <ArrowLeft className="size-4" />
+              </Button>
+              <h1 className="text-2xl font-semibold tracking-tight">
+                {repository.name}
+              </h1>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="secondary" className="text-xs">
+                {repository.format.toUpperCase()}
+              </Badge>
+              <span
+                className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${REPO_TYPE_COLORS[repository.repo_type] ?? ""}`}
+              >
+                {repository.repo_type}
+              </span>
+              <Badge
+                variant={repository.is_public ? "outline" : "secondary"}
+                className="text-xs font-normal"
+              >
+                {repository.is_public ? "Public" : "Private"}
+              </Badge>
+              <span className="text-sm text-muted-foreground ml-2">
+                {formatBytes(repository.storage_used_bytes)} used
+              </span>
+            </div>
+
+            {repository.description && (
+              <p className="text-sm text-muted-foreground max-w-2xl">
+                {repository.description}
+              </p>
+            )}
+          </div>
+        </>
+      ) : (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <h2 className="text-lg font-semibold tracking-tight">{repository.name}</h2>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon-xs" asChild>
+                  <a href={`/repositories/${repoKey}`} target="_blank" rel="noopener noreferrer">
+                    <ExternalLink className="size-3.5" />
+                  </a>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Open in new tab</TooltipContent>
+            </Tooltip>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="secondary" className="text-xs">
+              {repository.format.toUpperCase()}
+            </Badge>
+            <span
+              className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${REPO_TYPE_COLORS[repository.repo_type] ?? ""}`}
+            >
+              {repository.repo_type}
+            </span>
+            <Badge
+              variant={repository.is_public ? "outline" : "secondary"}
+              className="text-xs font-normal"
+            >
+              {repository.is_public ? "Public" : "Private"}
+            </Badge>
+            <span className="text-sm text-muted-foreground ml-2">
+              {formatBytes(repository.storage_used_bytes)} used
+            </span>
+          </div>
+          {repository.description && (
+            <p className="text-sm text-muted-foreground max-w-2xl">{repository.description}</p>
+          )}
+        </div>
+      )}
+
+      {/* Tabs */}
+      <Tabs defaultValue="artifacts">
+        <TabsList variant="line">
+          <TabsTrigger value="artifacts">Artifacts</TabsTrigger>
+          <TabsTrigger value="packages">
+            <PackageIcon className="size-3.5 mr-1" />
+            Packages
+          </TabsTrigger>
+          {isAuthenticated && <TabsTrigger value="upload">Upload</TabsTrigger>}
+          {repository.repo_type === "virtual" && (
+            <TabsTrigger value="members">
+              <Layers className="size-3.5 mr-1" />
+              Members
+            </TabsTrigger>
+          )}
+          {user?.is_admin && (
+            <TabsTrigger value="security">
+              <Shield className="size-3.5 mr-1" />
+              Security
+            </TabsTrigger>
+          )}
+          {user?.is_admin && (
+            <TabsTrigger value="notifications">
+              <Bell className="size-3.5 mr-1" />
+              Notifications
+            </TabsTrigger>
+          )}
+          {user?.is_admin && (
+            <TabsTrigger value="settings">
+              <Settings className="size-3.5 mr-1" />
+              Settings
+            </TabsTrigger>
+          )}
+        </TabsList>
+
+        {/* --- Artifacts Tab --- */}
+        <TabsContent value="artifacts" className="mt-4 space-y-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="relative max-w-sm flex-1">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
+              <Input
+                placeholder="Search artifacts..."
+                className="pl-8"
+                value={searchQuery}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setPage(1);
+                }}
+              />
+            </div>
+            {repoFormat && supportsGrouping(repoFormat) && (
+              <ArtifactBrowserToggle
+                value={viewMode}
+                onChange={handleViewModeChange}
+                format={repoFormat}
+              />
+            )}
+            {user?.is_admin && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => scanRepoMutation.mutate()}
+                disabled={scanRepoMutation.isPending}
+              >
+                <Shield className="size-4" />
+                {scanRepoMutation.isPending ? "Scanning..." : "Scan All"}
+              </Button>
+            )}
+          </div>
+
+          {/*
+            M4: SR users get an announcement when the toggle changes the
+            view mode.  `role=status` + `aria-live=polite` queues the
+            update without interrupting current speech, and `sr-only`
+            keeps it visually invisible.
+          */}
+          <div role="status" aria-live="polite" className="sr-only">
+            {viewMode === "grouped"
+              ? `Showing grouped ${repoFormat === "docker" ? "tag" : "component"} view`
+              : "Showing flat list view"}
+          </div>
+
+          {/* Outcome announcements for destructive actions (delete / cache
+              invalidate). Polite so it does not interrupt; sr-only because the
+              same text is shown visually via toast. */}
+          <div role="status" aria-live="polite" className="sr-only">
+            {actionAnnounce}
+          </div>
+
+          {useServerGrouping ? (
+            <MavenComponentList
+              components={artifactsData?.components ?? []}
+              loading={artifactsLoading}
+              total={artifactsData?.pagination?.total}
+              page={page}
+              pageSize={pageSize}
+              onPageChange={setPage}
+              onPageSizeChange={(s) => {
+                setPageSize(s);
+                setPage(1);
+              }}
+              onFileSelect={showDetailByPath}
+              emptyMessage="No Maven components could be grouped — switch to flat view to see raw files."
+            />
+          ) : isDockerGrouped ? (
+            <DockerTagList
+              artifacts={artifactsData?.items ?? []}
+              loading={artifactsLoading}
+              onTagClick={showDetail}
+              onScan={
+                user?.is_admin
+                  ? (manifest) => scanArtifactMutation.mutate(manifest.id)
+                  : undefined
+              }
+              scanPending={scanArtifactMutation.isPending}
+            />
+          ) : (
+            <DataTable
+              columns={artifactColumns}
+              data={artifactsData?.items ?? []}
+              total={artifactsData?.pagination?.total}
+              page={page}
+              pageSize={pageSize}
+              onPageChange={setPage}
+              onPageSizeChange={(s) => {
+                setPageSize(s);
+                setPage(1);
+              }}
+              loading={artifactsLoading}
+              emptyMessage="No artifacts in this repository."
+              rowKey={(a) => a.id}
+              onRowClick={showDetail}
+            />
+          )}
+        </TabsContent>
+
+        {/* --- Packages Tab --- */}
+        <TabsContent value="packages" className="mt-4">
+          <PackagesTabContent
+            repositoryKey={repoKey}
+            repositoryFormat={repository.format}
+          />
+        </TabsContent>
+
+        {/* --- Upload Tab --- */}
+        {isAuthenticated && (
+          <TabsContent value="upload" className="mt-4">
+            <div className="max-w-lg">
+              <h3 className="text-sm font-medium mb-4">
+                Upload an artifact to {repository.key}
+              </h3>
+              <FileUpload
+                onUpload={handleUpload}
+                showPathInput
+                repositoryKey={repoKey}
+                onChunkedComplete={handleChunkedComplete}
+                maxUploadSizeBytes={systemConfig.max_upload_size_bytes}
+              />
+            </div>
+          </TabsContent>
+        )}
+
+        {/* --- Members Tab (Virtual Repos) --- */}
+        {repository.repo_type === "virtual" && (
+          <TabsContent value="members" className="mt-4">
+            <VirtualMembersPanel repository={repository} />
+          </TabsContent>
+        )}
+
+        {/* --- Security Tab --- */}
+        {user?.is_admin && (
+          <TabsContent value="security" className="mt-4">
+            {securityLoading ? (
+              <div className="space-y-3 max-w-md">
+                <Skeleton className="h-8 w-full" />
+                <Skeleton className="h-8 w-full" />
+                <Skeleton className="h-8 w-full" />
+              </div>
+            ) : (
+              <form
+                className="space-y-5 max-w-md"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  updateSecurityMutation.mutate(currentSecForm);
+                }}
+              >
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="sec-enabled">Enable Scanning</Label>
+                  <Switch
+                    id="sec-enabled"
+                    checked={currentSecForm.scan_enabled}
+                    onCheckedChange={(v) =>
+                      setSecForm({ ...currentSecForm, scan_enabled: v })
+                    }
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="sec-upload">Scan on Upload</Label>
+                  <Switch
+                    id="sec-upload"
+                    checked={currentSecForm.scan_on_upload}
+                    onCheckedChange={(v) =>
+                      setSecForm({ ...currentSecForm, scan_on_upload: v })
+                    }
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="sec-proxy">Scan on Proxy</Label>
+                  <Switch
+                    id="sec-proxy"
+                    checked={currentSecForm.scan_on_proxy}
+                    onCheckedChange={(v) =>
+                      setSecForm({ ...currentSecForm, scan_on_proxy: v })
+                    }
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="sec-block">Block on Violation</Label>
+                  <Switch
+                    id="sec-block"
+                    checked={currentSecForm.block_on_policy_violation}
+                    onCheckedChange={(v) =>
+                      setSecForm({
+                        ...currentSecForm,
+                        block_on_policy_violation: v,
+                      })
+                    }
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Severity Threshold</Label>
+                  <Select
+                    value={currentSecForm.severity_threshold}
+                    onValueChange={(v) =>
+                      setSecForm({ ...currentSecForm, severity_threshold: v })
+                    }
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="critical">Critical</SelectItem>
+                      <SelectItem value="high">High</SelectItem>
+                      <SelectItem value="medium">Medium</SelectItem>
+                      <SelectItem value="low">Low</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <Button
+                  type="submit"
+                  disabled={updateSecurityMutation.isPending}
+                >
+                  {updateSecurityMutation.isPending
+                    ? "Saving..."
+                    : "Save Settings"}
+                </Button>
+              </form>
+            )}
+          </TabsContent>
+        )}
+
+        {/* --- Notifications Tab --- */}
+        {user?.is_admin && (
+          <TabsContent value="notifications" className="mt-4">
+            <NotificationsTabContent repositoryId={repository.id} />
+          </TabsContent>
+        )}
+
+        {/* --- Settings Tab --- */}
+        {user?.is_admin && (
+          <TabsContent value="settings" className="mt-4">
+            <RepoSettingsTab repository={repository} />
+          </TabsContent>
+        )}
+      </Tabs>
+
+      {/* --- Artifact Detail Dialog --- */}
+      <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
+        <DialogContent className="sm:max-w-3xl max-h-[85vh] overflow-hidden flex flex-col">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <FileIcon className="size-4" />
+              {selectedArtifact?.name ?? "Artifact Details"}
+            </DialogTitle>
+          </DialogHeader>
+          {selectedArtifact && isActivelyQuarantined(selectedArtifact) && (
+            <QuarantineBanner
+              reason={selectedArtifact.quarantine_reason}
+              quarantineUntil={selectedArtifact.quarantine_until}
+            />
+          )}
+          {selectedArtifact && (
+            <Tabs defaultValue="details" className="flex-1 overflow-hidden flex flex-col">
+              <TabsList variant="line" className="shrink-0">
+                <TabsTrigger value="details">
+                  <Info className="size-3.5 mr-1" />
+                  Details
+                </TabsTrigger>
+                <TabsTrigger value="sbom">
+                  <FileIcon className="size-3.5 mr-1" />
+                  SBOM
+                </TabsTrigger>
+                <TabsTrigger value="security">
+                  <Shield className="size-3.5 mr-1" />
+                  Security
+                </TabsTrigger>
+                <TabsTrigger value="health">
+                  <HeartPulse className="size-3.5 mr-1" />
+                  Health
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="details" className="flex-1 overflow-y-auto mt-4">
+                <div className="space-y-3 text-sm">
+                  <DetailRow label="Name" value={selectedArtifact.name} />
+                  <DetailRow label="Path" value={selectedArtifact.path} copy />
+                  {selectedArtifact.version && (
+                    <DetailRow label="Version" value={selectedArtifact.version} />
+                  )}
+                  <DetailRow
+                    label="Size"
+                    value={`${formatBytes(selectedArtifact.size_bytes)} (${selectedArtifact.size_bytes.toLocaleString()} bytes)`}
+                  />
+                  <DetailRow
+                    label="Content Type"
+                    value={selectedArtifact.content_type}
+                  />
+                  <DetailRow
+                    label="Downloads"
+                    value={selectedArtifact.download_count.toLocaleString()}
+                  />
+                  {isActivelyQuarantined(selectedArtifact) && (
+                    <>
+                      <DetailRow
+                        label="Quarantine"
+                        value={selectedArtifact.quarantine_reason || "Active"}
+                      />
+                      {selectedArtifact.quarantine_until && (
+                        <DetailRow
+                          label="Quarantine Until"
+                          value={new Date(selectedArtifact.quarantine_until).toLocaleString()}
+                        />
+                      )}
+                    </>
+                  )}
+                  <DetailRow
+                    label="Created"
+                    value={new Date(selectedArtifact.created_at).toLocaleString()}
+                  />
+                  {repository.repo_type === "remote" &&
+                    selectedArtifact.cache_cached_at && (
+                      <DetailRow
+                        label="Cached"
+                        value={formatRelativeTimestamp(
+                          selectedArtifact.cache_cached_at
+                        )}
+                        title={new Date(
+                          selectedArtifact.cache_cached_at
+                        ).toLocaleString()}
+                      />
+                    )}
+                  {repository.repo_type === "remote" &&
+                    selectedArtifact.cache_expires_at && (
+                      <DetailRow
+                        label="Cache expires"
+                        value={formatCacheExpiry(
+                          selectedArtifact.cache_expires_at
+                        )}
+                        title={new Date(
+                          selectedArtifact.cache_expires_at
+                        ).toLocaleString()}
+                      />
+                    )}
+                  <DetailRow
+                    label="SHA-256"
+                    value={selectedArtifact.checksum_sha256}
+                    copy
+                    mono
+                  />
+                  <DetailRow
+                    label="Download URL"
+                    value={artifactsApi.getAbsoluteDownloadUrl(repoKey, selectedArtifact.path)}
+                    copy
+                    mono
+                  />
+                  {(repoFormat === "maven" || repoFormat === "gradle") && (
+                    <MavenGavSection path={selectedArtifact.path} />
+                  )}
+                  {selectedArtifact.metadata &&
+                    Object.keys(selectedArtifact.metadata).length > 0 && (
+                      <div>
+                        <p className="text-xs font-medium text-muted-foreground mb-1">
+                          Metadata
+                        </p>
+                        <pre className="rounded-md bg-muted p-3 text-xs overflow-auto max-h-40">
+                          {JSON.stringify(selectedArtifact.metadata, null, 2)}
+                        </pre>
+                      </div>
+                    )}
+                </div>
+              </TabsContent>
+
+              <TabsContent value="sbom" className="flex-1 overflow-y-auto mt-4">
+                <SbomTabContent artifact={selectedArtifact} />
+              </TabsContent>
+
+              <TabsContent value="security" className="flex-1 overflow-y-auto mt-4">
+                <SecurityTabContent artifact={selectedArtifact} />
+              </TabsContent>
+
+              <TabsContent value="health" className="flex-1 overflow-y-auto mt-4">
+                <HealthTabContent artifact={selectedArtifact} />
+              </TabsContent>
+            </Tabs>
+          )}
+          <DialogFooter className="shrink-0">
+            <Button
+              variant="outline"
+              onClick={() => setDetailOpen(false)}
+            >
+              Close
+            </Button>
+            {selectedArtifact && (
+              <>
+                {user?.is_admin && (
+                  <Button
+                    variant="outline"
+                    onClick={() => scanArtifactMutation.mutate(selectedArtifact.id)}
+                    disabled={scanArtifactMutation.isPending}
+                  >
+                    <Shield className="size-4" />
+                    {scanArtifactMutation.isPending ? "Scanning..." : "Scan"}
+                  </Button>
+                )}
+                <Button
+                  variant="destructive"
+                  onClick={() => {
+                    if (selectedArtifact) deleteMutation.mutate(selectedArtifact.path);
+                  }}
+                  disabled={deleteMutation.isPending}
+                >
+                  <Trash2 className="size-4" />
+                  Delete
+                </Button>
+                {repository.repo_type === "remote" && (
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <Button
+                        variant="outline"
+                        disabled={invalidateCacheMutation.isPending}
+                        title="Evict this artifact from the proxy cache; next download re-fetches from upstream"
+                      >
+                        <RotateCcw className="size-4" />
+                        {invalidateCacheMutation.isPending
+                          ? "Invalidating..."
+                          : "Invalidate cache"}
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>Invalidate cache entry?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                          This evicts{" "}
+                          <span className="font-medium">
+                            {selectedArtifact.name}
+                          </span>{" "}
+                          from the proxy cache. The next download re-fetches it
+                          from upstream, which may be slower and could return a
+                          different artifact if upstream has changed.
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction
+                          onClick={() => {
+                            if (selectedArtifact) {
+                              invalidateCacheMutation.mutate(
+                                selectedArtifact.path
+                              );
+                            }
+                          }}
+                        >
+                          Invalidate
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                )}
+                <Button onClick={() => selectedArtifact && handleDownload(selectedArtifact)}>
+                  <Download className="size-4" />
+                  Download
+                </Button>
+              </>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+// -- detail row helper --
+
+/**
+ * Maven GAV coordinates plus a copy/paste pom.xml dependency snippet, derived
+ * from the artifact path. Shown in the artifact detail view for maven/gradle
+ * repositories so users can identify the GAV and reuse it. (issue #442)
+ */
+function MavenGavSection({ path }: { path: string }) {
+  const gav = parseMavenGav(path);
+  if (!gav) return null;
+  const snippet = buildPomDependencySnippet(gav);
+  return (
+    <div data-testid="maven-gav-section" className="space-y-3">
+      <DetailRow label="Group ID" value={gav.groupId} copy mono />
+      <DetailRow label="Artifact ID" value={gav.artifactId} copy mono />
+      <DetailRow label="Version" value={gav.version} copy mono />
+      <div>
+        <div className="mb-1 flex items-center justify-between">
+          <p className="text-xs font-medium text-muted-foreground">
+            pom.xml dependency
+          </p>
+          <CopyButton value={snippet} />
+        </div>
+        <pre
+          data-testid="maven-pom-snippet"
+          className="overflow-auto rounded-md bg-muted p-3 text-xs"
+        >
+          {snippet}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+function DetailRow({
+  label,
+  value,
+  copy,
+  mono,
+  title,
+}: {
+  label: string;
+  value: string;
+  copy?: boolean;
+  mono?: boolean;
+  /**
+   * Override the hover-tooltip text. Defaults to `value` when omitted.
+   * Useful for rows where the visible text is a derived/abbreviated form
+   * (e.g. "in 4 hours") and the full ISO-8601 timestamp belongs in the
+   * tooltip rather than the visible cell — see the cache_cached_at /
+   * cache_expires_at rows added in #449.
+   */
+  title?: string;
+}) {
+  return (
+    <div className="grid grid-cols-[100px_1fr] gap-2 items-start">
+      <span className="text-muted-foreground text-xs font-medium pt-0.5">{label}</span>
+      <div className="flex items-center gap-1 min-w-0">
+        <span
+          className={`break-all ${mono ? "font-mono text-xs" : ""}`}
+          title={title ?? value}
+        >
+          {value}
+        </span>
+        {copy && <CopyButton value={value} />}
+      </div>
+    </div>
+  );
+}

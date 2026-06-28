@@ -1,0 +1,1153 @@
+"use client";
+
+import { useState, useCallback, useMemo } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
+import {
+  Search as SearchIcon,
+  Download,
+  LayoutGrid,
+  LayoutList,
+  Plus,
+  Trash2,
+  Loader2,
+  Hash,
+  Package,
+  Tag,
+  FileSearch,
+  ChevronLeft,
+  ChevronRight,
+  ArrowDownWideNarrow,
+  ArrowUpWideNarrow,
+  X,
+} from "lucide-react";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent } from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { searchApi, type SearchResult } from "@/lib/api/search";
+import { artifactsApi } from "@/lib/api/artifacts";
+import { repositoriesApi } from "@/lib/api/repositories";
+import { buildMavenSearchQuery } from "@/lib/maven";
+import { QuarantineBadge } from "@/components/common/quarantine-badge";
+import { formatBytes as formatBytesUtil, formatDate } from "@/lib/utils";
+
+// ---- Types ----
+
+type SearchTab = "package" | "property" | "gavc" | "checksum";
+type ViewMode = "list" | "grid";
+// Sort fields accepted by the OpenSearch-backed /search/advanced endpoint.
+// `relevance` maps to no explicit sort_by so the backend returns its own
+// relevance ranking (the default and most useful order for a text query).
+type SortField =
+  | "relevance"
+  | "name"
+  | "created_at"
+  | "size_bytes"
+  | "download_count";
+type SortOrder = "asc" | "desc";
+
+interface PropertyFilter {
+  id: string;
+  key: string;
+  value: string;
+}
+
+let nextFilterId = 0;
+function makeFilterId() {
+  return `pf-${++nextFilterId}`;
+}
+
+interface PackageSearchValues {
+  name: string;
+  version: string;
+  repository: string;
+  format: string;
+}
+
+interface GavcSearchValues {
+  groupId: string;
+  artifactId: string;
+  version: string;
+  classifier: string;
+  extension: string;
+}
+
+interface ChecksumSearchValues {
+  value: string;
+  type: "sha256" | "sha1" | "md5";
+}
+
+// ---- Helpers ----
+
+function formatBytes(bytes: number | undefined): string {
+  if (!bytes) return "--";
+  return formatBytesUtil(bytes);
+}
+
+// OpenSearch returns highlight snippets with matched terms wrapped in <em>
+// tags. Render them as React nodes (emphasized spans) instead of injecting
+// raw HTML, so the markup can never execute arbitrary content. Anything that
+// is not inside <em>...</em> is rendered as plain text.
+function renderHighlight(snippet: string, keyPrefix: string) {
+  const parts = snippet.split(/(<em>.*?<\/em>)/g);
+  return parts
+    .filter((p) => p.length > 0)
+    .map((part, i) => {
+      const match = part.match(/^<em>(.*?)<\/em>$/);
+      if (match) {
+        return (
+          <mark
+            key={`${keyPrefix}-${i}`}
+            className="bg-transparent font-semibold text-foreground"
+          >
+            {match[1]}
+          </mark>
+        );
+      }
+      return <span key={`${keyPrefix}-${i}`}>{part}</span>;
+    });
+}
+
+const FORMAT_OPTIONS = [
+  "maven",
+  "npm",
+  "pypi",
+  "docker",
+  "helm",
+  "cargo",
+  "nuget",
+  "go",
+  "rubygems",
+  "debian",
+  "rpm",
+  "protobuf",
+  "generic",
+] as const;
+
+// ---- Main Content ----
+
+export function SearchContent() {
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
+  // URL state
+  const urlQuery = searchParams.get("q") || "";
+  const urlTab = (searchParams.get("tab") as SearchTab) || "package";
+
+  // Local state
+  const [activeTab, setActiveTab] = useState<SearchTab>(urlTab);
+  const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const [sortField, setSortField] = useState<SortField>("relevance");
+  const [sortOrder, setSortOrder] = useState<SortOrder>("desc");
+  const [page, setPage] = useState(1);
+  const pageSize = 20;
+
+  // Active facet filters applied on top of the form query. Selecting a facet
+  // chip narrows results to that format/repository and re-runs the search.
+  const [facetFormat, setFacetFormat] = useState<string | null>(null);
+  const [facetRepository, setFacetRepository] = useState<string | null>(null);
+
+  // Per-tab form state
+  const [packageValues, setPackageValues] = useState<PackageSearchValues>({
+    name: urlQuery,
+    version: "",
+    repository: "",
+    format: "",
+  });
+  const [propertyFilters, setPropertyFilters] = useState<PropertyFilter[]>([
+    { id: makeFilterId(), key: "", value: "" },
+  ]);
+  const [gavcValues, setGavcValues] = useState<GavcSearchValues>({
+    groupId: "",
+    artifactId: "",
+    version: "",
+    classifier: "",
+    extension: "",
+  });
+  const [checksumValues, setChecksumValues] = useState<ChecksumSearchValues>({
+    value: "",
+    type: "sha256",
+  });
+
+  // Track if search has been triggered
+  const [searchTriggered, setSearchTriggered] = useState(false);
+  const [searchKey, setSearchKey] = useState(0);
+
+  // Fetch repositories for select dropdown
+  const { data: reposData } = useQuery({
+    queryKey: ["repositories-list"],
+    queryFn: () => repositoriesApi.list({ per_page: 100 }),
+  });
+
+  const repositories = reposData?.items ?? [];
+
+  // Build search params based on active tab. `relevance` is the OpenSearch
+  // default ranking and is expressed by omitting sort_by, so the backend does
+  // not switch into an explicit field sort. Active facet chips override the
+  // matching form field (a selected format facet wins over the form's format).
+  const buildSearchParams = useCallback(() => {
+    const sort = sortField === "relevance" ? undefined : sortField;
+    const common = {
+      page,
+      per_page: pageSize,
+      sort_by: sort,
+      sort_order: sort ? sortOrder : undefined,
+      format: facetFormat ?? undefined,
+      repository_key: facetRepository ?? undefined,
+    };
+    switch (activeTab) {
+      case "package":
+        return {
+          ...common,
+          query: packageValues.name || undefined,
+          version: packageValues.version || undefined,
+          repository_key: facetRepository ?? (packageValues.repository || undefined),
+          format: facetFormat ?? (packageValues.format || undefined),
+        };
+      case "property": {
+        const queryParts = propertyFilters
+          .filter((f) => f.key && f.value)
+          .map((f) => `${f.key}:${f.value}`);
+        return {
+          ...common,
+          query: queryParts.length > 0 ? queryParts.join(" ") : undefined,
+        };
+      }
+      case "gavc": {
+        // The backend advanced-search endpoint matches a single full-text
+        // `query` against name + path + version; it does not filter on the
+        // separate `path`/`version` params. Maven GAV coordinates live in the
+        // artifact path, so fold the supplied fields into one query string and
+        // scope the search to the maven format. (issue #441)
+        const query = buildMavenSearchQuery({
+          groupId: gavcValues.groupId,
+          artifactId: gavcValues.artifactId,
+          version: gavcValues.version,
+          classifier: gavcValues.classifier,
+          extension: gavcValues.extension,
+        });
+        // Spread `common` so the GAVC tab honours the shared sort/facet
+        // handling (sort_by, sort_order, repository facet). The GAV fields are
+        // folded into a single full-text `query` and the search is scoped to
+        // maven; an explicit format facet still wins over that default.
+        return {
+          ...common,
+          query: query || undefined,
+          format: facetFormat ?? "maven",
+        };
+      }
+      case "checksum":
+        return null; // Checksum handled separately
+    }
+  }, [
+    activeTab,
+    packageValues,
+    propertyFilters,
+    gavcValues,
+    page,
+    pageSize,
+    sortField,
+    sortOrder,
+    facetFormat,
+    facetRepository,
+  ]);
+
+  // Main search query
+  const {
+    data: searchResults,
+    isLoading,
+    isFetching,
+  } = useQuery({
+    queryKey: [
+      "advanced-search",
+      searchKey,
+      activeTab,
+      page,
+      sortField,
+      sortOrder,
+      facetFormat,
+      facetRepository,
+    ],
+    queryFn: async () => {
+      if (activeTab === "checksum") {
+        if (!checksumValues.value) return null;
+        const artifacts = await searchApi.checksumSearch({
+          checksum: checksumValues.value,
+          algorithm: checksumValues.type,
+        });
+        return {
+          items: artifacts.map((a) => ({
+            id: a.id,
+            type: "artifact" as const,
+            name: a.name,
+            path: a.path,
+            repository_key: a.repository_key,
+            format: a.content_type,
+            version: a.version,
+            size_bytes: a.size_bytes,
+            created_at: a.created_at,
+          })),
+          pagination: {
+            page: 1,
+            per_page: artifacts.length,
+            total: artifacts.length,
+            total_pages: 1,
+          },
+          facets: { formats: [], repositories: [], content_types: [] },
+        };
+      }
+
+      const params = buildSearchParams();
+      if (!params) return null;
+
+      return searchApi.advancedSearch(params);
+    },
+    enabled: searchTriggered,
+  });
+
+  const totalResults = searchResults?.pagination?.total ?? 0;
+  const totalPages = searchResults?.pagination?.total_pages ?? 0;
+
+  // Update URL
+  const updateUrl = useCallback(
+    (tab: SearchTab) => {
+      const params = new URLSearchParams();
+      params.set("tab", tab);
+      if (tab === "package" && packageValues.name) {
+        params.set("q", packageValues.name);
+      }
+      router.replace(`/search?${params.toString()}`, { scroll: false });
+    },
+    [router, packageValues.name]
+  );
+
+  const handleSearch = useCallback(() => {
+    setPage(1);
+    setSearchTriggered(true);
+    setSearchKey((k) => k + 1);
+    updateUrl(activeTab);
+  }, [activeTab, updateUrl]);
+
+  const handleTabChange = useCallback(
+    (tab: string) => {
+      setActiveTab(tab as SearchTab);
+      setSearchTriggered(false);
+    },
+    []
+  );
+
+  const handleDownload = useCallback((result: SearchResult) => {
+    if (result.path && result.repository_key) {
+      const url = artifactsApi.getDownloadUrl(result.repository_key, result.path);
+      window.open(url, "_blank");
+    }
+  }, []);
+
+  // Property filter helpers
+  const addPropertyFilter = useCallback(() => {
+    setPropertyFilters((prev) => [...prev, { id: makeFilterId(), key: "", value: "" }]);
+  }, []);
+
+  const removePropertyFilter = useCallback((index: number) => {
+    setPropertyFilters((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const updatePropertyFilter = useCallback(
+    (index: number, field: "key" | "value", val: string) => {
+      setPropertyFilters((prev) =>
+        prev.map((f, i) => (i === index ? { ...f, [field]: val } : f))
+      );
+    },
+    []
+  );
+
+  const loading = isLoading || isFetching;
+
+  // Use the server's ordering directly. The OpenSearch backend already applies
+  // relevance ranking (or the requested sort_by + sort_order) across the full
+  // result set; re-sorting client-side only reorders the current page, which
+  // contradicts the server order and breaks once results span more than one
+  // page. So we render exactly what the backend returned.
+  const results: SearchResult[] = (searchResults?.items ?? []) as SearchResult[];
+  const facets = searchResults?.facets ?? {
+    formats: [],
+    repositories: [],
+    content_types: [],
+  };
+  const hasActiveFacets = facetFormat !== null || facetRepository !== null;
+
+  // Announce result-set changes to assistive tech. Sorting and facet filtering
+  // re-run the search and silently reorder/replace the list, which a screen
+  // reader would otherwise miss. (review fix #463)
+  const searchAnnouncement = useMemo(() => {
+    if (!searchTriggered || loading) return "";
+    const sortLabels: Record<SortField, string> = {
+      relevance: "relevance",
+      created_at: "date",
+      name: "name",
+      size_bytes: "size",
+      download_count: "downloads",
+    };
+    const parts = [
+      `${totalResults} ${totalResults === 1 ? "result" : "results"} found`,
+      `sorted by ${sortLabels[sortField]}${
+        sortField === "relevance" ? "" : ` ${sortOrder === "asc" ? "ascending" : "descending"}`
+      }`,
+    ];
+    if (facetFormat) parts.push(`filtered to format ${facetFormat}`);
+    if (facetRepository) parts.push(`filtered to repository ${facetRepository}`);
+    return `${parts.join(", ")}.`;
+  }, [
+    searchTriggered,
+    loading,
+    totalResults,
+    sortField,
+    sortOrder,
+    facetFormat,
+    facetRepository,
+  ]);
+
+  // Toggle a facet filter: selecting re-runs the search from page 1, clicking
+  // the active value again clears it.
+  const toggleFacet = useCallback(
+    (kind: "format" | "repository", value: string) => {
+      setPage(1);
+      setSearchKey((k) => k + 1);
+      if (kind === "format") {
+        setFacetFormat((cur) => (cur === value ? null : value));
+      } else {
+        setFacetRepository((cur) => (cur === value ? null : value));
+      }
+    },
+    []
+  );
+
+  const clearFacets = useCallback(() => {
+    setFacetFormat(null);
+    setFacetRepository(null);
+    setPage(1);
+    setSearchKey((k) => k + 1);
+  }, []);
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          Advanced Search
+        </h1>
+        <p className="text-sm text-muted-foreground mt-1">
+          Search across all repositories, packages, and artifacts
+        </p>
+      </div>
+
+      <Card className="py-0">
+        <CardContent className="p-6">
+          <Tabs value={activeTab} onValueChange={handleTabChange}>
+            <TabsList className="mb-6">
+              <TabsTrigger value="package" className="gap-1.5">
+                <Package className="size-3.5" />
+                Package
+              </TabsTrigger>
+              <TabsTrigger value="property" className="gap-1.5">
+                <Tag className="size-3.5" />
+                Property
+              </TabsTrigger>
+              <TabsTrigger value="gavc" className="gap-1.5">
+                <FileSearch className="size-3.5" />
+                GAVC
+              </TabsTrigger>
+              <TabsTrigger value="checksum" className="gap-1.5">
+                <Hash className="size-3.5" />
+                Checksum
+              </TabsTrigger>
+            </TabsList>
+
+            {/* Package Search Tab */}
+            <TabsContent value="package">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <label htmlFor="search-package-name" className="text-sm font-medium">Package Name</label>
+                  <Input
+                    id="search-package-name"
+                    placeholder="e.g., react, lodash"
+                    value={packageValues.name}
+                    onChange={(e) =>
+                      setPackageValues((v) => ({ ...v, name: e.target.value }))
+                    }
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="search-package-version" className="text-sm font-medium">Version</label>
+                  <Input
+                    id="search-package-version"
+                    placeholder="e.g., 1.0.0, ^2.0"
+                    value={packageValues.version}
+                    onChange={(e) =>
+                      setPackageValues((v) => ({
+                        ...v,
+                        version: e.target.value,
+                      }))
+                    }
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="search-package-repository" className="text-sm font-medium">Repository</label>
+                  <Select
+                    value={packageValues.repository}
+                    onValueChange={(val) =>
+                      setPackageValues((v) => ({
+                        ...v,
+                        repository: val === "__all__" ? "" : val,
+                      }))
+                    }
+                  >
+                    <SelectTrigger id="search-package-repository" className="w-full">
+                      <SelectValue placeholder="All repositories" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__all__">All repositories</SelectItem>
+                      {repositories.map((r) => (
+                        <SelectItem key={r.id} value={r.key}>
+                          {r.name} ({r.key})
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="search-package-format" className="text-sm font-medium">Format</label>
+                  <Select
+                    value={packageValues.format}
+                    onValueChange={(val) =>
+                      setPackageValues((v) => ({
+                        ...v,
+                        format: val === "__all__" ? "" : val,
+                      }))
+                    }
+                  >
+                    <SelectTrigger id="search-package-format" className="w-full">
+                      <SelectValue placeholder="All formats" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__all__">All formats</SelectItem>
+                      {FORMAT_OPTIONS.map((f) => (
+                        <SelectItem key={f} value={f}>
+                          {f}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </TabsContent>
+
+            {/* Property Search Tab */}
+            <TabsContent value="property">
+              <div className="space-y-3">
+                {propertyFilters.map((filter, index) => (
+                  <div key={filter.id} className="flex items-end gap-3">
+                    <div className="flex-1 space-y-1.5">
+                      <label htmlFor={`prop-key-${index}`} className="text-sm font-medium">
+                        Property Key
+                      </label>
+                      <Input
+                        id={`prop-key-${index}`}
+                        placeholder="e.g., build.number"
+                        value={filter.key}
+                        onChange={(e) =>
+                          updatePropertyFilter(index, "key", e.target.value)
+                        }
+                        onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                      />
+                    </div>
+                    <div className="flex-1 space-y-1.5">
+                      <label htmlFor={`prop-value-${index}`} className="text-sm font-medium">
+                        Property Value
+                      </label>
+                      <Input
+                        id={`prop-value-${index}`}
+                        placeholder="e.g., 42"
+                        value={filter.value}
+                        onChange={(e) =>
+                          updatePropertyFilter(index, "value", e.target.value)
+                        }
+                        onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                      />
+                    </div>
+                    {propertyFilters.length > 1 && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => removePropertyFilter(index)}
+                        className="shrink-0"
+                        aria-label="Remove filter"
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    )}
+                  </div>
+                ))}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={addPropertyFilter}
+                  className="gap-1.5"
+                >
+                  <Plus className="size-3.5" />
+                  Add filter
+                </Button>
+              </div>
+            </TabsContent>
+
+            {/* GAVC Search Tab */}
+            <TabsContent value="gavc">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <label htmlFor="search-gavc-group" className="text-sm font-medium">Group ID</label>
+                  <Input
+                    id="search-gavc-group"
+                    placeholder="e.g., org.apache.maven"
+                    value={gavcValues.groupId}
+                    onChange={(e) =>
+                      setGavcValues((v) => ({
+                        ...v,
+                        groupId: e.target.value,
+                      }))
+                    }
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="search-gavc-artifact" className="text-sm font-medium">Artifact ID</label>
+                  <Input
+                    id="search-gavc-artifact"
+                    placeholder="e.g., maven-core"
+                    value={gavcValues.artifactId}
+                    onChange={(e) =>
+                      setGavcValues((v) => ({
+                        ...v,
+                        artifactId: e.target.value,
+                      }))
+                    }
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="search-gavc-version" className="text-sm font-medium">Version</label>
+                  <Input
+                    id="search-gavc-version"
+                    placeholder="e.g., 3.9.0"
+                    value={gavcValues.version}
+                    onChange={(e) =>
+                      setGavcValues((v) => ({
+                        ...v,
+                        version: e.target.value,
+                      }))
+                    }
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="search-gavc-classifier" className="text-sm font-medium">Classifier</label>
+                  <Input
+                    id="search-gavc-classifier"
+                    placeholder="e.g., sources, javadoc"
+                    value={gavcValues.classifier}
+                    onChange={(e) =>
+                      setGavcValues((v) => ({
+                        ...v,
+                        classifier: e.target.value,
+                      }))
+                    }
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="search-gavc-extension" className="text-sm font-medium">Extension</label>
+                  <Input
+                    id="search-gavc-extension"
+                    placeholder="e.g., jar, pom, war"
+                    value={gavcValues.extension}
+                    onChange={(e) =>
+                      setGavcValues((v) => ({
+                        ...v,
+                        extension: e.target.value,
+                      }))
+                    }
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                  />
+                </div>
+              </div>
+            </TabsContent>
+
+            {/* Checksum Search Tab */}
+            <TabsContent value="checksum">
+              <div className="grid gap-4 sm:grid-cols-[1fr_200px]">
+                <div className="space-y-1.5">
+                  <label htmlFor="search-checksum-value" className="text-sm font-medium">Checksum Value</label>
+                  <Input
+                    id="search-checksum-value"
+                    placeholder="Enter SHA-256, SHA-1, or MD5 checksum"
+                    value={checksumValues.value}
+                    onChange={(e) =>
+                      setChecksumValues((v) => ({
+                        ...v,
+                        value: e.target.value,
+                      }))
+                    }
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                    className="font-mono text-xs"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="search-checksum-algorithm" className="text-sm font-medium">Algorithm</label>
+                  <Select
+                    value={checksumValues.type}
+                    onValueChange={(val) =>
+                      setChecksumValues((v) => ({
+                        ...v,
+                        type: val as "sha256" | "sha1" | "md5",
+                      }))
+                    }
+                  >
+                    <SelectTrigger id="search-checksum-algorithm" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="sha256">SHA-256</SelectItem>
+                      <SelectItem value="sha1">SHA-1</SelectItem>
+                      <SelectItem value="md5">MD5</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </TabsContent>
+
+            {/* Search button */}
+            <div className="mt-6 flex items-center gap-3">
+              <Button onClick={handleSearch} disabled={loading} className="gap-2">
+                {loading ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <SearchIcon className="size-4" />
+                )}
+                Search
+              </Button>
+            </div>
+          </Tabs>
+        </CardContent>
+      </Card>
+
+      {/* Results */}
+      {searchTriggered && (
+        <Card className="py-0">
+          <CardContent className="p-6">
+            {/* Announce result-set changes (count, sort, facets) to screen
+                readers, since sorting/filtering reorders the list silently. */}
+            <div
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              className="sr-only"
+              data-testid="search-results-announcement"
+            >
+              {searchAnnouncement}
+            </div>
+            {/* Results header */}
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <h2 className="text-lg font-semibold">Results</h2>
+                {!loading && (
+                  <span className="text-sm text-muted-foreground">
+                    {totalResults} {totalResults === 1 ? "result" : "results"} found
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {activeTab !== "checksum" && (
+                  <>
+                    <Select
+                      value={sortField}
+                      onValueChange={(val) => {
+                        setSortField(val as SortField);
+                        setSearchKey((k) => k + 1);
+                      }}
+                    >
+                      <SelectTrigger
+                        className="w-36"
+                        size="sm"
+                        aria-label="Sort by"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="relevance">Relevance</SelectItem>
+                        <SelectItem value="created_at">Date</SelectItem>
+                        <SelectItem value="name">Name</SelectItem>
+                        <SelectItem value="size_bytes">Size</SelectItem>
+                        <SelectItem value="download_count">Downloads</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      variant="outline"
+                      size="icon-sm"
+                      disabled={sortField === "relevance"}
+                      onClick={() => {
+                        setSortOrder((o) => (o === "desc" ? "asc" : "desc"));
+                        setSearchKey((k) => k + 1);
+                      }}
+                      aria-label={
+                        sortOrder === "desc"
+                          ? "Sort descending, switch to ascending"
+                          : "Sort ascending, switch to descending"
+                      }
+                    >
+                      {sortOrder === "desc" ? (
+                        <ArrowDownWideNarrow className="size-4" />
+                      ) : (
+                        <ArrowUpWideNarrow className="size-4" />
+                      )}
+                    </Button>
+                  </>
+                )}
+                <div className="flex items-center rounded-md border">
+                  <Button
+                    variant={viewMode === "list" ? "secondary" : "ghost"}
+                    size="icon-sm"
+                    onClick={() => setViewMode("list")}
+                    className="rounded-r-none"
+                    aria-label="List view"
+                  >
+                    <LayoutList className="size-4" />
+                  </Button>
+                  <Button
+                    variant={viewMode === "grid" ? "secondary" : "ghost"}
+                    size="icon-sm"
+                    onClick={() => setViewMode("grid")}
+                    className="rounded-l-none"
+                    aria-label="Grid view"
+                  >
+                    <LayoutGrid className="size-4" />
+                  </Button>
+                </div>
+              </div>
+            </div>
+
+            {/* Facets: server-computed aggregations from OpenSearch. Clicking a
+                value filters the result set; the active value is highlighted
+                and can be cleared. Only shown for the index-backed tabs. */}
+            {!loading &&
+              activeTab !== "checksum" &&
+              (facets.formats.length > 0 ||
+                facets.repositories.length > 0 ||
+                hasActiveFacets) && (
+                <div
+                  className="mb-4 space-y-2 rounded-md border bg-muted/30 p-3"
+                  data-testid="search-facets"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                      Refine
+                    </span>
+                    {hasActiveFacets && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 gap-1 px-2 text-xs"
+                        onClick={clearFacets}
+                      >
+                        <X className="size-3" />
+                        Clear filters
+                      </Button>
+                    )}
+                  </div>
+                  {facets.formats.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-xs text-muted-foreground w-20 shrink-0">
+                        Format
+                      </span>
+                      {facets.formats.map((f) => (
+                        <button
+                          key={f.value}
+                          type="button"
+                          onClick={() => toggleFacet("format", f.value)}
+                          aria-pressed={facetFormat === f.value}
+                          className="inline-flex items-center"
+                        >
+                          <Badge
+                            variant={
+                              facetFormat === f.value ? "default" : "secondary"
+                            }
+                            className="cursor-pointer gap-1"
+                          >
+                            {f.value}
+                            <span className="opacity-70">{f.count}</span>
+                          </Badge>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {facets.repositories.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-xs text-muted-foreground w-20 shrink-0">
+                        Repository
+                      </span>
+                      {facets.repositories.map((f) => (
+                        <button
+                          key={f.value}
+                          type="button"
+                          onClick={() => toggleFacet("repository", f.value)}
+                          aria-pressed={facetRepository === f.value}
+                          className="inline-flex items-center"
+                        >
+                          <Badge
+                            variant={
+                              facetRepository === f.value
+                                ? "default"
+                                : "secondary"
+                            }
+                            className="cursor-pointer gap-1"
+                          >
+                            {f.value}
+                            <span className="opacity-70">{f.count}</span>
+                          </Badge>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+            {/* Loading state */}
+            {loading && (
+              <div className="flex items-center justify-center py-16">
+                <Loader2 className="size-6 animate-spin text-muted-foreground" />
+              </div>
+            )}
+
+            {/* Empty state */}
+            {!loading && results.length === 0 && (
+              <div className="flex flex-col items-center justify-center py-16 text-center">
+                <SearchIcon className="size-10 text-muted-foreground/40 mb-3" />
+                <p className="text-sm text-muted-foreground">
+                  No results found. Try adjusting your search criteria.
+                </p>
+              </div>
+            )}
+
+            {/* List view */}
+            {!loading && results.length > 0 && viewMode === "list" && (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Name</TableHead>
+                    <TableHead>Version</TableHead>
+                    <TableHead>Format</TableHead>
+                    <TableHead>Repository</TableHead>
+                    <TableHead className="text-right">Size</TableHead>
+                    <TableHead>Date</TableHead>
+                    <TableHead className="w-10" />
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {results.map((result) => (
+                    <TableRow
+                      key={result.id}
+                      className="cursor-pointer"
+                      onClick={() => {
+                        if (result.repository_key && result.path) {
+                          router.push(
+                            `/repositories/${result.repository_key}?path=${encodeURIComponent(result.path)}`
+                          );
+                        }
+                      }}
+                    >
+                      <TableCell className="font-medium max-w-[250px]">
+                        <span className="flex items-center gap-2">
+                          <span className="truncate">{result.name}</span>
+                          {result.is_quarantined && (
+                            <QuarantineBadge
+                              reason={result.quarantine_reason}
+                              quarantineUntil={result.quarantine_until}
+                            />
+                          )}
+                        </span>
+                        {result.highlights && result.highlights.length > 0 && (
+                          <p className="mt-0.5 truncate text-xs font-normal text-muted-foreground">
+                            {renderHighlight(
+                              result.highlights[0],
+                              `${result.id}-hl`
+                            )}
+                          </p>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {result.version || "--"}
+                      </TableCell>
+                      <TableCell>
+                        {result.format && (
+                          <Badge variant="secondary">{result.format}</Badge>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {result.repository_key}
+                      </TableCell>
+                      <TableCell className="text-right text-muted-foreground">
+                        {formatBytes(result.size_bytes)}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {formatDate(result.created_at)}
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDownload(result);
+                          }}
+                          aria-label={`Download ${result.name}`}
+                        >
+                          <Download className="size-3.5" />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+
+            {/* Grid view */}
+            {!loading && results.length > 0 && viewMode === "grid" && (
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                {results.map((result) => (
+                  <button
+                    key={result.id}
+                    type="button"
+                    className="group cursor-pointer rounded-lg border p-4 transition-colors hover:bg-muted/50 text-left w-full"
+                    onClick={() => {
+                      if (result.repository_key && result.path) {
+                        router.push(
+                          `/repositories/${result.repository_key}?path=${encodeURIComponent(result.path)}`
+                        );
+                      }
+                    }}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="font-medium truncate text-sm">
+                          {result.name}
+                        </p>
+                        <p className="text-xs text-muted-foreground truncate mt-0.5">
+                          {result.repository_key}
+                          {result.path ? `/${result.path}` : ""}
+                        </p>
+                        {result.highlights && result.highlights.length > 0 && (
+                          <p className="mt-1 truncate text-xs text-muted-foreground">
+                            {renderHighlight(
+                              result.highlights[0],
+                              `${result.id}-grid-hl`
+                            )}
+                          </p>
+                        )}
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        className="opacity-0 group-hover:opacity-100 transition-opacity"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDownload(result);
+                        }}
+                        aria-label={`Download ${result.name}`}
+                      >
+                        <Download className="size-3" />
+                      </Button>
+                    </div>
+                    <div className="flex items-center gap-2 mt-3 flex-wrap">
+                      {result.is_quarantined && (
+                        <QuarantineBadge
+                          reason={result.quarantine_reason}
+                          quarantineUntil={result.quarantine_until}
+                        />
+                      )}
+                      {result.format && (
+                        <Badge variant="secondary" className="text-xs">
+                          {result.format}
+                        </Badge>
+                      )}
+                      {result.version && (
+                        <span className="text-xs text-muted-foreground">
+                          v{result.version}
+                        </span>
+                      )}
+                      <span className="ml-auto text-xs text-muted-foreground">
+                        {formatBytes(result.size_bytes)}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Pagination */}
+            {!loading && totalPages > 1 && (
+              <div className="flex items-center justify-between mt-6 pt-4 border-t">
+                <span className="text-sm text-muted-foreground">
+                  Page {page} of {totalPages}
+                </span>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={page <= 1}
+                    onClick={() => {
+                      setPage((p) => p - 1);
+                      setSearchKey((k) => k + 1);
+                    }}
+                    className="gap-1"
+                  >
+                    <ChevronLeft className="size-4" />
+                    Previous
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={page >= totalPages}
+                    onClick={() => {
+                      setPage((p) => p + 1);
+                      setSearchKey((k) => k + 1);
+                    }}
+                    className="gap-1"
+                  >
+                    Next
+                    <ChevronRight className="size-4" />
+                  </Button>
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,80 @@
+queue_rules:
+  - name: default
+    merge_method: squash
+    update_method: rebase
+
+pull_request_rules:
+  - name: Auto-merge Dependabot patch updates
+    conditions:
+      - author=dependabot[bot]
+      - "-title~=major"
+      - check-success=lint
+      - check-success=build
+      - check-success=e2e
+      - "#approved-reviews-by>=1"
+      # Scope auto-merge to PRs targeting main only. Maintenance branches
+      # (release/1.1.x and similar) overwrite floating dev tags on push,
+      # so dependency bumps onto them must go through human review even
+      # if they pass CI. See #320 / #331.
+      - base=main
+    actions:
+      queue:
+        name: default
+
+  - name: Flag Dependabot major updates
+    conditions:
+      - author=dependabot[bot]
+      - "title~=major"
+    actions:
+      label:
+        add:
+          - needs-review
+          - major-update
+
+  - name: Flag Dependabot PRs targeting maintenance branches
+    conditions:
+      - author=dependabot[bot]
+      - "base!=main"
+    actions:
+      label:
+        add:
+          - needs-review
+          - maintenance-branch
+
+  - name: Require E2E for page changes
+    conditions:
+      - "files~=^src/app/"
+      - -draft
+    actions:
+      label:
+        add:
+          - needs-e2e
+      comment:
+        message: |
+          This PR modifies app pages. Please ensure Playwright E2E tests cover the changes.
+
+  - name: Label UI component changes
+    conditions:
+      - "files~=^src/components/"
+    actions:
+      label:
+        add:
+          - ui
+
+  - name: Label E2E test changes
+    conditions:
+      - "files~=^e2e/"
+    actions:
+      label:
+        add:
+          - e2e
+
+  - name: Require test checklist completion
+    conditions:
+      - "body~=\\[x\\].*[Tt]est"
+      - "#approved-reviews-by>=1"
+    actions:
+      label:
+        add:
+          - tests-verified
+

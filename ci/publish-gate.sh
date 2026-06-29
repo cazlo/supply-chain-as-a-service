@@ -50,14 +50,25 @@ case "${event}" in
       [[ -n "${COMMENT_AUTHOR:-}" ]] || die "comment author is missing"
       [[ "${COMMENT_AUTHOR}" != "${bot_login}" ]] || die "the sync bot cannot authorize deployments"
 
-      api="${GITEA_SERVER_URL%/}/api/v1/repos/${GITEA_REPOSITORY}"
-      permission="$(curl -fsS -H "Authorization: token ${GITEA_TOKEN}" \
-        "${api}/collaborators/${COMMENT_AUTHOR}/permission" | jq -er '.permission')"
-      case "${permission}" in
-        owner | admin | write) ;;
-        *) die "${COMMENT_AUTHOR} has ${permission} permission; write access is required" ;;
-      esac
+      # The built-in Gitea job token can read PRs but intentionally cannot read
+      # collaborator permissions. Default to the individual repository owner;
+      # additional trusted operators can be named explicitly in the non-secret
+      # CHATOPS_DEPLOYERS repository variable (comma- or space-separated).
+      owner="${GITEA_REPOSITORY%%/*}"
+      deployers="${CHATOPS_DEPLOYERS:-${owner}}"
+      deployers="${deployers//,/ }"
+      read -r -a authorized_users <<<"${deployers}"
+      authorized=false
+      for user in "${authorized_users[@]}"; do
+        if [[ "${COMMENT_AUTHOR}" == "${user}" ]]; then
+          authorized=true
+          break
+        fi
+      done
+      [[ "${authorized}" == true ]] ||
+        die "${COMMENT_AUTHOR} is not listed in CHATOPS_DEPLOYERS"
 
+      api="${GITEA_SERVER_URL%/}/api/v1/repos/${GITEA_REPOSITORY}"
       pr="$(curl -fsS -H "Authorization: token ${GITEA_TOKEN}" \
         "${api}/pulls/${pr_number}")"
       state="$(jq -r '.state' <<<"${pr}")"

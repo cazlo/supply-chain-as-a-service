@@ -57,6 +57,7 @@ jobs:
           PR_NUMBER: ${{ gitea.event.issue.number }}
           COMMENT_AUTHOR: ${{ gitea.event.sender.login }}
           COMMENT_BODY: ${{ gitea.event.comment.body }}
+          CHATOPS_DEPLOYERS: ${{ vars.CHATOPS_DEPLOYERS }}
           # The machine identity whose PRs must not auto-publish or deploy.
           BOT_LOGIN: supply-chain-sync
         run: ci/publish-gate.sh

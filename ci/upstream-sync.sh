@@ -159,7 +159,8 @@ for name in $(upstream_names); do
     fi
   else
     diverged+=("${name} ${release_tag}: $(printf '%s' "${out}" | tail -n1)")
-    log "${name}: skipped ${release_tag} (non-fast-forward or error)"
+    log "${name}: failed to import ${release_tag}"
+    printf '%s\n' "${out}" | sed 's/^/    /' >&2
   fi
 done
 

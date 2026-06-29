@@ -1,0 +1,54 @@
+# Local mirror of the upstream backend CI (test-backend-unit + coverage jobs).
+# Run via the repo-root Makefile: `make local-test` / `make local-coverage`.
+#
+# Caching: the cargo registry/git cache and the compile target dir are named
+# volumes, so only the first run pays the full backend compile. The repo is
+# mounted read-only and all build output goes to the volumes (+ lcov to /tmp),
+# so your working tree is never touched.
+name: ak-local-ci
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    tmpfs:
+      - /var/lib/postgresql/data   # ephemeral DB: fast, nothing to clean up
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  ci:
+    build:
+      context: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://registry:registry@db:5432/artifact_registry
+      SQLX_OFFLINE: "true"
+      JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+      CARGO_HOME: /cargo
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      # New-code coverage gate knobs (match upstream defaults). COVERAGE_BASE
+      # defaults to the merge-base with `main`, i.e. exactly the age-gate patches.
+      COVERAGE_BASE: ${COVERAGE_BASE:-}
+      NEW_CODE_MIN: ${NEW_CODE_MIN:-70}
+      TOTAL_MIN: ${TOTAL_MIN:-50}
+    volumes:
+      # Repo is mounted rw because cargo may touch Cargo.lock, but all compile
+      # output is redirected to the ak-target volume and lcov to /tmp, so your
+      # source tree stays clean.
+      - ../../:/work
+      - ak-cargo:/cargo
+      - ak-target:/work/artifact-keeper/target
+    working_dir: /work
+
+volumes:
+  ak-cargo:
+  ak-target:

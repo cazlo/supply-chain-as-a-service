@@ -8,7 +8,12 @@ readonly root="$(git rev-parse --show-toplevel)"
 readonly namespace="${QUALITY_NAMESPACE:-ak-smoke}"
 readonly revision="$(git -C "${root}" rev-parse --short=8 HEAD)"
 readonly run_suffix="${GITEA_RUN_NUMBER:-${GITHUB_RUN_NUMBER:-0}}"
-readonly name="ak-quality-${revision}-${run_suffix}"
+readonly mode="${QUALITY_MODE:-coverage}"
+case "${mode}" in
+  integration|coverage) ;;
+  *) echo "QUALITY_MODE must be integration or coverage" >&2; exit 2 ;;
+esac
+readonly name="ak-${mode}-${revision}-${run_suffix}"
 readonly results_dir="${QUALITY_RESULTS_DIR:-/tmp/artifact-keeper-quality}"
 
 cleanup() {
@@ -71,12 +76,12 @@ if [[ -z "${coverage_base}" ]]; then
     || git -C "${root}" rev-parse HEAD^)"
 fi
 
-echo "==> integration + coverage on BuildKit (diff base ${coverage_base})"
+echo "==> ${mode} on BuildKit (diff base ${coverage_base})"
 docker buildx build \
   --progress plain \
   --file "${root}/ci/local-ci/Dockerfile.runner" \
-  --target results \
-  --no-cache-filter gates \
+  --target "${mode}-results" \
+  --no-cache-filter "${mode}" \
   --build-arg "DATABASE_URL=postgresql://registry:registry@${name}.${namespace}.svc.cluster.local:5432/artifact_registry" \
   --build-arg "COVERAGE_BASE=${coverage_base}" \
   --build-arg "NEW_CODE_MIN=${NEW_CODE_MIN:-70}" \

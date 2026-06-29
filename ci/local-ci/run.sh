@@ -50,8 +50,18 @@ if [ -n "${COVERAGE_NEXTEST_FILTER:-}" ]; then
   echo "==> coverage nextest filter: ${COVERAGE_NEXTEST_FILTER}"
 fi
 
+coverage_cache=()
+if [ "${COVERAGE_NO_CLEAN:-0}" = "1" ]; then
+  coverage_cache=(--no-clean)
+  echo "==> reusing instrumented coverage build artifacts"
+  # Keep compiled objects/incremental state, but never merge counters from a
+  # previous run into this run's report.
+  find "${CARGO_TARGET_DIR:-target}/llvm-cov-target" -type f \
+    \( -name '*.profraw' -o -name '*.profdata' \) -delete 2>/dev/null || true
+fi
+
 echo "==> cargo llvm-cov nextest --workspace --lib"
-cargo llvm-cov nextest --workspace --lib --lcov --output-path /tmp/lcov.info \
+cargo llvm-cov "${coverage_cache[@]}" nextest --workspace --lib --lcov --output-path /tmp/lcov.info \
   --test-threads "${COVERAGE_TEST_THREADS:-4}" "${coverage_filter[@]}"
 
 echo

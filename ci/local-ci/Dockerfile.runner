@@ -30,7 +30,7 @@ RUN rustup component add llvm-tools-preview \
 
 RUN git config --global --add safe.directory '*'
 
-FROM toolchain AS gates
+FROM toolchain AS source
 ARG DATABASE_URL
 ARG COVERAGE_BASE
 ARG NEW_CODE_MIN=70
@@ -43,12 +43,13 @@ ENV DATABASE_URL=${DATABASE_URL} \
     JWT_SECRET=ci-coverage-secret-at-least-32-bytes-long-for-tests \
     CARGO_HOME=/cargo \
     CARGO_TARGET_DIR=/target \
-    CARGO_BUILD_JOBS=4 \
-    CARGO_INCREMENTAL=0 \
+    CARGO_BUILD_JOBS=8 \
+    CARGO_INCREMENTAL=1 \
     CARGO_PROFILE_DEV_DEBUG=0 \
     CARGO_PROFILE_TEST_DEBUG=0 \
     CARGO_TERM_COLOR=always \
-    COVERAGE_TEST_THREADS=8
+    COVERAGE_TEST_THREADS=8 \
+    COVERAGE_NO_CLEAN=1
 
 # This pre-existing OTLP constructor test passes upstream but rejects its
 # hard-coded localhost URI in the rootless BuildKit environment. Keep the
@@ -59,18 +60,25 @@ ENV COVERAGE_NEXTEST_FILTER="not test(telemetry::tests::test_build_span_exporter
 WORKDIR /work
 COPY . /work
 
+FROM source AS integration
 RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
     --mount=type=cache,id=ak-quality-target,target=/target \
     bash -o pipefail -c \
       'bash /work/ci/local-ci/run.sh integration 2>&1 | tee /tmp/integration.log'
 
+RUN mkdir /results && cp /tmp/integration.log /results/
+
+FROM scratch AS integration-results
+COPY --from=integration /results/ /
+
+FROM source AS coverage
 RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
     --mount=type=cache,id=ak-quality-target,target=/target \
     bash -o pipefail -c \
       'bash /work/ci/local-ci/run.sh coverage 2>&1 | tee /tmp/coverage.log'
 
 RUN mkdir /results \
- && cp /tmp/integration.log /tmp/coverage.log /tmp/lcov.info /results/
+ && cp /tmp/coverage.log /tmp/lcov.info /results/
 
-FROM scratch AS results
-COPY --from=gates /results/ /
+FROM scratch AS coverage-results
+COPY --from=coverage /results/ /

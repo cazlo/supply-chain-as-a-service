@@ -9,11 +9,16 @@ The same gates run automatically in Gitea's `publish-ci` workflow. Because the
 repository runners are daemonless, that lane uses
 [`Dockerfile.runner`](Dockerfile.runner) with their persistent rootless
 BuildKit cache and a short-lived Postgres deployment in the RBAC-confined
-`ak-smoke` namespace. It uploads `integration.log`, `coverage.log`, and
-`lcov.info` as the `backend-quality-*` workflow artifact.
+`ak-smoke` namespace. The two jobs upload `integration.log`, `coverage.log`,
+and `lcov.info` as `backend-integration-*` / `backend-coverage-*` artifacts.
 
-The runner variant uses four compiler jobs and eight nextest threads (the lab
-builders have materially more memory than upstream's constrained ARC pods). It
+The runner variant uses eight compiler jobs, incremental compilation,
+`cargo llvm-cov --no-clean`, and eight nextest threads (the lab builders have
+materially more memory than upstream's constrained ARC pods). Integration and
+coverage are separate Gitea jobs, so the two builders can execute them in
+parallel while preserving upstream's `--lib`-only coverage definition. It
+deletes old LLVM profile counters before each run, retaining compiled objects
+without allowing stale hits to inflate the report. It
 also excludes only
 `telemetry::tests::test_build_span_exporter_grpc`: that pre-existing test's
 hard-coded localhost OTLP URI is rejected in rootless BuildKit, after 11,744

@@ -18,7 +18,7 @@ source-smoke-compose:
 
 # Runner-native DB integration + coverage lane (rootless BuildKit + ak-smoke).
 backend-quality-ci:
-	ci/backend-quality-k8s.sh
+	QUALITY_MODE=$(or $(MODE),coverage) ci/backend-quality-k8s.sh
 
 source-check-backend:
 	ci/check-clean-snapshots.sh backend

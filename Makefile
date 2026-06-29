@@ -1,4 +1,4 @@
-.PHONY: ci-publish source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose vendor-check vendor-status vendor-update vendor-sync local-ci-build local-test local-coverage local-integration local-ci-down
+.PHONY: ci-publish source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose backend-quality-ci vendor-check vendor-status vendor-update vendor-sync local-ci-build local-test local-coverage local-integration local-ci-down
 
 LOCAL_CI := docker compose -f ci/local-ci/docker-compose.yml
 
@@ -15,6 +15,10 @@ source-smoke:
 # Local Docker Compose smoke, kept for workstation use without a cluster.
 source-smoke-compose:
 	ci/smoke-test.sh
+
+# Runner-native DB integration + coverage lane (rootless BuildKit + ak-smoke).
+backend-quality-ci:
+	ci/backend-quality-k8s.sh
 
 source-check-backend:
 	ci/check-clean-snapshots.sh backend

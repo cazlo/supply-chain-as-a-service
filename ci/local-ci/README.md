@@ -1,9 +1,16 @@
-# Local CI mirror (backend tests + coverage)
+# Backend CI mirror (local + Gitea runners)
 
 A small, well-cached Docker mirror of the upstream backend CI jobs in
 [`artifact-keeper/.github/workflows/ci.yml`](../../artifact-keeper/.github/workflows/ci.yml),
 so the age-gate work can be iterated on locally with the **same gates the
 reviewer runs** — in particular the coverage gates the PR was flagged on.
+
+The same gates run automatically in Gitea's `publish-ci` workflow. Because the
+repository runners are daemonless, that lane uses
+[`Dockerfile.runner`](Dockerfile.runner) with their persistent rootless
+BuildKit cache and a short-lived Postgres deployment in the RBAC-confined
+`ak-smoke` namespace. It uploads `integration.log`, `coverage.log`, and
+`lcov.info` as the `backend-quality-*` workflow artifact.
 
 ## What it reproduces
 
@@ -20,8 +27,10 @@ what to add a `--lib` unit test for. Only `src/` `#[cfg(test)]` tests count
 toward coverage — integration tests under `backend/tests/` are a separate target
 and, like upstream, do not move the coverage number.
 
-> Not reproduced (yet): the jscpd 3% code-duplication gate and the shell/e2e
-> jobs. Add them here if they start to matter.
+> Not reproduced (yet): the jscpd 3% code-duplication gate and the full protocol
+> smoke matrix. The age-gate `--ignored` DB/wiremock integration suite runs here;
+> the separate k8s-native publish smoke remains responsible for real pypi/npm/
+> cargo clients against the built backend image.
 
 ## Usage
 

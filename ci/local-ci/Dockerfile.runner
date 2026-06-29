@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1.7
+# Gitea-runner variant of the local backend quality harness. The repository is
+# baked into the build context because the host-mode runners deliberately have
+# no Docker daemon with which to mount the checkout. Test execution remains an
+# uncached BuildKit stage, while cargo downloads and compiled targets use the
+# runner's persistent rootless BuildKit cache mounts.
+FROM rust:1.93-bookworm AS toolchain
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 git postgresql-client ca-certificates unzip \
+      pkg-config make perl libssl-dev zlib1g-dev liblzma-dev libbz2-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN ARCH="$(uname -m)" \
+ && case "$ARCH" in \
+      x86_64)  PA="linux-x86_64" ;; \
+      aarch64) PA="linux-aarch_64" ;; \
+      *)       echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac \
+ && curl --proto '=https' --tlsv1.2 -sSfL \
+      "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PA}.zip" -o /tmp/protoc.zip \
+ && unzip -q /tmp/protoc.zip -d /usr/local \
+ && rm /tmp/protoc.zip
+
+RUN rustup component add llvm-tools-preview \
+ && curl -L --proto '=https' --tlsv1.2 -sSf \
+      https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
+ && cargo binstall -y cargo-nextest cargo-llvm-cov sqlx-cli
+
+RUN git config --global --add safe.directory '*'
+
+FROM toolchain AS gates
+ARG DATABASE_URL
+ARG COVERAGE_BASE
+ARG NEW_CODE_MIN=70
+ARG TOTAL_MIN=50
+ENV DATABASE_URL=${DATABASE_URL} \
+    COVERAGE_BASE=${COVERAGE_BASE} \
+    NEW_CODE_MIN=${NEW_CODE_MIN} \
+    TOTAL_MIN=${TOTAL_MIN} \
+    SQLX_OFFLINE=true \
+    JWT_SECRET=ci-coverage-secret-at-least-32-bytes-long-for-tests \
+    CARGO_HOME=/cargo \
+    CARGO_TARGET_DIR=/target \
+    CARGO_BUILD_JOBS=2 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_PROFILE_TEST_DEBUG=0 \
+    CARGO_TERM_COLOR=always
+
+WORKDIR /work
+COPY . /work
+
+RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
+    --mount=type=cache,id=ak-quality-target,target=/target \
+    bash -o pipefail -c \
+      'bash /work/ci/local-ci/run.sh integration 2>&1 | tee /tmp/integration.log'
+
+RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
+    --mount=type=cache,id=ak-quality-target,target=/target \
+    bash -o pipefail -c \
+      'bash /work/ci/local-ci/run.sh coverage 2>&1 | tee /tmp/coverage.log'
+
+RUN mkdir /results \
+ && cp /tmp/integration.log /tmp/coverage.log /tmp/lcov.info /results/
+
+FROM scratch AS results
+COPY --from=gates /results/ /

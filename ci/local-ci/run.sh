@@ -61,7 +61,11 @@ BASE="${COVERAGE_BASE:-}"
 if [ -z "${BASE}" ]; then
   # Default: the merge-base with main == exactly the age-gate patch set, so the
   # gate reports coverage of the work we are trying to land upstream.
-  BASE="$(git -C /work merge-base main HEAD 2>/dev/null || git -C /work rev-parse main 2>/dev/null || true)"
+  BASE="$(git -C /work merge-base main HEAD 2>/dev/null \
+    || git -C /work merge-base origin/main HEAD 2>/dev/null \
+    || git -C /work rev-parse main 2>/dev/null \
+    || git -C /work rev-parse origin/main 2>/dev/null \
+    || true)"
 fi
 if [ -z "${BASE}" ]; then
   echo "   no base ref found; set COVERAGE_BASE=<ref> to enable the new-code gate"

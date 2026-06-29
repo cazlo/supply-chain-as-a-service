@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Request, State},
+    extract::{OriginalUri, Request, State},
     http::{
         header::{AUTHORIZATION, COOKIE},
         HeaderMap, HeaderName, Method, StatusCode,
@@ -402,18 +402,29 @@ fn decode_basic_credentials(encoded: &str) -> Option<(String, String)> {
 /// [`auth_middleware`]); this allowlist is the narrow set of endpoints that
 /// let them recover without admin intervention:
 ///
+///   * the current-user self lookup (`.../me`, i.e. `GET /api/v1/auth/me`) —
+///     a read-only call the mandatory first-login change screen makes to
+///     render (who is logged in / which account is being rotated),
 ///   * the self password-change route (`.../password`, e.g.
 ///     `POST /api/v1/users/:id/password`) — clears the flag, and
 ///   * logout (`.../auth/logout`) — lets the client end the session.
 ///
-/// Matching is by suffix so it is robust to the `/api/v1` (or any future)
-/// nest prefix the middleware observes on `request.uri().path()`. The
-/// admin reset / force-change routes (`.../password/reset`,
-/// `.../force-password-change`) deliberately do NOT match — they sit behind
-/// `admin_middleware`, not this one, and would not be self-recoverable.
+/// Matching is by suffix of the FULL, un-stripped request path (see
+/// [`auth_middleware`], which reads `OriginalUri`). This middleware is layered
+/// *inside* the `/api/v1` + `/auth` nests, so `request.uri().path()` is the
+/// fully nest-stripped suffix — `GET /api/v1/auth/me` and
+/// `DELETE /api/v1/sbom/me` (id = "me") both arrive as exactly `/me`, which a
+/// stripped-path predicate cannot tell apart. The genuine self-lookup is
+/// therefore anchored to the full route `.../auth/me`, so impostors like
+/// `/api/v1/sbom/me`, `/api/v1/webhooks/me`, and `/api/v1/promotion-rules/me`
+/// stay gated. The admin reset / force-change routes
+/// (`.../password/reset`, `.../force-password-change`) deliberately do NOT
+/// match — they sit behind `admin_middleware`, not this one, and would not be
+/// self-recoverable. Only read-only / self-recovery endpoints are exempt;
+/// every state-changing API surface stays gated until the flag is cleared.
 fn path_exempt_from_password_change(path: &str) -> bool {
     let path = path.strip_suffix('/').unwrap_or(path);
-    path.ends_with("/password") || path.ends_with("/auth/logout")
+    path.ends_with("/auth/me") || path.ends_with("/password") || path.ends_with("/auth/logout")
 }
 
 /// 428 Precondition Required: the principal must rotate their password before
@@ -546,7 +557,23 @@ pub async fn auth_middleware(
             // "unauthenticated". The DB read only happens for non-exempt paths,
             // so the common authenticated request pays nothing extra on the
             // password-change / logout recovery routes.
-            if !path_exempt_from_password_change(request.uri().path())
+            //
+            // Use the FULL request path via `OriginalUri` (populated by the
+            // outer router before any nest stripped its prefix), not
+            // `request.uri().path()` which axum has already stripped down to a
+            // bare suffix. The exemption anchors the self-lookup to
+            // `.../auth/me`, and the stripped suffix `/me` is identical for the
+            // genuine `GET /api/v1/auth/me` and impostors like
+            // `DELETE /api/v1/sbom/me`; only the original path can tell them
+            // apart. Fall back to `request.uri().path()` when `OriginalUri` is
+            // absent (e.g. a flat-router unit test with no nest) so the path
+            // still carries the full route.
+            let gate_path = request
+                .extensions()
+                .get::<OriginalUri>()
+                .map(|o| o.0.path().to_string())
+                .unwrap_or_else(|| request.uri().path().to_string());
+            if !path_exempt_from_password_change(&gate_path)
                 && principal_must_change_password(auth_service.db(), ext.user_id).await
             {
                 return must_change_password_response();
@@ -4113,8 +4140,13 @@ mod tests {
 
     #[test]
     fn test_path_exempt_from_password_change_allowlist() {
-        // Recovery routes: self password-change and logout (with or without a
-        // trailing slash, with or without the nest prefix).
+        // Recovery / change-screen routes: the current-user self lookup, the
+        // self password-change route, and logout (with or without a trailing
+        // slash). The helper now keys off the FULL request path (the middleware
+        // reads `OriginalUri`, not the nest-stripped suffix), so the self
+        // lookup is anchored to the exact `/auth/me` route.
+        assert!(path_exempt_from_password_change("/api/v1/auth/me"));
+        assert!(path_exempt_from_password_change("/api/v1/auth/me/"));
         assert!(path_exempt_from_password_change(
             "/api/v1/users/4040201f-c67a-4719-a292-79ec66a7bd2d/password"
         ));
@@ -4122,9 +4154,23 @@ mod tests {
         assert!(path_exempt_from_password_change("/api/v1/auth/logout"));
         assert!(path_exempt_from_password_change("/auth/logout/"));
 
+        // The core of this finding: a bare `/me` (the stripped form, and any
+        // `/<resource>/me` whose terminal :id is the literal "me") is NOT the
+        // self lookup and must stay gated. Anchoring to `/auth/me` rejects the
+        // `DELETE /api/v1/sbom/me`, `/api/v1/webhooks/me`, and
+        // `/api/v1/promotion-rules/me` impostors that an `ends_with("/me")`
+        // suffix would have exempted.
+        assert!(!path_exempt_from_password_change("/me"));
+        assert!(!path_exempt_from_password_change("/api/v1/sbom/me"));
+        assert!(!path_exempt_from_password_change("/api/v1/webhooks/me"));
+        assert!(!path_exempt_from_password_change(
+            "/api/v1/promotion-rules/me"
+        ));
+
         // Everything else is gated, including the admin reset / force-change
-        // routes (which live behind admin_middleware, not this one) and any
-        // route that merely contains "password" elsewhere.
+        // routes (which live behind admin_middleware, not this one), the
+        // token-management routes, and any route that merely contains
+        // "password" elsewhere.
         assert!(!path_exempt_from_password_change(
             "/api/v1/users/abc/password/reset"
         ));
@@ -4132,8 +4178,10 @@ mod tests {
             "/api/v1/users/abc/force-password-change"
         ));
         assert!(!path_exempt_from_password_change("/api/v1/repositories"));
-        assert!(!path_exempt_from_password_change("/api/v1/auth/me"));
         assert!(!path_exempt_from_password_change("/api/v1/auth/tokens"));
+        // Stripped forms the middleware actually sees for token management.
+        assert!(!path_exempt_from_password_change("/tokens"));
+        assert!(!path_exempt_from_password_change("/tokens/abc"));
     }
 
     /// Build a flagged/unflagged non-admin `User` row and mint a real JWT for it
@@ -4208,29 +4256,42 @@ mod tests {
             make_test_config_for_middleware(),
         ));
 
+        // Register routes through a real `/api/v1` nest with `auth_middleware`
+        // layered INSIDE each sub-nest, exactly as the live router does. axum
+        // strips the matched prefix before the middleware reads
+        // `request.uri()`, but populates `OriginalUri` with the full path —
+        // which the gate now reads. This is what lets the genuine
+        // `GET /api/v1/auth/me` be exempt while the `DELETE /api/v1/sbom/me`
+        // impostor (terminal :id = "me") stays gated.
         let app = || {
-            Router::new()
-                .route(
-                    "/api/v1/repositories",
-                    any(|| async { (StatusCode::OK, "repos") }),
-                )
-                .route(
-                    "/api/v1/users/:id/password",
-                    any(|| async { (StatusCode::OK, "pw") }),
-                )
-                .route(
-                    "/api/v1/auth/logout",
-                    any(|| async { (StatusCode::OK, "logout") }),
-                )
-                .layer(middleware::from_fn_with_state(
-                    auth_service.clone(),
-                    auth_middleware,
-                ))
+            let layer = middleware::from_fn_with_state(auth_service.clone(), auth_middleware);
+            Router::new().nest(
+                "/api/v1",
+                Router::new()
+                    .route("/repositories", any(|| async { (StatusCode::OK, "repos") }))
+                    .nest(
+                        "/auth",
+                        Router::new()
+                            .route("/me", any(|| async { (StatusCode::OK, "me") }))
+                            .route("/logout", any(|| async { (StatusCode::OK, "logout") }))
+                            .route("/tokens", any(|| async { (StatusCode::OK, "tokens") })),
+                    )
+                    .nest(
+                        "/sbom",
+                        Router::new().route("/:id", any(|| async { (StatusCode::OK, "sbom") })),
+                    )
+                    .nest(
+                        "/users",
+                        Router::new()
+                            .route("/:id/password", any(|| async { (StatusCode::OK, "pw") })),
+                    )
+                    .layer(layer),
+            )
         };
 
-        let mk_req = |uri: &str, bearer: &str| {
+        let mk_req = |method: Method, uri: &str, bearer: &str| {
             axum::http::Request::builder()
-                .method(Method::GET)
+                .method(method)
                 .uri(uri)
                 .header("Authorization", bearer)
                 .body(axum::body::Body::empty())
@@ -4243,7 +4304,7 @@ mod tests {
 
         // A normal route is refused with 428.
         let resp = app()
-            .oneshot(mk_req("/api/v1/repositories", &flagged_bearer))
+            .oneshot(mk_req(Method::GET, "/api/v1/repositories", &flagged_bearer))
             .await
             .unwrap();
         assert_eq!(
@@ -4252,9 +4313,49 @@ mod tests {
             "flagged principal must be 428'd on a normal route"
         );
 
+        // Token management is state-changing and stays gated even though the
+        // change screen runs while flagged (#1948 must not over-broaden).
+        let resp = app()
+            .oneshot(mk_req(Method::GET, "/api/v1/auth/tokens", &flagged_bearer))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PRECONDITION_REQUIRED,
+            "flagged principal must still be 428'd on token management"
+        );
+
+        // Core of this finding: a `/<resource>/me` whose terminal :id is the
+        // literal "me" must NOT be mistaken for the self lookup. With the gate
+        // reading `OriginalUri`, `DELETE /api/v1/sbom/me` is refused with 428
+        // (the handler is NOT reached) — an `ends_with("/me")` suffix on the
+        // stripped path would have let it through.
+        let resp = app()
+            .oneshot(mk_req(Method::DELETE, "/api/v1/sbom/me", &flagged_bearer))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PRECONDITION_REQUIRED,
+            "flagged principal must be 428'd on /sbom/me (terminal :id impostor)"
+        );
+
+        // The genuine current-user self lookup (`GET /api/v1/auth/me`) the
+        // mandatory change screen calls to render IS reachable while flagged.
+        let resp = app()
+            .oneshot(mk_req(Method::GET, "/api/v1/auth/me", &flagged_bearer))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "flagged principal must reach the current-user self lookup"
+        );
+
         // The self password-change recovery route is still reachable.
         let resp = app()
             .oneshot(mk_req(
+                Method::POST,
                 &format!("/api/v1/users/{}/password", flagged_id),
                 &flagged_bearer,
             ))
@@ -4268,7 +4369,7 @@ mod tests {
 
         // Logout is reachable too.
         let resp = app()
-            .oneshot(mk_req("/api/v1/auth/logout", &flagged_bearer))
+            .oneshot(mk_req(Method::POST, "/api/v1/auth/logout", &flagged_bearer))
             .await
             .unwrap();
         assert_eq!(
@@ -4281,7 +4382,11 @@ mod tests {
         let (_unflagged_id, unflagged_bearer) =
             mint_bearer_for_flagged_user(&pool, &auth_service, false).await;
         let resp = app()
-            .oneshot(mk_req("/api/v1/repositories", &unflagged_bearer))
+            .oneshot(mk_req(
+                Method::GET,
+                "/api/v1/repositories",
+                &unflagged_bearer,
+            ))
             .await
             .unwrap();
         assert_eq!(

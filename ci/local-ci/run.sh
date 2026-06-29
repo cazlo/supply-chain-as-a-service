@@ -44,8 +44,15 @@ if [ "${MODE}" = "integration" ]; then
   exit $?
 fi
 
+coverage_filter=()
+if [ -n "${COVERAGE_NEXTEST_FILTER:-}" ]; then
+  coverage_filter=(--filter-expr "${COVERAGE_NEXTEST_FILTER}")
+  echo "==> coverage nextest filter: ${COVERAGE_NEXTEST_FILTER}"
+fi
+
 echo "==> cargo llvm-cov nextest --workspace --lib"
-cargo llvm-cov nextest --workspace --lib --lcov --output-path /tmp/lcov.info --test-threads 4
+cargo llvm-cov nextest --workspace --lib --lcov --output-path /tmp/lcov.info \
+  --test-threads "${COVERAGE_TEST_THREADS:-4}" "${coverage_filter[@]}"
 
 echo
 echo "==> overall coverage summary"

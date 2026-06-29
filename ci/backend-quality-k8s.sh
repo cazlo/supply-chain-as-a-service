@@ -73,6 +73,7 @@ fi
 
 echo "==> integration + coverage on BuildKit (diff base ${coverage_base})"
 docker buildx build \
+  --progress plain \
   --file "${root}/ci/local-ci/Dockerfile.runner" \
   --target results \
   --no-cache-filter gates \

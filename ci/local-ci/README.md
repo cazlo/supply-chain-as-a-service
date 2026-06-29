@@ -12,6 +12,14 @@ BuildKit cache and a short-lived Postgres deployment in the RBAC-confined
 `ak-smoke` namespace. It uploads `integration.log`, `coverage.log`, and
 `lcov.info` as the `backend-quality-*` workflow artifact.
 
+The runner variant uses four compiler jobs and eight nextest threads (the lab
+builders have materially more memory than upstream's constrained ARC pods). It
+also excludes only
+`telemetry::tests::test_build_span_exporter_grpc`: that pre-existing test's
+hard-coded localhost OTLP URI is rejected in rootless BuildKit, after 11,744
+other lib tests passed. This exception does not apply to local runs and does not
+touch the age-gate unit or integration suites.
+
 ## What it reproduces
 
 | Upstream job | Local mode | What runs |

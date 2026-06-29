@@ -50,8 +50,8 @@ Actions secrets rather than source control.
 ## ChatOps smoke deployment
 
 Bot-authored upstream-sync PRs validate source and charts by default without
-receiving registry or signing secrets. After reviewing one, a repository owner,
-administrator, or collaborator with write access can comment exactly:
+receiving registry or signing secrets. After reviewing one, the repository
+owner can comment exactly:
 
 ```text
 /deploy smoke
@@ -62,3 +62,7 @@ build and push both images, scan, sign, verify, deploy the backend into the
 ephemeral Kubernetes smoke environment, and promote the passing digests to the
 staging project. It does not merge the PR or promote anything to release. If the
 PR head changes, comment again to authorize the new commit.
+
+Additional trusted operators can be authorized with a non-secret repository
+Actions variable named `CHATOPS_DEPLOYERS`, containing comma- or space-separated
+Gitea usernames. When unset, it defaults to the repository owner only.

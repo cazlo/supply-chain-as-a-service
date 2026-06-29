@@ -1,7 +1,12 @@
 # Scheduled vendored-upstream sync. Runs as the supply-chain-sync bot: imports
-# fast-forward upstream commits and opens/updates a single pull request. The PR
-# is validate-only in publish-ci (no push/sign/scan/deploy) because its author is
-# the bot; a human reviews, merges, and publishes through a separate approval.
+# the latest upstream *release* once it clears a seven-day quarantine and
+# opens/updates a single pull request. The PR is validate-only in publish-ci (no
+# push/sign/scan/deploy) because its author is the bot; a human reviews, merges,
+# and publishes through a separate approval.
+#
+# Quarantine: the daily run only imports releases that are at least seven days
+# old. To pull a brand-new release immediately (e.g. to test it), dispatch this
+# workflow with `quarantine` unchecked.
 #
 # Secrets (repository Actions secrets, provisioned out of band):
 #   SYNC_BOT_TOKEN        bot PAT with write:repository (push + open PR)
@@ -17,6 +22,10 @@ on:
     - cron: "0 7 * * *"
   workflow_dispatch:
     inputs:
+      quarantine:
+        description: "Quarantine new releases for 7 days (uncheck to import the latest release immediately)"
+        type: boolean
+        default: true
       dry_run:
         description: "Import locally but do not push or open a PR"
         type: boolean
@@ -52,5 +61,7 @@ jobs:
           GITEA_SERVER: http://gitea-http.gitea.svc.cluster.local:3000
           GITEA_TOKEN: ${{ secrets.SYNC_BOT_TOKEN }}
           GITEA_REPO: drew/supply-chain-as-a-service
+          # Empty on scheduled runs, so the script defaults quarantine ON.
+          QUARANTINE: ${{ gitea.event.inputs.quarantine }}
           DRY_RUN: ${{ gitea.event.inputs.dry_run }}
         run: ci/upstream-sync.sh

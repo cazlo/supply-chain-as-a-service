@@ -1,4 +1,4 @@
 name	prefix	url	branch	revision	tag	imported
-artifact-keeper	artifact-keeper	https://github.com/artifact-keeper/artifact-keeper.git	main	ea6f5ed686ea2783bcaddd67c9e22bcb66d607a8	v1.2.1	2026-06-27
-artifact-keeper-web	artifact-keeper-web	https://github.com/artifact-keeper/artifact-keeper-web.git	main	3cfc8dd6665969bf53aa34481ac1268c540b8cc6	-	2026-06-27
-artifact-keeper-iac	artifact-keeper-iac	https://github.com/artifact-keeper/artifact-keeper-iac.git	main	19fddefd17d91df77ecad0526f388655435545ef	-	2026-06-27
+artifact-keeper	artifact-keeper	https://github.com/artifact-keeper/artifact-keeper.git	main	65c006eaddb9f1fdab90f0434604f9b480492a7d	v1.2.2	2026-06-29
+artifact-keeper-web	artifact-keeper-web	https://github.com/artifact-keeper/artifact-keeper-web.git	main	f3a4a241c9a1cf87ed2a9f3d6b3a6475f06e7de2	v1.2.2	2026-06-29
+artifact-keeper-iac	artifact-keeper-iac	https://github.com/artifact-keeper/artifact-keeper-iac.git	main	523eec457575a51015daa293f03eaeb8d93d2e78	artifact-keeper-1.2.2	2026-06-29

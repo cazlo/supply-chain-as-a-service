@@ -35,6 +35,10 @@ services:
       CARGO_HOME: /cargo
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
+      # Match the runner filter: these pre-existing tests are environment-
+      # sensitive in root/rootless container coverage runs, not feature-gate
+      # coverage signals.
+      COVERAGE_NEXTEST_FILTER: ${COVERAGE_NEXTEST_FILTER:-not test(telemetry::tests::test_build_span_exporter_grpc) and not test(api::handlers::health::tests::test_probe_storage_health_filesystem_unwritable)}
       # New-code coverage gate knobs (match upstream defaults). COVERAGE_BASE
       # defaults to the merge-base with `main`.
       COVERAGE_BASE: ${COVERAGE_BASE:-}

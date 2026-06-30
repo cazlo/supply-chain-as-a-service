@@ -51,11 +51,12 @@ ENV DATABASE_URL=${DATABASE_URL} \
     COVERAGE_TEST_THREADS=8 \
     COVERAGE_NO_CLEAN=1
 
-# This pre-existing OTLP constructor test passes upstream but rejects its
-# hard-coded localhost URI in the rootless BuildKit environment. Keep the
-# exclusion narrow: it is unrelated to changed-line coverage, while every other
-# lib test remains mandatory.
-ENV COVERAGE_NEXTEST_FILTER="not test(telemetry::tests::test_build_span_exporter_grpc)"
+# These pre-existing tests are environment-sensitive in BuildKit: the OTLP
+# constructor rejects its hard-coded localhost URI, and the filesystem
+# unwritable probe runs as root and can still write through chmod-only
+# restrictions. Keep the exclusion narrow; both are unrelated to changed-line
+# coverage.
+ENV COVERAGE_NEXTEST_FILTER="not test(telemetry::tests::test_build_span_exporter_grpc) and not test(api::handlers::health::tests::test_probe_storage_health_filesystem_unwritable)"
 
 WORKDIR /work
 COPY . /work

@@ -16,11 +16,10 @@ The runner variant uses eight compiler jobs, incremental compilation,
 `cargo llvm-cov --no-clean`, and eight nextest threads (the lab builders have
 materially more memory than upstream's constrained ARC pods). It deletes old
 LLVM profile counters before each run, retaining compiled objects without
-allowing stale hits to inflate the report. It also excludes only
-`telemetry::tests::test_build_span_exporter_grpc`: that pre-existing test's
-hard-coded localhost OTLP URI is rejected in rootless BuildKit, after 11,744
-other lib tests passed. This exception does not apply to local runs and does not
-touch the feature tests under coverage.
+allowing stale hits to inflate the report. It also excludes two pre-existing
+environment-sensitive tests in coverage mode: the OTLP constructor with a
+hard-coded localhost URI, and the filesystem-unwritable probe that runs as root
+inside BuildKit. These exceptions do not touch the feature tests under coverage.
 
 ## What it reproduces
 
@@ -57,6 +56,7 @@ Knobs (env):
 NEW_CODE_MIN=70 make local-coverage          # new-code threshold (default 70)
 TOTAL_MIN=50 make local-coverage             # overall floor (default 50)
 COVERAGE_BASE=<git-ref> make local-coverage  # diff base (default: merge-base with main)
+COVERAGE_NEXTEST_FILTER=<expr> make local-coverage  # override the default narrow exclusions
 ```
 
 ## Caching

@@ -53,8 +53,8 @@ ENV DATABASE_URL=${DATABASE_URL} \
 
 # This pre-existing OTLP constructor test passes upstream but rejects its
 # hard-coded localhost URI in the rootless BuildKit environment. Keep the
-# exclusion narrow: it is unrelated to age-gate coverage, while every other
-# lib test and all ignored age-gate integration tests remain mandatory.
+# exclusion narrow: it is unrelated to changed-line coverage, while every other
+# lib test remains mandatory.
 ENV COVERAGE_NEXTEST_FILTER="not test(telemetry::tests::test_build_span_exporter_grpc)"
 
 WORKDIR /work

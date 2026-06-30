@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run the DB-backed age-gate integration suite and upstream-equivalent coverage
-# gates on a daemonless Gitea runner. PostgreSQL lives briefly in the runner's
+# Run DB-backed integration suites or upstream-equivalent coverage gates on a
+# daemonless Gitea runner. PostgreSQL lives briefly in the runner's
 # RBAC-confined ak-smoke namespace; compilation/tests run in rootless BuildKit.
 set -euo pipefail
 

@@ -36,7 +36,7 @@ services:
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
       # New-code coverage gate knobs (match upstream defaults). COVERAGE_BASE
-      # defaults to the merge-base with `main`, i.e. exactly the age-gate patches.
+      # defaults to the merge-base with `main`.
       COVERAGE_BASE: ${COVERAGE_BASE:-}
       NEW_CODE_MIN: ${NEW_CODE_MIN:-70}
       TOTAL_MIN: ${TOTAL_MIN:-50}

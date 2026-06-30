@@ -1,5 +1,5 @@
 # Local CI image: mirrors the upstream backend `test-backend-unit` + `coverage`
-# jobs so the age-gate work can be iterated on locally with the same gates the
+# jobs so backend changes can be iterated on locally with the same gates the
 # reviewer runs. Toolchain pinned to the version the production Dockerfile uses
 # (artifact-keeper/docker/Dockerfile.backend: rustup --default-toolchain 1.93.0).
 FROM rust:1.93-bookworm

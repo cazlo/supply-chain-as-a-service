@@ -46,7 +46,7 @@ vendor-sync:
 	DRY_RUN=1 ci/upstream-sync.sh
 
 # Local mirror of the upstream backend CI (test-backend-unit + coverage jobs),
-# for iterating on the age-gate work with the reviewer's gates. See
+# for iterating on backend changes with the reviewer's gates. See
 # ci/local-ci/README.md.
 local-ci-build:
 	$(LOCAL_CI) build
@@ -57,8 +57,8 @@ local-test:
 local-coverage:
 	$(LOCAL_CI) run --rm ci bash /work/ci/local-ci/run.sh coverage
 
-# DB-backed tests/ suites that `--lib` does not build (default: age_gate_tests;
-# override with TEST=<name>). This is what actually runs patches/0003.
+# DB-backed tests/ suites that `--lib` does not build. Select a target with
+# TEST=<name>.
 local-integration:
 	$(LOCAL_CI) run --rm -e TEST ci bash /work/ci/local-ci/run.sh integration
 

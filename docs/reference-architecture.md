@@ -69,7 +69,9 @@ flowchart TB
   vendored monorepo.
 - CI runners: self-hosted runners with enough CPU, memory, disk, and cache for
   Artifact Keeper backend and web builds.
-- Builder: BuildKit, preferably with `mode=max` registry cache export/import.
+- Builder: rootless BuildKit, preferably paired with both a mounted local cache
+  volume for same-runner speed and `mode=max` registry cache export/import for
+  durable cross-runner reuse.
 - Registry: an internal OCI registry with separate cache, scratch, staging, and
   release projects.
 - Evidence: retained build records containing source revisions, image digests,
@@ -94,6 +96,13 @@ Use separate registry projects so credentials and retention can be scoped:
 
 Use different robot accounts for push-capable CI and pull-only deployment. The
 GitOps cluster should not need permission to pull from scratch or cache projects.
+
+Harbor is the working homelab implementation for initial OCI intake, scratch
+images, promotion targets, and BuildKit cache images. That is intentional: it is
+a dissimilar registry tier that avoids needing Artifact Keeper to serve the
+artifacts required to build or deploy Artifact Keeper. Larger environments can
+replace that tier with ACR, ECR, GAR, GHCR Enterprise, or another managed OCI
+registry while keeping the same cache, promotion, and digest-pinning contracts.
 
 ## Release and Quarantine Policy
 

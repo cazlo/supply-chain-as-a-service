@@ -16,7 +16,9 @@ Use custom runners when you need:
 
 A warm `mode=max` registry cache can turn large rebuilds from minutes into
 seconds for source-only changes, while still preserving an external cache that
-survives runner pod replacement.
+survives runner pod replacement. The working homelab pattern uses both: a
+mounted BuildKit cache volume for fast same-runner rebuilds, plus Harbor-hosted
+cache images for cross-runner and post-reschedule warm starts.
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"fontSize": "18px", "fontFamily": "Inter, ui-sans-serif, system-ui", "primaryTextColor": "#17212b", "lineColor": "#53616f"}} }%%
@@ -26,7 +28,8 @@ flowchart TB
   validate@{ shape: lin-rect, label: "Validate only<br/>no secrets" }
   runner@{ shape: fr-rect, label: "Repo-scoped runner<br/>Gitea or ARC" }
   buildkit@{ shape: h-cyl, label: "Rootless BuildKit<br/>remote builder" }
-  cache@{ shape: cyl, label: "Registry cache<br/>mode=max" }
+  localcache@{ shape: cyl, label: "Mounted cache<br/>runner-local" }
+  cache@{ shape: cyl, label: "Harbor cache image<br/>mode=max" }
   publish@{ shape: lin-rect, label: "Build + push<br/>backend / web" }
   sign@{ shape: hex, label: "Scan + sign<br/>verify" }
   smoke@{ shape: win-pane, label: "Scoped smoke<br/>namespace" }
@@ -34,6 +37,7 @@ flowchart TB
   pr --> gate
   gate -- no --> validate
   gate -- yes --> runner --> buildkit --> publish --> sign --> smoke
+  buildkit <--> localcache
   buildkit <--> cache
   publish --> cache
 
@@ -45,7 +49,7 @@ flowchart TB
   class pr source
   class gate,validate,sign policy
   class runner,buildkit,publish build
-  class cache registry
+  class localcache,cache registry
   class smoke deploy
 ```
 
@@ -57,10 +61,20 @@ important reusable details are:
 - Use repository-scoped labels such as `artifact-keeper-builder`; do not expose
   these runners as a general `ubuntu-latest` pool.
 - Run jobs in host mode inside a hardened runner image, not Docker-in-Docker.
-- Pair each runner with a rootless BuildKit daemon and drive it with buildx using
-  a remote builder endpoint.
+- Pair each runner pod with a rootless BuildKit sidecar and drive it with buildx
+  using a remote builder endpoint, so the workflow can use ordinary
+  `docker buildx build` commands without a Docker daemon or privileged DinD.
+- Mount persistent volumes into the runner and BuildKit containers for
+  runner-local state: the runner registration/work directory, BuildKit's local
+  cache, and any tool caches worth keeping between pod restarts on the same
+  node.
 - Export/import BuildKit cache to an internal registry project such as
-  `artifact-keeper-cache`.
+  `artifact-keeper-cache`. Harbor stores those cache references as OCI images,
+  which makes the cache shareable across runner pods and recoverable after a pod
+  replacement or node reschedule.
+- Keep the local volume cache and registry cache as separate layers. The volume
+  cache is the hot path; the Harbor cache image is the durable and cross-runner
+  warm-start path.
 - Keep the Kubernetes smoke ServiceAccount narrowly scoped. A fixed smoke
   namespace with namespaced admin rights is simpler and safer than granting
   cluster-wide namespace creation to CI.
@@ -78,8 +92,10 @@ runner scale set for this repository. Keep the same trust boundaries:
 - Use a custom runner image containing buildx, git, git-subtree, helm, kubectl,
   cosign, Trivy, make, and any language toolchains needed by source checks.
 - Run a rootless BuildKit sidecar or a separately managed BuildKit service.
-- Use registry-backed `mode=max` caches rather than relying only on pod-local
-  ephemeral storage.
+- Use persistent volume mounts for same-runner BuildKit cache and registry-backed
+  `mode=max` caches for cross-runner reuse. In an enterprise GitHub setup the
+  registry target might be ACR, ECR, GAR, GHCR, or another managed OCI registry
+  instead of Harbor.
 - Mount only the ServiceAccount permissions needed for the smoke namespace.
 - Use GitHub Environments or workflow conditions so untrusted bot PRs cannot
   access registry, signing, or cluster secrets.
@@ -94,12 +110,27 @@ instead of Gitea.
 
 Use two cache layers:
 
-- Pod or host-local cache for fast repeated builds on the same runner.
+- Runner-local mounted cache for fast repeated builds on the same runner. In
+  Kubernetes this is usually a PVC or hostPath-like volume mounted at BuildKit's
+  state directory, for example `/home/user/.local/share/buildkit` in a rootless
+  BuildKit container.
 - Registry cache for durable warm starts after runner replacement or reschedule.
+  BuildKit pushes this as an OCI cache image with `--cache-to
+  type=registry,ref=<registry>/<cache-project>/<image>:buildcache,mode=max` and
+  imports it with the matching `--cache-from`.
 
 The registry cache is the recovery layer. Do not rely on a single node-local
 cache as the only copy of build acceleration state, and do not put release
 artifacts in the same retention bucket as scratch images.
+
+The homelab uses Harbor for this initial OCI intake because it is a deliberately
+dissimilar dependency from Artifact Keeper itself: Artifact Keeper should not
+have to serve the image or cache artifacts required to build and deploy Artifact
+Keeper. In a corporate environment, the same role can be filled by a managed OCI
+registry such as ACR, ECR, GAR, GHCR Enterprise, or a hosted Harbor deployment.
+The key contract is not "must be Harbor"; it is "the build/promotion registry is
+available before Artifact Keeper and is independent enough to avoid circular
+bootstrap dependencies."
 
 ## Minimal Secret Set
 

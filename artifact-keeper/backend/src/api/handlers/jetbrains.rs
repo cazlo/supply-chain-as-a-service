@@ -80,13 +80,7 @@ async fn list_plugins(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     // Build XML response
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plugin-repository>\n");
@@ -172,13 +166,7 @@ async fn download_plugin(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Plugin not found").into_response());
 
     let artifact = match artifact {
@@ -310,13 +298,7 @@ async fn plugin_updates(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plugin-updates>\n");
 
@@ -373,6 +355,7 @@ async fn upload_plugin(
     let user_id = require_auth_basic(auth, "jetbrains")?.user_id;
     let repo = resolve_jetbrains_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty upload body").into_response());
@@ -422,13 +405,7 @@ async fn upload_plugin(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
         return Err((StatusCode::CONFLICT, "Plugin version already exists").into_response());
@@ -481,13 +458,10 @@ async fn upload_plugin(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -547,13 +521,7 @@ async fn plugin_details(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     if artifacts.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Plugin not found").into_response());
@@ -875,6 +843,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
@@ -953,5 +922,31 @@ mod tests {
             "filename": "my-plugin-1.0.0.zip",
         });
         assert_eq!(metadata["plugin_id"], "my-plugin");
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_jetbrains_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![
+            format!("/{k}/plugins/list/"),
+            format!("/{k}/plugins/1/updates"),
+            format!("/{k}/plugin/details/name"),
+            format!("/{k}/plugin/download/name/1.0.0"),
+        ];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }

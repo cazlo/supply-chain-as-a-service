@@ -1879,18 +1879,26 @@ mod tests {
             Arc::new(crate::services::scan_result_service::ScanResultService::new(fx.pool.clone()));
         let scan_config_service =
             Arc::new(crate::services::scan_config_service::ScanConfigService::new(fx.pool.clone()));
+        let scanner_auth = Arc::new(crate::services::auth_service::AuthService::new(
+            fx.pool.clone(),
+            Arc::new(crate::config::Config::test_config()),
+        ));
         let scanner = Arc::new(crate::services::scanner_service::ScannerService::new(
             fx.pool.clone(),
             advisory_client,
             scan_result_service,
             scan_config_service,
             None, // trivy_url
+            None, // trivy_adapter_url
             fx.state.storage.clone(),
             fx.state.storage_registry.clone(),
             fx.storage_dir.to_string_lossy().into_owned(),
             "/tmp/scan".to_string(),
             None, // openscap_url
             "standard".to_string(),
+            scanner_auth,
+            None, // scan_identity: anonymous pulls in test
+            300,  // scan_token_ttl_seconds
         ));
 
         // The fixture's SharedState is `Arc<AppState>` with `scanner_service:

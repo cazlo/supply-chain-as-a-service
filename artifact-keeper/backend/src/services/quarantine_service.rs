@@ -10,11 +10,74 @@
 //! 2. Global env vars `QUARANTINE_ENABLED` / `QUARANTINE_DURATION_MINUTES`
 //! 3. Hardcoded defaults (disabled, 60 minutes)
 
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+use std::time::Instant;
+
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+
+// NOTE: `std::time::Duration` is referenced fully-qualified below to avoid
+// clashing with `chrono::Duration` imported above.
+
+/// How long a repo's quarantine override lookup stays cached.
+const QUARANTINE_CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The `repository_config` quarantine override tuple: `(enabled, duration)`.
+type RepoQuarantineSettings = (Option<bool>, Option<i64>);
+
+/// Per-repo cache of the `repository_config` quarantine override lookup.
+///
+/// `resolve_config` runs on every proxy fetch and upload; the per-repo
+/// `repository_config` SELECT it makes returns nothing for the common case (no
+/// override). Caching the resolved tuple for a short TTL skips that query on
+/// the hot path. `invalidate_config_cache` (called by the settings-update
+/// handler) makes changes take effect immediately; the TTL only bounds
+/// staleness for edits made out of process.
+fn config_cache() -> &'static RwLock<HashMap<Uuid, (Instant, RepoQuarantineSettings)>> {
+    static CACHE: OnceLock<RwLock<HashMap<Uuid, (Instant, RepoQuarantineSettings)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Return a repo's cached override tuple if the entry is still fresh.
+fn cached_repo_settings(repository_id: Uuid) -> Option<RepoQuarantineSettings> {
+    let cache = config_cache().read().ok()?;
+    let (inserted, settings) = cache.get(&repository_id)?;
+    (inserted.elapsed() < QUARANTINE_CONFIG_TTL).then_some(*settings)
+}
+
+/// Record a repo's override tuple, evicting expired entries to bound memory.
+/// Recovers from a poisoned lock (mirroring `permission_service`) so a poisoned
+/// write cannot silently turn the cache into a permanent no-op.
+fn store_repo_settings(repository_id: Uuid, settings: RepoQuarantineSettings) {
+    let mut cache = match config_cache().write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!("quarantine config cache write lock poisoned, recovering to store");
+            poisoned.into_inner()
+        }
+    };
+    cache.retain(|_, (inserted, _)| inserted.elapsed() < QUARANTINE_CONFIG_TTL);
+    cache.insert(repository_id, (Instant::now(), settings));
+}
+
+/// Drop a repo's cached quarantine settings after they change. Recovers from a
+/// poisoned lock so a stale entry can never outlive a settings update.
+pub fn invalidate_config_cache(repository_id: Uuid) {
+    match config_cache().write() {
+        Ok(mut cache) => {
+            cache.remove(&repository_id);
+        }
+        Err(poisoned) => {
+            tracing::error!("quarantine config cache write lock poisoned, recovering");
+            poisoned.into_inner().remove(&repository_id);
+        }
+    }
+}
 
 /// Default quarantine duration in minutes when not configured.
 const DEFAULT_DURATION_MINUTES: i64 = 60;
@@ -183,8 +246,16 @@ pub async fn resolve_config(db: &PgPool, repository_id: Uuid) -> QuarantineConfi
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_DURATION_MINUTES);
 
-    // Per-repo overrides from repository_config take precedence.
-    let (enabled, duration) = repo_settings(db, repository_id).await;
+    // Per-repo overrides from repository_config take precedence. Cached for a
+    // short TTL (invalidated on write) so this stays off the DB on the hot path.
+    let (enabled, duration) = match cached_repo_settings(repository_id) {
+        Some(cached) => cached,
+        None => {
+            let settings = repo_settings(db, repository_id).await;
+            store_repo_settings(repository_id, settings);
+            settings
+        }
+    };
 
     QuarantineConfig {
         enabled: enabled.unwrap_or(global_enabled),
@@ -207,6 +278,78 @@ pub async fn set_quarantine(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
+}
+
+/// Apply the upload-time quarantine hold to a freshly-uploaded artifact.
+///
+/// Resolves the repository's quarantine config and, when enabled, marks the
+/// artifact `quarantined` with an expiry `duration_minutes` in the future so
+/// the download gate ([`check_download_allowed`]) holds it until release. This
+/// is the single place the hold is applied on upload; every hosted format
+/// upload path funnels through it (directly or via [`apply_upload_hold_hosted`])
+/// so the Package Age Policy is enforced consistently rather than per-format.
+///
+/// Best-effort: any failure to persist the hold is logged and swallowed so a
+/// transient error never fails an otherwise-successful upload. No-op when
+/// quarantine is disabled for the repository (the default), keeping existing
+/// deployments backwards-compatible.
+pub async fn apply_upload_hold(db: &PgPool, repository_id: Uuid, artifact_id: Uuid) {
+    let config = resolve_config(db, repository_id).await;
+    if !should_quarantine(&config) {
+        return;
+    }
+    let until = quarantine_until(&config, Utc::now());
+    match set_quarantine(
+        db,
+        artifact_id,
+        QuarantineState::Quarantined.as_str(),
+        Some(until),
+    )
+    .await
+    {
+        Ok(()) => tracing::info!(
+            artifact_id = %artifact_id,
+            quarantine_until = %until,
+            "Artifact quarantined on upload"
+        ),
+        Err(e) => tracing::error!(
+            artifact_id = %artifact_id,
+            error = %e,
+            "Failed to set quarantine status on uploaded artifact"
+        ),
+    }
+}
+
+/// Apply the upload-time quarantine hold, but only for hosted repositories.
+///
+/// Proxy/remote and virtual repositories cache upstream artifacts with their
+/// own sidecar quarantine state (the Package Age Policy hold is measured from
+/// the upstream release date), so a cache insert must not be re-held here. The
+/// shared insert paths (`proxy_helpers::insert_artifact` and the format upload
+/// handlers) can be reached from those cache flows, so this guard scopes the
+/// hold to hosted (`Local`/`Staging`) repositories. Best-effort like
+/// [`apply_upload_hold`].
+pub async fn apply_upload_hold_hosted(db: &PgPool, repository_id: Uuid, artifact_id: Uuid) {
+    if repo_is_hosted(db, repository_id).await {
+        apply_upload_hold(db, repository_id, artifact_id).await;
+    }
+}
+
+/// Return true when the repository is hosted (`Local` or `Staging`).
+///
+/// Defaults to `false` (skip the hold) when the type cannot be read, so a
+/// transient lookup error never double-holds a proxy cache insert. Uses a
+/// runtime query (not the compile-time-checked macro) so the guard needs no
+/// prepared-query metadata.
+async fn repo_is_hosted(db: &PgPool, repository_id: Uuid) -> bool {
+    let repo_type: Option<String> =
+        sqlx::query_scalar("SELECT repo_type::text FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    matches!(repo_type.as_deref(), Some("local") | Some("staging"))
 }
 
 /// Transition a quarantined artifact to released or rejected.
@@ -592,5 +735,176 @@ mod tests {
             crate::error::AppError::Conflict(_) => {}
             other => panic!("Expected Conflict error, got: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_config cache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_cache_store_and_invalidate() {
+        let id = Uuid::new_v4();
+        assert!(cached_repo_settings(id).is_none());
+        store_repo_settings(id, (Some(true), Some(15)));
+        assert_eq!(cached_repo_settings(id), Some((Some(true), Some(15))));
+        invalidate_config_cache(id);
+        assert!(cached_repo_settings(id).is_none());
+    }
+
+    // DATABASE_URL-gated: covers resolve_config's cache-miss (query + populate)
+    // and cache-hit paths, plus invalidation. The fixture repo has no override
+    // in the DB, so a cached duration of 15 can only come from the cache.
+    #[tokio::test]
+    async fn test_resolve_config_uses_cache_and_invalidation() {
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("remote", "maven").await
+        else {
+            return;
+        };
+        // Start empty: the first call is a cache miss that queries the DB and
+        // populates the cache.
+        invalidate_config_cache(fx.repo_id);
+        let _ = resolve_config(&fx.pool, fx.repo_id).await;
+        assert!(
+            cached_repo_settings(fx.repo_id).is_some(),
+            "a cache miss must populate the cache"
+        );
+        // Seed a sentinel override; resolve_config must serve it from the cache
+        // rather than the DB (which has no override for this repo).
+        store_repo_settings(fx.repo_id, (Some(true), Some(15)));
+        let cfg = resolve_config(&fx.pool, fx.repo_id).await;
+        assert!(cfg.enabled, "cached override should be read");
+        assert_eq!(cfg.duration_minutes, 15, "cached duration should be served");
+        // Invalidation drops the entry (env-independent assertion).
+        invalidate_config_cache(fx.repo_id);
+        assert!(
+            cached_repo_settings(fx.repo_id).is_none(),
+            "invalidation must drop the cache entry"
+        );
+        fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_upload_hold / apply_upload_hold_hosted (DB-backed; no-op without
+    // DATABASE_URL). These cover the consolidated upload-time hold: it marks a
+    // freshly-uploaded artifact quarantined when the repo has quarantine
+    // enabled, is a no-op when disabled, and is skipped for non-hosted (proxy)
+    // repositories so a cache insert is never double-held.
+    // -----------------------------------------------------------------------
+
+    async fn enable_quarantine(pool: &PgPool, repo_id: Uuid, minutes: i64) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, $2, $3), ($1, $4, $5)",
+        )
+        .bind(repo_id)
+        .bind("quarantine_enabled")
+        .bind("true")
+        .bind("quarantine_duration_minutes")
+        .bind(minutes.to_string())
+        .execute(pool)
+        .await
+        .expect("enable quarantine config");
+        invalidate_config_cache(repo_id);
+    }
+
+    async fn seed_row(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        repo_type: &str,
+        path: &str,
+    ) -> Uuid {
+        crate::api::handlers::test_db_helpers::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info(repo_type, None),
+            path,
+            path,
+            "pkg",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_apply_upload_hold_sets_quarantine_when_enabled() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        // Seed while quarantine is disabled (default): the row must start
+        // un-held so the assertion isolates the effect of apply_upload_hold.
+        let aid = seed_row(&fx, "local", "com/example/a/1.0/a-1.0.jar").await;
+        let (status, _) = get_status(&fx.pool, aid).await.expect("status");
+        assert_eq!(status, None, "artifact must start un-quarantined");
+
+        enable_quarantine(&fx.pool, fx.repo_id, 120).await;
+        let before = Utc::now();
+        apply_upload_hold(&fx.pool, fx.repo_id, aid).await;
+
+        let (status, until) = get_status(&fx.pool, aid).await.expect("status");
+        assert_eq!(status.as_deref(), Some("quarantined"));
+        let until = until.expect("quarantine_until must be set");
+        assert!(until > before, "expiry must be in the future");
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_upload_hold_noop_when_disabled() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let aid = seed_row(&fx, "local", "com/example/b/1.0/b-1.0.jar").await;
+        apply_upload_hold(&fx.pool, fx.repo_id, aid).await;
+        let (status, until) = get_status(&fx.pool, aid).await.expect("status");
+        assert_eq!(
+            status, None,
+            "disabled quarantine must not hold the artifact"
+        );
+        assert_eq!(until, None);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_insert_artifact_holds_hosted_when_enabled() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("local", "maven").await else {
+            return;
+        };
+        // Enable first, then seed through the insert_artifact chokepoint so the
+        // hold is applied end-to-end for a helper-based hosted upload.
+        enable_quarantine(&fx.pool, fx.repo_id, 60).await;
+        let aid = seed_row(&fx, "local", "com/example/c/1.0/c-1.0.jar").await;
+        let (status, _) = get_status(&fx.pool, aid).await.expect("status");
+        assert_eq!(
+            status.as_deref(),
+            Some("quarantined"),
+            "hosted upload via insert_artifact must be held when quarantine is enabled"
+        );
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_upload_hold_hosted_skips_proxy_repo() {
+        use crate::api::handlers::test_db_helpers::Fixture;
+        let Some(fx) = Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        // A remote repo with quarantine enabled: a cache-style insert must NOT
+        // be quarantine-held (it carries its own sidecar hold), and an explicit
+        // hosted-scoped call must also skip it.
+        enable_quarantine(&fx.pool, fx.repo_id, 60).await;
+        let aid = seed_row(&fx, "remote", "com/example/d/1.0/d-1.0.jar").await;
+        apply_upload_hold_hosted(&fx.pool, fx.repo_id, aid).await;
+        let (status, until) = get_status(&fx.pool, aid).await.expect("status");
+        assert_eq!(
+            status, None,
+            "proxy/remote cache insert must not be quarantine-held"
+        );
+        assert_eq!(until, None);
+        fx.teardown().await;
     }
 }

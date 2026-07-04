@@ -264,7 +264,7 @@ async fn query_release_versions(
     .await
     .map_err(|e| {
         swift_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -365,7 +365,7 @@ async fn query_release_metadata(
     .await
     .map_err(|e| {
         swift_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -500,7 +500,7 @@ async fn download_archive(
     .await
     .map_err(|e| {
         swift_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -643,7 +643,7 @@ async fn query_manifest(
     .await
     .map_err(|e| {
         swift_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -727,7 +727,7 @@ async fn fetch_manifest(
             .await
             .map_err(|e| {
                 swift_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    crate::api::handlers::db_status(&e),
                     &format!("Database error: {}", e),
                 )
             })?;
@@ -793,6 +793,7 @@ async fn publish_release(
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // Validate path
     let _info = SwiftHandler::parse_path(&format!("{}/{}/{}", scope, name, version))
@@ -819,7 +820,7 @@ async fn publish_release(
     .await
     .map_err(|e| {
         swift_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -896,10 +897,13 @@ async fn publish_release(
     .await
     .map_err(|e| {
         swift_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -974,7 +978,7 @@ async fn lookup_identifiers(
     .await
     .map_err(|e| {
         swift_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?;
@@ -1151,6 +1155,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.storage_path, "/data/swift-repo");
@@ -1167,6 +1172,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://swift-packages.example.com".to_string()),
+            promotion_only: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
@@ -1447,5 +1453,30 @@ mod tests {
         let manifest = extract_manifest_from_zip(&buf).expect("manifest at cap must be accepted");
         assert!(manifest.contains("swift-tools-version:5.9"));
         assert!((manifest.len() as u64) <= MAX_MANIFEST_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_swift_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "swift").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![
+            format!("/{k}/identifiers?url=https://example.test/pkg.git"),
+            format!("/{k}/scope/name"),
+            format!("/{k}/scope/name/1.0.0"),
+        ];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }

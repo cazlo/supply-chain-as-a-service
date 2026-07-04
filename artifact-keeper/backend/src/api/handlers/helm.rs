@@ -446,6 +446,7 @@ async fn upload_chart(
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // Extract chart file from multipart form (field name: "chart")
     let mut chart_content: Option<Bytes> = None;
@@ -595,13 +596,7 @@ async fn delete_chart(
         .bind(artifact_id)
         .execute(&state.db)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(crate::api::handlers::db_err)?;
 
     // Update repository timestamp
     let _ = sqlx::query!(
@@ -760,6 +755,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(repo.repo_type, "hosted");
         assert!(repo.upstream_url.is_none());
@@ -774,6 +770,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://charts.helm.sh/stable".to_string()),
+            promotion_only: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
@@ -1129,6 +1126,7 @@ entries:
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some(upstream_url),
+            promotion_only: false,
         };
 
         let result = download_chart_via_index(&state, &repo, "tc", "2.0.0", "tc-2.0.0.tgz").await;
@@ -1160,6 +1158,7 @@ entries:
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
 
         let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
@@ -1183,11 +1182,36 @@ entries:
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
 
         let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(matches!(result, Ok(None)));
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_helm_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![
+            format!("/{k}/index.yaml"),
+            format!("/{k}/charts/name-1.0.0.tgz"),
+        ];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }

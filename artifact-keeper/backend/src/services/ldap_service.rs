@@ -313,6 +313,13 @@ impl LdapService {
                 SET email = $1, display_name = $2, is_admin = $3,
                     last_login_at = NOW(), updated_at = NOW()
                 WHERE id = $4
+                  AND (
+                    email IS DISTINCT FROM $1
+                    OR display_name IS DISTINCT FROM $2
+                    OR is_admin IS DISTINCT FROM $3
+                    OR last_login_at IS NULL
+                    OR last_login_at < NOW() - INTERVAL '5 minutes'
+                  )
                 "#,
                 ldap_user.email,
                 ldap_user.display_name,
@@ -751,6 +758,7 @@ mod tests {
             ldap_url: Some("ldap://localhost:389".into()),
             ldap_base_dn: Some("dc=example,dc=com".into()),
             trivy_url: None,
+            trivy_adapter_url: None,
             openscap_url: None,
             openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
             opensearch_url: None,
@@ -777,6 +785,7 @@ mod tests {
             stuck_scan_reap_limit: 1000,
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
+            sso_disable_admin_break_glass: false,
             metrics_port: None,
             database_max_connections: 20,
             database_min_connections: 5,
@@ -799,6 +808,7 @@ mod tests {
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
             rate_limit_trusted_cidrs: Vec::new(),
+            rate_limit_trusted_proxy_cidrs: Vec::new(),
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
@@ -822,6 +832,7 @@ mod tests {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".to_string(),
             smtp_tls_mode: "starttls".to_string(),
+            scan_token_ttl_seconds: 300,
         }
     }
 

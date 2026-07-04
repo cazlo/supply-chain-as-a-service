@@ -74,16 +74,19 @@ impl RepositoryType {
     /// Parse a source-side repository type string.
     ///
     /// Accepts both the Artifactory vocabulary (`local` / `remote` /
-    /// `virtual`) and the Nexus vocabulary (`hosted` / `proxy` / `group`).
-    /// The two sets denote the same three logical kinds — the enum doc
-    /// comments above have always pinned this mapping. Prior to this fix
-    /// the function only matched the Artifactory triple, so every Nexus
+    /// `virtual` / `federated`) and the Nexus vocabulary (`hosted` / `proxy` /
+    /// `group`). These denote the same three logical kinds — the enum doc
+    /// comments above have always pinned this mapping. Artifactory
+    /// `federated` repos store artifacts locally (a local repo that also
+    /// mirrors to peer instances), so they map to `Local`. Prior to these
+    /// fixes the function only matched the Artifactory triple, so every Nexus
     /// repository was rejected by `prepare_repository_migration` with
     /// `Unknown repository type: hosted` and an entire Nexus source was
-    /// effectively un-migratable (issue #1889).
+    /// effectively un-migratable (issue #1889); `federated` sources hit the
+    /// same wall with `Unknown repository type: FEDERATED`.
     pub fn from_artifactory(rclass: &str) -> Option<Self> {
         match rclass.to_lowercase().as_str() {
-            "local" | "hosted" => Some(Self::Local),
+            "local" | "hosted" | "federated" => Some(Self::Local),
             "remote" | "proxy" => Some(Self::Remote),
             "virtual" | "group" => Some(Self::Virtual),
             _ => None,
@@ -384,6 +387,7 @@ impl MigrationService {
     pub async fn create_repository(
         &self,
         config: &RepositoryMigrationConfig,
+        storage_base: &str,
     ) -> Result<Uuid, MigrationError> {
         // Check compatibility
         if config.format_compatibility == FormatCompatibility::Unsupported {
@@ -405,8 +409,9 @@ impl MigrationService {
         // The repositories table schema has no `metadata`, `display_name`, or
         // `repository_type` columns. The corresponding columns are `name` and
         // `repo_type`, and `storage_path` is NOT NULL — so the INSERT must
-        // supply it. We default storage_path to the repository key, matching
-        // how local repos are typically named by the storage backend.
+        // supply it. storage_path is stored absolute (under STORAGE_PATH),
+        // matching the HTTP create-repo handler.
+        let storage_path = format!("{}/{}", storage_base, config.target_key);
         let repo_id: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO repositories (key, name, description, format, repo_type, storage_path)
@@ -419,7 +424,7 @@ impl MigrationService {
         .bind(&config.description)
         .bind(&format)
         .bind(repo_type)
-        .bind(&config.target_key) // storage_path defaults to key
+        .bind(&storage_path)
         .fetch_one(&self.db)
         .await?;
 
@@ -1479,6 +1484,10 @@ mod tests {
             RepositoryType::from_artifactory("virtual"),
             Some(RepositoryType::Virtual)
         );
+        assert_eq!(
+            RepositoryType::from_artifactory("federated"),
+            Some(RepositoryType::Local)
+        );
     }
 
     #[test]
@@ -1499,11 +1508,9 @@ mod tests {
 
     #[test]
     fn test_repository_type_from_artifactory_unknown() {
-        // `federated` (Artifactory) and `unknown_kind` are genuinely
-        // unmapped. `hosted` used to live here too — see #1889; it is
-        // Nexus's name for `Local` and is now accepted by
-        // `from_artifactory` via the alias branch below.
-        assert_eq!(RepositoryType::from_artifactory("federated"), None);
+        // `hosted` used to live here too — see #1889; it is Nexus's name
+        // for `Local` and is now accepted via the alias branch. `federated`
+        // maps to `Local` because federated repos store artifacts locally.
         assert_eq!(RepositoryType::from_artifactory(""), None);
         assert_eq!(RepositoryType::from_artifactory("unknown_kind"), None);
     }
@@ -2064,11 +2071,11 @@ mod tests {
         use crate::services::artifactory_client::RepositoryListItem;
 
         let repo = RepositoryListItem {
-            key: "federated-repo".to_string(),
-            repo_type: "federated".to_string(),
+            key: "unknown-repo".to_string(),
+            repo_type: "unknown_kind".to_string(),
             package_type: "maven".to_string(),
             description: None,
-            url: Some("http://artifactory/federated-repo".to_string()),
+            url: Some("http://artifactory/unknown-repo".to_string()),
         };
 
         let result = MigrationService::prepare_repository_migration(&repo, None);

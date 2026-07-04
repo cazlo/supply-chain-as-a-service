@@ -37,6 +37,35 @@ pub struct FederatedCredentials {
     pub groups: Vec<String>,
     /// Required group name for admin role (exact match); when set, replaces default pattern matching
     pub required_admin_group: Option<String>,
+    /// Whether a first-time login may auto-provision a local account for this
+    /// identity provider. When `false`, an authenticated principal that has no
+    /// existing local user is rejected instead of being created on the fly
+    /// (issue #2057, honours the OIDC "Auto Create Users" switch). Providers
+    /// without an explicit toggle (LDAP/SAML) pass `true` to preserve behaviour.
+    pub auto_create_users: bool,
+}
+
+/// Decide whether a federated login is allowed to proceed given the provider's
+/// auto-provisioning policy (issue #2057).
+///
+/// An identity provider may authenticate a principal that has no local account
+/// yet. Auto-creating that account is gated behind the provider's "Auto Create
+/// Users" switch: when it is off, the login is refused instead of silently
+/// creating a user. Principals that already have a local account are always
+/// allowed through so existing users keep working regardless of the toggle.
+///
+/// Returns `Err(AppError::Authorization)` (HTTP 403) when provisioning is
+/// required but disabled, and `Ok(())` otherwise.
+#[allow(clippy::result_large_err)]
+fn guard_federated_provisioning(user_exists: bool, auto_create_users: bool) -> Result<()> {
+    if !user_exists && !auto_create_users {
+        return Err(AppError::Authorization(
+            "This identity provider does not allow automatic account creation; \
+             ask an administrator to create your account first"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Result of group-to-role mapping
@@ -103,6 +132,15 @@ pub struct Claims {
     /// family. Set on refresh tokens only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family_id: Option<Uuid>,
+    /// Repository routing key this token is authorized to *pull* from, and
+    /// ONLY that repository (#2093). Present only on scanner-minted tokens
+    /// (see [`AuthService::generate_scan_token`]); enforced by
+    /// `oci_v2::enforce_scan_pull_scope` on the OCI blob/manifest read
+    /// handlers. `None` on every normal (login / refresh / API-token-exchange)
+    /// token, where it is a no-op — normal tokens are unaffected. `Option`
+    /// with a serde default so pre-existing tokens deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_pull_repo: Option<String>,
 }
 
 impl Claims {
@@ -951,15 +989,29 @@ impl AuthService {
             ));
         }
 
-        // Successful login: reset lockout counters and record last login
+        // Successful login: reset lockout counters and record last login.
+        // last_login_at is throttled to once per 5 minutes (display-only field,
+        // #2107), but the lockout counters MUST always be reset on a valid
+        // login, so the row is still written whenever any counter is non-clean.
         sqlx::query!(
             r#"
             UPDATE users
-            SET last_login_at = NOW(),
+            SET last_login_at = CASE
+                    WHEN last_login_at IS NULL
+                         OR last_login_at < NOW() - INTERVAL '5 minutes'
+                    THEN NOW() ELSE last_login_at
+                END,
                 failed_login_attempts = 0,
                 locked_until = NULL,
                 last_failed_login_at = NULL
             WHERE id = $1
+              AND (
+                last_login_at IS NULL
+                OR last_login_at < NOW() - INTERVAL '5 minutes'
+                OR failed_login_attempts > 0
+                OR locked_until IS NOT NULL
+                OR last_failed_login_at IS NOT NULL
+              )
             "#,
             user.id
         )
@@ -1036,6 +1088,7 @@ impl AuthService {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let refresh_jti = Uuid::new_v4();
@@ -1050,6 +1103,7 @@ impl AuthService {
             token_type: "refresh".to_string(),
             jti: Some(refresh_jti),
             family_id: Some(family_id),
+            scan_pull_repo: None,
         };
 
         let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
@@ -1063,6 +1117,50 @@ impl AuthService {
             refresh_token,
             expires_in: (self.config.jwt_access_token_expiry_minutes * 60) as u64,
         })
+    }
+
+    /// Mint a short-lived, single-repository *pull* token for the scanner
+    /// service account (#2093).
+    ///
+    /// Unlike [`generate_tokens`], this returns a bare access-token string
+    /// carrying a `scan_pull_repo` claim that pins the token to exactly one
+    /// repository routing key. `oci_v2::enforce_scan_pull_scope` rejects any
+    /// blob/manifest read whose repository key does not match, so a leaked
+    /// scan token cannot be used to pull *other* private repositories — it is
+    /// narrower than a normal JWT, never wider.
+    ///
+    /// * `ttl_seconds` is a hard, short expiry (config `scan_token_ttl_seconds`,
+    ///   default 300s) — far below the 30-minute interactive access-token TTL.
+    /// * `is_admin` mirrors the passed identity (the scanner account is a
+    ///   non-admin service account) — an admin claim would bypass the per-repo
+    ///   gate, so this MUST never be forced to `true`.
+    /// * No refresh token is issued and the result is NEVER logged.
+    pub fn generate_scan_token(
+        &self,
+        user: &User,
+        repo_key: &str,
+        ttl_seconds: i64,
+    ) -> Result<String> {
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
+        let exp = now + Duration::seconds(ttl_seconds);
+
+        let claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            iat: now.timestamp(),
+            iat_ms: Some(now_ms),
+            exp: exp.timestamp(),
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: Some(repo_key.to_string()),
+        };
+
+        encode(&Header::default(), &claims, &self.encoding_key)
+            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
     }
 
     /// Persist a refresh-token `jti` so future presentations can detect
@@ -1349,6 +1447,36 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("User not found".to_string()))
+    }
+
+    /// Load the dedicated, non-login scanner service account (`_ak_scanner`,
+    /// migration 138) used to mint per-repository scan pull tokens (#2093).
+    ///
+    /// Returns `Ok(None)` when the account has not been seeded yet (e.g. before
+    /// migrations run), in which case image scans fall back to anonymous pulls
+    /// (public repositories only) rather than failing. The lookup is pinned to
+    /// `is_service_account = true` so it can never resolve a same-named human
+    /// account.
+    pub async fn load_scanner_identity(&self) -> Result<Option<User>> {
+        sqlx::query_as!(
+            User,
+            r#"
+            SELECT
+                id, username, email, password_hash, display_name,
+                auth_provider as "auth_provider: AuthProvider",
+                external_id, is_admin, is_active, is_service_account, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                failed_login_attempts, locked_until, last_failed_login_at,
+                password_changed_at, last_login_at, created_at, updated_at
+            FROM users
+            WHERE username = '_ak_scanner'
+              AND is_service_account = true
+              AND is_active = true
+            "#
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Revoke every refresh token in every active family for `user_id`. Called
@@ -1867,9 +1995,12 @@ impl AuthService {
             ));
         }
 
-        // Update last login
+        // Update last login. Throttled to at most once per 5 minutes per user
+        // (display-only field, #2107) to avoid needless WAL churn on re-auth.
         sqlx::query!(
-            "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+            "UPDATE users SET last_login_at = NOW() \
+             WHERE id = $1 \
+               AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
             user.id
         )
         .execute(&self.db)
@@ -1892,9 +2023,12 @@ impl AuthService {
         // Sync or create the user based on federated credentials
         let user = self.sync_federated_user(provider, &credentials).await?;
 
-        // Update last login
+        // Update last login. Throttled to at most once per 5 minutes per user
+        // (display-only field, #2107) to avoid needless WAL churn on re-auth.
         sqlx::query!(
-            "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+            "UPDATE users SET last_login_at = NOW() \
+             WHERE id = $1 \
+               AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
             user.id
         )
         .execute(&self.db)
@@ -2153,6 +2287,11 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // #2057: honour the provider's "Auto Create Users" switch. A brand-new
+        // federated principal may only be provisioned when auto-create is on;
+        // otherwise the login is rejected rather than silently creating a user.
+        guard_federated_provisioning(existing_user.is_some(), credentials.auto_create_users)?;
+
         let user = if let Some(existing) = existing_user {
             // Update existing user with latest information from provider
             sqlx::query_as!(
@@ -2386,6 +2525,7 @@ impl AuthService {
             token_type: "totp_pending".to_string(),
             jti: Some(Uuid::new_v4()),
             family_id: None,
+            scan_pull_repo: None,
         };
         encode(&Header::default(), &claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
@@ -2475,6 +2615,153 @@ fn check_token_validation_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // last_login_at write throttling (#2107)
+    //
+    // These DB-backed tests no-op cleanly when DATABASE_URL is unset. CI
+    // provisions Postgres + migrations before `cargo test --lib`, so they run
+    // for real there.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_password_login_throttles_last_login_but_always_resets_lockout() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+
+        let id = Uuid::new_v4();
+        let username = format!("throttle_pw_{id}");
+        let password = "Correct!Horse9Battery";
+        let hash = AuthService::hash_password(password).await.unwrap();
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin) \
+             VALUES ($1, $2, $3, $4, 'local', true, false)",
+            id,
+            username,
+            format!("{username}@example.com"),
+            hash
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // (1) First successful login records last_login_at.
+        svc.authenticate(&username, password).await.unwrap();
+        let t1: Option<DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(t1.is_some(), "first login must set last_login_at");
+
+        // (2) A second login inside the 5-minute window does NOT advance it.
+        svc.authenticate(&username, password).await.unwrap();
+        let t2: Option<DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(t1, t2, "last_login_at must not advance within 5 minutes");
+
+        // (3) SECURITY: even inside the throttle window, a valid login MUST
+        // still clear lockout counters, or a user stays locked after logging
+        // in with the correct password.
+        sqlx::query!(
+            "UPDATE users \
+             SET failed_login_attempts = 3, \
+                 locked_until = NOW() + INTERVAL '10 minutes', \
+                 last_failed_login_at = NOW() \
+             WHERE id = $1",
+            id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        svc.authenticate(&username, password).await.unwrap();
+        let row = sqlx::query!(
+            "SELECT failed_login_attempts, locked_until, last_failed_login_at, last_login_at \
+             FROM users WHERE id = $1",
+            id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.failed_login_attempts, 0,
+            "lockout counter must reset on valid login even within throttle window"
+        );
+        assert!(row.locked_until.is_none(), "locked_until must clear");
+        assert!(
+            row.last_failed_login_at.is_none(),
+            "last_failed_login_at must clear"
+        );
+        assert_eq!(
+            row.last_login_at, t1,
+            "last_login_at still throttled inside the window"
+        );
+
+        sqlx::query!("DELETE FROM users WHERE id = $1", id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_standalone_login_throttles_last_login_at() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+
+        // LDAP hybrid mode: password_hash stored, auth_provider = 'ldap'.
+        let id = Uuid::new_v4();
+        let username = format!("throttle_ldap_{id}");
+        let password = "Correct!Horse9Battery";
+        let hash = AuthService::hash_password(password).await.unwrap();
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin) \
+             VALUES ($1, $2, $3, $4, 'ldap', true, false)",
+            id,
+            username,
+            format!("{username}@example.com"),
+            hash
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // (1) First login sets last_login_at on the standalone path.
+        svc.authenticate_ldap(&username, password).await.unwrap();
+        let t1: Option<DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            t1.is_some(),
+            "first standalone login must set last_login_at"
+        );
+
+        // (2) A repeat login within 5 minutes does NOT advance it.
+        svc.authenticate_ldap(&username, password).await.unwrap();
+        let t2: Option<DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT last_login_at FROM users WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            t1, t2,
+            "standalone last_login_at must not advance within 5 minutes"
+        );
+
+        sqlx::query!("DELETE FROM users WHERE id = $1", id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn test_password_hashing() {
@@ -2761,6 +3048,7 @@ mod tests {
             ldap_url: None,
             ldap_base_dn: None,
             trivy_url: None,
+            trivy_adapter_url: None,
             openscap_url: None,
             openscap_profile: "standard".to_string(),
             opensearch_url: None,
@@ -2787,6 +3075,7 @@ mod tests {
             stuck_scan_reap_limit: 1000,
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
+            sso_disable_admin_break_glass: false,
             metrics_port: None,
             database_max_connections: 20,
             database_min_connections: 5,
@@ -2809,6 +3098,7 @@ mod tests {
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
             rate_limit_trusted_cidrs: Vec::new(),
+            rate_limit_trusted_proxy_cidrs: Vec::new(),
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
@@ -2832,6 +3122,7 @@ mod tests {
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".to_string(),
             smtp_tls_mode: "starttls".to_string(),
+            scan_token_ttl_seconds: 300,
         })
     }
 
@@ -2866,6 +3157,82 @@ mod tests {
     // need JWT encoding/decoding, we directly use jsonwebtoken's encode/decode
     // with the same keys the AuthService would use.
 
+    /// Build an `AuthService` whose pool never actually connects (`connect_lazy`)
+    /// so pure token-minting/validation methods can be unit-tested with no DB.
+    fn make_lazy_auth_service() -> AuthService {
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("connect_lazy never errors on construction");
+        AuthService::new(pool, make_test_config())
+    }
+
+    #[tokio::test]
+    async fn test_generate_scan_token_is_scoped_short_lived_and_validates() {
+        let auth = make_lazy_auth_service();
+        let user = make_test_user(); // is_admin = false
+        let ttl = 300;
+
+        let token = auth
+            .generate_scan_token(&user, "docker-private-a", ttl)
+            .expect("scan token must mint");
+
+        // Round-trips through the normal access-token validator (#2093 scanner
+        // pull path presents this exact token to the OCI handlers).
+        let claims = auth
+            .validate_access_token(&token)
+            .expect("scan token must validate as an access token");
+
+        assert_eq!(claims.token_type, "access");
+        assert_eq!(claims.scan_pull_repo.as_deref(), Some("docker-private-a"));
+        // Must NOT be admin — an admin claim would bypass the per-repo gate.
+        assert!(!claims.is_admin, "scan token must not carry admin");
+        assert_eq!(claims.sub, user.id);
+
+        // Expiry is bounded by the short scan TTL, far under the 30-minute
+        // interactive access-token expiry.
+        let lifetime = claims.exp - claims.iat;
+        assert!(
+            lifetime <= ttl && lifetime >= ttl - 5,
+            "scan token lifetime {}s must be ~{}s (well under 30min)",
+            lifetime,
+            ttl
+        );
+        assert!(
+            lifetime < 30 * 60,
+            "scan token must be much shorter than the interactive TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_scan_token_preserves_identity_admin_flag() {
+        // A scan token minted for an admin identity keeps is_admin=true (the
+        // helper never forces false); the scanner account is seeded non-admin,
+        // so in production the gate is real. This guards the identity mapping.
+        let auth = make_lazy_auth_service();
+        let mut user = make_test_user();
+        user.is_admin = true;
+        let token = auth.generate_scan_token(&user, "repo-x", 300).unwrap();
+        let claims = auth.validate_access_token(&token).unwrap();
+        assert!(claims.is_admin);
+        assert_eq!(claims.scan_pull_repo.as_deref(), Some("repo-x"));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_access_token_without_scan_claim_still_validates() {
+        // Backward-compat: a token minted before this change (no
+        // scan_pull_repo field on the wire) must deserialize via the serde
+        // default to None and remain a valid, unscoped access token.
+        let auth = make_lazy_auth_service();
+        let user = make_test_user();
+        let tokens = auth.generate_tokens(&user).expect("tokens");
+        let claims = auth
+            .validate_access_token(&tokens.access_token)
+            .expect("normal access token must validate");
+        assert!(
+            claims.scan_pull_repo.is_none(),
+            "normal tokens carry no scan scope (no-op for enforcement)"
+        );
+    }
+
     #[test]
     fn test_generate_tokens_and_validate_access_token() {
         let config = make_test_config();
@@ -2889,6 +3256,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let refresh_claims = Claims {
@@ -2902,6 +3270,7 @@ mod tests {
             token_type: "refresh".to_string(),
             jti: Some(Uuid::new_v4()),
             family_id: Some(Uuid::new_v4()),
+            scan_pull_repo: None,
         };
 
         let access_token = encode(&Header::default(), &access_claims, &encoding_key).unwrap();
@@ -2949,6 +3318,7 @@ mod tests {
             token_type: "refresh".to_string(),
             jti: Some(Uuid::new_v4()),
             family_id: Some(Uuid::new_v4()),
+            scan_pull_repo: None,
         };
 
         let token = encode(&Header::default(), &refresh_claims, &encoding_key).unwrap();
@@ -2979,6 +3349,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -3003,6 +3374,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -3028,6 +3400,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();
@@ -3055,6 +3428,7 @@ mod tests {
             token_type: "refresh".to_string(),
             jti: Some(jti),
             family_id: Some(family),
+            scan_pull_repo: None,
         };
         let json = serde_json::to_string(&claims).unwrap();
         assert!(json.contains("jti"));
@@ -3104,10 +3478,41 @@ mod tests {
             display_name: Some("Fed User".to_string()),
             groups: vec!["devs".to_string(), "admin".to_string()],
             required_admin_group: None,
+            auto_create_users: true,
         };
         let debug = format!("{:?}", creds);
         assert!(debug.contains("feduser"));
         assert!(debug.contains("ext-123"));
+    }
+
+    // -----------------------------------------------------------------------
+    // guard_federated_provisioning (#2057, pure function, no DB)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guard_allows_existing_user_when_auto_create_off() {
+        // Existing users must always be allowed through regardless of toggle.
+        assert!(guard_federated_provisioning(true, false).is_ok());
+    }
+
+    #[test]
+    fn test_guard_allows_existing_user_when_auto_create_on() {
+        assert!(guard_federated_provisioning(true, true).is_ok());
+    }
+
+    #[test]
+    fn test_guard_allows_new_user_when_auto_create_on() {
+        // First login + auto-create enabled -> provisioning proceeds.
+        assert!(guard_federated_provisioning(false, true).is_ok());
+    }
+
+    #[test]
+    fn test_guard_rejects_new_user_when_auto_create_off() {
+        // The regression case for #2057: no local account + toggle off must be
+        // refused with a 403 rather than silently creating the user.
+        let err = guard_federated_provisioning(false, false)
+            .expect_err("new user with auto-create disabled must be rejected");
+        assert!(matches!(err, AppError::Authorization(_)));
     }
 
     // -----------------------------------------------------------------------
@@ -3882,6 +4287,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         encode(
             &Header::default(),
@@ -4180,6 +4586,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         // The fallback is exactly `iat * 1000`.
         assert_eq!(legacy.effective_iat_ms(), iat_sec.saturating_mul(1000));
@@ -4548,6 +4955,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         let payload_json = serde_json::to_vec(&claims).unwrap();
         let payload_b64 = {
@@ -5201,6 +5609,7 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
             family_id: None,
+            scan_pull_repo: None,
         };
         encode(
             &Header::default(),

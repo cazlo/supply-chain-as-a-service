@@ -281,6 +281,7 @@ async fn push_gem(
     let user_id = require_auth_basic_scope(auth, "rubygems", "write")?.user_id;
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty gem file").into_response());
@@ -396,13 +397,7 @@ async fn query_gem_specs(
         .bind(repo_id)
         .fetch_all(db)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(crate::api::handlers::db_err)?;
 
     Ok(rows
         .iter()
@@ -610,13 +605,7 @@ async fn dependencies(
         )
         .fetch_all(&state.db)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(crate::api::handlers::db_err)?;
 
         for a in &artifacts {
             let deps = a
@@ -810,6 +799,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: Some("https://rubygems.org".to_string()),
+            promotion_only: false,
         };
         assert_eq!(info.id, id);
         assert_eq!(info.repo_type, "hosted");
@@ -995,5 +985,33 @@ mod tests {
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         f.teardown().await;
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_rubygems_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![
+            format!("/{k}/api/v1/gems/name"),
+            format!("/{k}/api/v1/versions/name"),
+            format!("/{k}/api/v1/dependencies?gems=name"),
+            format!("/{k}/specs.4.8.gz"),
+            format!("/{k}/latest_specs.4.8.gz"),
+            format!("/{k}/gems/name-1.0.0.gem"),
+        ];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }

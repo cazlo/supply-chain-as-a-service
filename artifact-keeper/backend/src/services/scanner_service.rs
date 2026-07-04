@@ -29,6 +29,8 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, RawPackage, Severity};
+use crate::models::user::User;
+use crate::services::auth_service::AuthService;
 use crate::services::grype_scanner::GrypeScanner;
 use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
@@ -152,6 +154,96 @@ pub fn is_oci_image_artifact(artifact: &Artifact) -> bool {
         || ct.contains("vnd.docker.distribution")
         || ct.contains("vnd.docker.container")
         || artifact.path.contains("/manifests/")
+}
+
+/// Config mediaTypes whose presence means "this manifest describes a real,
+/// runnable container image rootfs" — the only configs the image-vuln
+/// scanners (Trivy/Grype `registry:` mode) should be routed to. OCI
+/// image-spec config and Docker schema2 container config. Anything else
+/// (Helm `vnd.cncf.helm.config`, WASM `vnd.wasm.config`, the empty-artifact
+/// `vnd.oci.empty`, SBOM/attestation configs) is NOT a container image.
+const CONTAINER_IMAGE_CONFIG_MEDIA_TYPES: [&str; 2] = [
+    crate::formats::oci::media_types::OCI_CONFIG, // application/vnd.oci.image.config.v1+json
+    crate::formats::oci::media_types::CONFIG,     // application/vnd.docker.container.image.v1+json
+];
+
+/// Layer mediaTypes that positively identify a NON-image OCI artifact even
+/// when its config mediaType is the standard image config. cosign signatures
+/// reuse `application/vnd.oci.image.config.v1+json` as their config (sigstore
+/// SIGNATURE_SPEC), so the config allow-list alone would admit them; the
+/// discriminating signal is the layer mediaType. Matched as a substring so
+/// versioned variants are covered.
+const NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS: [&str; 6] = [
+    "vnd.dev.cosign",              // cosign signature layer
+    "in-toto",                     // SLSA / in-toto attestation
+    "spdx",                        // SPDX SBOM
+    "cyclonedx",                   // CycloneDX SBOM
+    "vnd.cncf.helm.chart.content", // Helm chart payload (belt-and-suspenders)
+    "wasm",                        // WASM module payload (application/wasm, ...+wasm)
+];
+
+/// Decide whether an already-loaded OCI manifest `body` describes a real
+/// container image that the image-vuln scanners should run on.
+///
+/// Default-DENY. Returns `true` only when:
+///   * the body is an image **index** / manifest list (top-level `manifests`
+///     array): indexes carry no config, and `resolve_scan_reference` (#1971,
+///     #1992, #2054) rewrites the reference to a concrete scannable child,
+///     so an index must NEVER be denied at the gate; OR
+///   * the body is a single manifest whose `config.mediaType` is a container
+///     image config ([`CONTAINER_IMAGE_CONFIG_MEDIA_TYPES`]) AND none of its
+///     `layers[].mediaType` is a known non-image marker
+///     ([`NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS`]) — the layer guard rejects
+///     cosign signatures, which reuse the standard image config.
+///
+/// Returns `false` for Helm OCI charts, WASM modules, SBOM/attestation/empty
+/// artifacts, and any manifest with an unknown or absent config — these are
+/// not runnable images and a "completed/0-findings" scan on them is a false
+/// clean (the security-gate failure). A non-JSON / unparseable body
+/// returns `true` (fail-open): callers only consult this for artifacts that
+/// already passed `is_oci_image_artifact`, and a malformed body must not flip
+/// a possibly-real image to skipped (#1971 passthrough contract).
+pub fn oci_manifest_is_scannable_image(body: &[u8]) -> bool {
+    let Ok(manifest) = crate::formats::oci::OciHandler::parse_manifest(body) else {
+        // Anomalous body on an OCI route: do not flip the path-based decision.
+        return true;
+    };
+    // Index / manifest list: no config, resolved to a child downstream. Allow.
+    if !manifest.manifests.is_empty() {
+        return true;
+    }
+    // Single manifest: require a container-image config AND non-signature layers.
+    let Some(config) = manifest.config.as_ref() else {
+        // No config and no `manifests` array → not a distribution image. Deny.
+        return false;
+    };
+    let config_is_image = CONTAINER_IMAGE_CONFIG_MEDIA_TYPES
+        .iter()
+        .any(|allowed| config.media_type == *allowed);
+    if !config_is_image {
+        return false;
+    }
+    // Layer guard: reject cosign/in-toto/spdx/cyclonedx/helm/wasm payloads even
+    // when the config is the standard image config (cosign reuses it).
+    let has_non_image_layer = manifest.layers.iter().any(|layer| {
+        let mt = layer.media_type.to_ascii_lowercase();
+        NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS
+            .iter()
+            .any(|marker| mt.contains(marker))
+    });
+    !has_non_image_layer
+}
+
+/// Gate helper shared by the image-family scanners' `is_applicable_for_target`.
+/// Given a `ScanTarget` already known to pass [`is_oci_image_artifact`],
+/// returns `true` unless a manifest body is in hand AND that body positively
+/// classifies as a non-image OCI artifact. With no body (`None`) the decision
+/// is left to the caller's path-based predicate (#1971 fail-open).
+pub fn oci_target_is_scannable_image(target: &ScanTarget<'_>) -> bool {
+    match target.manifest_body {
+        Some(body) => oci_manifest_is_scannable_image(body),
+        None => true,
+    }
 }
 
 /// Parse a `v2/<name>/manifests/<reference>` registry path into `(name, ref)`.
@@ -1400,10 +1492,26 @@ fn extract_tar_gz_safe(content: &[u8], target: &Path) -> Result<()> {
 /// `Artifact::path` is repository-internal. Scanners that need an externally
 /// routable identity (currently Grype's OCI `registry:` mode) must use the
 /// repository fields from this context instead of guessing from the path.
+/// Scanners may also use the optional database/storage handles to inspect
+/// repository-local artifact state without re-entering the public registry
+/// route.
 pub struct ScanTarget<'a> {
     pub artifact: &'a Artifact,
     pub repository_key: &'a str,
     pub repository_type: &'a str,
+    pub db: Option<&'a PgPool>,
+    pub storage: Option<&'a dyn StorageBackend>,
+    /// The manifest body the orchestrator already loaded for this artifact
+    /// (`content` at the construction site), when the artifact is served on
+    /// the OCI manifest route. Carries the bytes the image-family scanners
+    /// need to read `config.mediaType` / `layers[].mediaType` so they can
+    /// reject non-container OCI artifacts (Helm charts, cosign signatures,
+    /// SBOM/attestation, WASM modules) that are byte-identical to a real
+    /// image at the manifest mediaType level. `None` for callers with
+    /// no body in hand (legacy path-only applicability + unit tests); in
+    /// that case the gate falls back to the path/content-type predicate and
+    /// must never flip an artifact applicable→not-applicable (#1971).
+    pub manifest_body: Option<&'a [u8]>,
 }
 
 /// A pluggable vulnerability scanner.
@@ -2624,26 +2732,56 @@ impl ScannerService {
         scan_result_service: Arc<ScanResultService>,
         scan_config_service: Arc<ScanConfigService>,
         trivy_url: Option<String>,
+        trivy_adapter_url: Option<String>,
         storage: Arc<dyn StorageBackend>,
         storage_registry: Arc<crate::storage::StorageRegistry>,
         storage_base_path: String,
         scan_workspace_path: String,
         openscap_url: Option<String>,
         openscap_profile: String,
+        // #2093: token minter for private-repo image pulls. `auth` mints the
+        // per-repo scoped scan tokens; `scan_identity` is the loaded
+        // `_ak_scanner` service account (None when it is not seeded yet, in
+        // which case image pulls fall back to anonymous — public repos only);
+        // `scan_token_ttl_seconds` bounds each token's lifetime.
+        auth: Arc<AuthService>,
+        scan_identity: Option<User>,
+        scan_token_ttl_seconds: u64,
     ) -> Self {
+        let scan_token_ttl_seconds = scan_token_ttl_seconds as i64;
         let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
         let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
 
+        // Container *image* scanner: Harbor scanner-adapter (#2088). Registered
+        // ONLY when an adapter URL is configured. When unset, no trivy/image
+        // scan row is produced at all (grype still runs) — we do not claim to
+        // have run trivy on images.
+        if let Some(adapter_url) = trivy_adapter_url {
+            info!(
+                "Container image scanner (Harbor adapter) enabled at {}",
+                adapter_url
+            );
+            let mut image_scanner = ImageScanner::new(adapter_url);
+            // Wire the per-repo token minter so the adapter can pull private
+            // images (#2093). Only when the scanner identity is loaded;
+            // otherwise pulls stay anonymous (public repos only).
+            if let Some(identity) = scan_identity.clone() {
+                image_scanner =
+                    image_scanner.with_token_minter(auth.clone(), identity, scan_token_ttl_seconds);
+            }
+            scanners.push(Arc::new(image_scanner));
+        }
+
+        // Trivy filesystem + incus (rootfs) scanners drive the trivy server
+        // directly and keep consuming TRIVY_URL unchanged: their
+        // `--server` / dir-mode protocol is incompatible with the Harbor
+        // adapter, so they are NOT repointed at it.
         if let Some(url) = trivy_url {
-            info!("Trivy image scanner enabled at {}", url);
-            scanners.push(Arc::new(ImageScanner::new(url.clone())));
-            // Trivy filesystem scanner for non-container artifacts
             info!("Trivy filesystem scanner enabled");
             scanners.push(Arc::new(TrivyFsScanner::new(
                 url.clone(),
                 scan_workspace_path.clone(),
             )));
-            // Incus/LXC container image scanner (extracts rootfs, scans with trivy)
             info!("Incus container image scanner enabled");
             scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
                 url,
@@ -2653,7 +2791,14 @@ impl ScannerService {
 
         // Grype scanner (CLI-based, degrades gracefully if binary not available)
         info!("Grype scanner enabled");
-        scanners.push(Arc::new(GrypeScanner::new(scan_workspace_path.clone())));
+        let mut grype_scanner = GrypeScanner::new(scan_workspace_path.clone());
+        // Wire the per-repo token minter so grype's registry pull is
+        // authenticated for private images (#2093).
+        if let Some(identity) = scan_identity.clone() {
+            grype_scanner =
+                grype_scanner.with_token_minter(auth.clone(), identity, scan_token_ttl_seconds);
+        }
+        scanners.push(Arc::new(grype_scanner));
 
         // OpenSCAP compliance scanner (optional sidecar)
         if let Some(url) = openscap_url {
@@ -2902,7 +3047,10 @@ impl ScannerService {
         // Load content from storage (we need the storage key)
         // NOTE: The orchestrator is called with content already available in
         // upload/proxy paths. For on-demand scans, we fetch from DB metadata.
-        let content = self.fetch_artifact_content(&artifact).await?;
+        let storage = self.resolve_repo_storage(artifact.repository_id).await?;
+        let content = self
+            .fetch_artifact_content_from_storage(&artifact, storage.as_ref())
+            .await?;
 
         // Load metadata if available
         let metadata = sqlx::query_as!(
@@ -2925,6 +3073,14 @@ impl ScannerService {
             artifact: &artifact,
             repository_key: &repository_key,
             repository_type: &repository_type,
+            db: Some(&self.db),
+            storage: Some(storage.as_ref()),
+            // thread the already-loaded manifest body so the image-vuln
+            // scanners can read config.mediaType / layers[].mediaType and
+            // reject non-container OCI artifacts (Helm/cosign/SBOM/WASM) that
+            // share the image manifest mediaType. Only meaningful for OCI
+            // manifest artifacts; the gate ignores it for everything else.
+            manifest_body: is_oci_image_artifact(&artifact).then(|| content.as_ref()),
         };
 
         for scanner in &self.scanners {
@@ -3670,7 +3826,11 @@ impl ScannerService {
     /// streaming reads for those backends is tracked separately by #1430 and
     /// #1431 (GCS `get_stream`); this fix deliberately does not expand into
     /// that work.
-    async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
+    async fn fetch_artifact_content_from_storage(
+        &self,
+        artifact: &Artifact,
+        storage: &dyn StorageBackend,
+    ) -> Result<Bytes> {
         // Early reject using the recorded size before we open the stream. The
         // streaming loop below re-checks against the same ceiling because
         // `size_bytes` can be stale or wrong for proxied/upstream content.
@@ -3681,22 +3841,17 @@ impl ScannerService {
             )));
         }
 
-        let storage = self.resolve_repo_storage(artifact.repository_id).await?;
-        Self::stage_from_storage(
-            storage.as_ref(),
-            &artifact.storage_key,
-            &self.scan_workspace_path,
-        )
-        .await
-        .map_err(|e| match e {
-            // Preserve the validation/size-cap variant; only wrap raw
-            // storage/stream-open failures with artifact context.
-            AppError::Storage(msg) => AppError::Storage(format!(
-                "Failed to stage artifact {} (key={}): {}",
-                artifact.id, artifact.storage_key, msg
-            )),
-            other => other,
-        })
+        Self::stage_from_storage(storage, &artifact.storage_key, &self.scan_workspace_path)
+            .await
+            .map_err(|e| match e {
+                // Preserve the validation/size-cap variant; only wrap raw
+                // storage/stream-open failures with artifact context.
+                AppError::Storage(msg) => AppError::Storage(format!(
+                    "Failed to stage artifact {} (key={}): {}",
+                    artifact.id, artifact.storage_key, msg
+                )),
+                other => other,
+            })
     }
 
     /// Open a streaming read from `storage` for `key` and stage it for scanning.
@@ -4161,6 +4316,48 @@ pub(crate) mod test_helpers {
             expected_label,
             err_msg
         );
+    }
+
+    /// A non-login scanner service-account `User` fixture (#2093). Shared by the
+    /// image- and grype-scanner token-minter tests so the fixture is defined
+    /// once.
+    pub fn make_scanner_user() -> crate::models::user::User {
+        crate::models::user::User {
+            id: uuid::Uuid::new_v4(),
+            username: "_ak_scanner".to_string(),
+            email: "scanner@artifact-keeper.internal".to_string(),
+            password_hash: None,
+            auth_provider: crate::models::user::AuthProvider::Local,
+            external_id: None,
+            display_name: Some("Image Scanner (system)".to_string()),
+            is_active: true,
+            is_admin: false,
+            is_service_account: true,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
+            password_changed_at: chrono::Utc::now(),
+            last_login_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// An `AuthService` whose pool never connects (`connect_lazy`), for
+    /// unit-testing pure token-minting/validation with no DB. MUST be called
+    /// from within a tokio runtime (`#[tokio::test]`).
+    pub fn make_scanner_auth() -> std::sync::Arc<crate::services::auth_service::AuthService> {
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("connect_lazy never errors on construction");
+        std::sync::Arc::new(crate::services::auth_service::AuthService::new(
+            pool,
+            std::sync::Arc::new(crate::config::Config::test_config()),
+        ))
     }
 }
 
@@ -4807,6 +5004,149 @@ mod tests {
         // content type sniffed).
         let a = test_helpers::make_test_artifact("foo", "", "generic/foo");
         assert!(!is_oci_image_artifact(&a));
+    }
+
+    // -----------------------------------------------------------------------
+    // oci_manifest_is_scannable_image: config/layer-mediaType gate.
+    // Default-deny — a Helm/cosign/SBOM/WASM OCI artifact shares the image
+    // manifest mediaType but must NOT be routed to the image-vuln scanners.
+    // -----------------------------------------------------------------------
+
+    const OCI_IMAGE_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+
+    const DOCKER_SCHEMA2_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.docker.distribution.manifest.v2+json",
+      "config":{"mediaType":"application/vnd.docker.container.image.v1+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/vnd.docker.image.rootfs.diff.tar.gzip","digest":"sha256:l1","size":9}]}"#;
+
+    const HELM_OCI_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "config":{"mediaType":"application/vnd.cncf.helm.config.v1+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/vnd.cncf.helm.chart.content.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+
+    const WASM_OCI_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "config":{"mediaType":"application/vnd.wasm.config.v0+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/wasm","digest":"sha256:l1","size":9}]}"#;
+
+    const COSIGN_SIG_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cfg","size":7},
+      "layers":[{"mediaType":"application/vnd.dev.cosign.simplesigning.v1+json","digest":"sha256:l1","size":9}]}"#;
+
+    const SBOM_OCI_MANIFEST_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.manifest.v1+json",
+      "artifactType":"application/vnd.cyclonedx+json",
+      "config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa3","size":2},
+      "layers":[{"mediaType":"application/vnd.cyclonedx+json","digest":"sha256:l1","size":9}]}"#;
+
+    const OCI_INDEX_BODY: &[u8] = br#"{"schemaVersion":2,
+      "mediaType":"application/vnd.oci.image.index.v1+json",
+      "manifests":[
+        {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:child","size":5,
+         "platform":{"os":"linux","architecture":"amd64"}}]}"#;
+
+    #[test]
+    fn test_scannable_image_oci_image_config_is_image() {
+        assert!(oci_manifest_is_scannable_image(OCI_IMAGE_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_docker_schema2_config_is_image() {
+        assert!(oci_manifest_is_scannable_image(
+            DOCKER_SCHEMA2_MANIFEST_BODY
+        ));
+    }
+
+    #[test]
+    fn test_scannable_image_index_is_image() {
+        // Multi-arch index has no config; resolution picks a child downstream.
+        assert!(oci_manifest_is_scannable_image(OCI_INDEX_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_rejects_helm_chart() {
+        // The core regression: demochart must NOT route to image scanners.
+        assert!(!oci_manifest_is_scannable_image(HELM_OCI_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_rejects_wasm_module() {
+        assert!(!oci_manifest_is_scannable_image(WASM_OCI_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_rejects_cosign_signature_despite_image_config() {
+        // cosign reuses the standard image config; the layer guard rejects it.
+        assert!(!oci_manifest_is_scannable_image(COSIGN_SIG_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_rejects_sbom_artifact() {
+        assert!(!oci_manifest_is_scannable_image(SBOM_OCI_MANIFEST_BODY));
+    }
+
+    #[test]
+    fn test_scannable_image_denies_manifest_with_no_config_and_no_manifests() {
+        // No config descriptor and no `manifests` array → not a distribution
+        // image → deny (default-deny).
+        let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
+        assert!(!oci_manifest_is_scannable_image(body));
+    }
+
+    #[test]
+    fn test_scannable_image_denies_unknown_config_media_type() {
+        let body = br#"{"schemaVersion":2,
+          "config":{"mediaType":"application/vnd.example.unknown.v1+json","digest":"sha256:cfg","size":7},
+          "layers":[{"mediaType":"application/octet-stream","digest":"sha256:l1","size":9}]}"#;
+        assert!(!oci_manifest_is_scannable_image(body));
+    }
+
+    #[test]
+    fn test_scannable_image_failopen_on_non_json_body() {
+        // A non-JSON body on an OCI route must not flip a possibly-real image
+        // to skipped (#1971 passthrough): fail open.
+        assert!(oci_manifest_is_scannable_image(b"not json"));
+        assert!(oci_manifest_is_scannable_image(b""));
+    }
+
+    #[test]
+    fn test_oci_target_is_scannable_image_none_body_failopen() {
+        let artifact = test_helpers::make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
+        };
+        assert!(oci_target_is_scannable_image(&target));
+    }
+
+    #[test]
+    fn test_oci_target_is_scannable_image_helm_body_denies() {
+        let artifact = test_helpers::make_test_artifact(
+            "demochart",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/demochart/manifests/0.1.0",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "helm-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: Some(HELM_OCI_MANIFEST_BODY),
+        };
+        assert!(!oci_target_is_scannable_image(&target));
     }
 
     #[test]
@@ -11381,6 +11721,9 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-local",
             repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -11402,6 +11745,9 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-local",
             repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -11804,18 +12150,26 @@ mod tests {
         let scan_result_service = Arc::new(ScanResultService::new(pool.clone()));
         let scan_config_service =
             Arc::new(crate::services::scan_config_service::ScanConfigService::new(pool.clone()));
+        let auth = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::test_config()),
+        ));
         Arc::new(ScannerService::new(
             pool,
             advisory_client,
             scan_result_service,
             scan_config_service,
-            None, // trivy_url: skip image / fs / incus scanners
+            None, // trivy_url: skip fs / incus scanners
+            None, // trivy_adapter_url: skip image scanner
             storage,
             storage_registry,
             storage_base_path,
             "/tmp/scan-1469-tests".to_string(),
             None, // openscap_url
             "standard".to_string(),
+            auth,
+            None, // scan_identity: anonymous pulls in tests
+            300,  // scan_token_ttl_seconds
         ))
     }
 
@@ -11878,6 +12232,9 @@ mod tests {
         // checksum + scan_type. The pre-existing completed row must not
         // be returned to the caller as the prepared id.
         use crate::api::handlers::test_db_helpers as tdh;
+        // #2000: serialize the DB-backed scan-dedup tests across nextest's
+        // per-test processes so they never mutate `scan_results` concurrently.
+        let _serial = tdh::scan_dedup_serial_lock().await;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return; // skip cleanly when no DATABASE_URL
         };
@@ -11948,6 +12305,9 @@ mod tests {
         // `find_existing_scan_for_artifact` with the new dual-TTL
         // signature, exercising the else-branch added in #1469.
         use crate::api::handlers::test_db_helpers as tdh;
+        // #2000: serialize the DB-backed scan-dedup tests across nextest's
+        // per-test processes so they never mutate `scan_results` concurrently.
+        let _serial = tdh::scan_dedup_serial_lock().await;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
@@ -12007,6 +12367,9 @@ mod tests {
         // produces an empty prepared vec regardless of bypass_dedup. This
         // hits the new signature on the no-artifact path.
         use crate::api::handlers::test_db_helpers as tdh;
+        // #2000: serialize the DB-backed scan-dedup tests across nextest's
+        // per-test processes so they never mutate `scan_results` concurrently.
+        let _serial = tdh::scan_dedup_serial_lock().await;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };

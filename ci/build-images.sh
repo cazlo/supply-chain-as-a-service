@@ -34,7 +34,11 @@ image_version() {
   elif [[ "${name}" == "artifact-keeper-web" ]]; then
     jq -r '.version' "${root}/artifact-keeper-web/package.json"
   else
-    revision_for "${name}"
+    # No release tag recorded (e.g. pinned mid-stream past the last tag to
+    # validate an unmerged upstream PR): fall back to a valid semver
+    # placeholder instead of the raw revision. Cargo's version parser rejects
+    # a bare commit SHA whenever it doesn't start with a digit.
+    printf '0.0.0-src.%s\n' "$(revision_for "${name}" | cut -c1-8)"
   fi
 }
 

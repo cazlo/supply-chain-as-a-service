@@ -8,7 +8,7 @@ FROM rust:1.93-bookworm AS toolchain
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3 git postgresql-client ca-certificates unzip \
+      python3 git postgresql-client ca-certificates unzip jq \
       pkg-config make perl libssl-dev zlib1g-dev liblzma-dev libbz2-dev \
  && rm -rf /var/lib/apt/lists/*
 
@@ -23,10 +23,30 @@ RUN ARCH="$(uname -m)" \
  && unzip -q /tmp/protoc.zip -d /usr/local \
  && rm /tmp/protoc.zip
 
+# All three binstall targets pinned to exact versions confirmed working
+# against this toolchain (rustc 1.93.1): sqlx-cli matches the backend's
+# `sqlx = "0.8"` (locked at 0.8.6 in Cargo.lock); cargo-nextest/cargo-llvm-cov
+# pinned to the last versions observed installing cleanly via prebuilt
+# GitHub release binaries. This RUN line had been cache-hit (never actually
+# re-executed) for long enough that unpinned `sqlx-cli` drifted onto a
+# 0.9.0 release requiring rustc 1.94+ before anyone noticed. The moment
+# pinning it changed this line's text and forced a real rebuild, binstall's
+# GitHub-API-based release lookup started intermittently falling back to
+# `cargo install` from source for cargo-nextest too (which then failed to
+# compile) -- almost certainly GitHub's unauthenticated 60 req/hour rate
+# limit after repeated same-day rebuilds, not a real incompatibility. Pinning
+# every version reduces "latest silently changed" risk; the retry loop below
+# is the actual fix for the rate-limit flakiness, giving a transient GitHub
+# API failure a few chances to clear before failing the whole build.
 RUN rustup component add llvm-tools-preview \
  && curl -L --proto '=https' --tlsv1.2 -sSf \
       https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
- && cargo binstall -y cargo-nextest cargo-llvm-cov sqlx-cli
+ && for attempt in 1 2 3 4 5; do \
+      cargo binstall -y cargo-nextest@0.9.138 cargo-llvm-cov@0.8.7 sqlx-cli@0.8.6 && break; \
+      echo "cargo binstall attempt ${attempt} failed" >&2; \
+      [ "${attempt}" -eq 5 ] && exit 1; \
+      sleep $((attempt * 20)); \
+    done
 
 RUN git config --global --add safe.directory '*'
 
@@ -62,6 +82,8 @@ WORKDIR /work
 COPY . /work
 
 FROM source AS integration
+ARG TEST
+ENV TEST=${TEST}
 RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
     --mount=type=cache,id=ak-quality-target,target=/target \
     bash -o pipefail -c \
@@ -71,6 +93,37 @@ RUN mkdir /results && cp /tmp/integration.log /results/
 
 FROM scratch AS integration-results
 COPY --from=integration /results/ /
+
+# Compile every backend/tests/*.rs integration-test binary (plus the lib's
+# unit tests) exactly ONCE, then copy each executable out of the cargo
+# target cache mount into a plain image layer under /test-bin. Pushed once
+# per CI run (ci/backend-test-image-build.sh) and reused by every
+# backend-integration matrix leg (ci/backend-integration-run-k8s.sh), which
+# just runs one already-built binary against its own Postgres instead of
+# recompiling the whole dev-dependency graph N times. No DATABASE_URL is
+# needed here: nothing runs yet, only compiles.
+# Compile and extract in ONE RUN: --mount=type=cache paths only exist while
+# that specific RUN instruction is executing, not in later RUN instructions
+# unless the same mount is re-declared. A separate extraction RUN without
+# the /target mount saw an empty directory, so every `cp` failed -- silently,
+# since the shell form has no `set -e` by default, so the RUN still exited 0
+# with a completely empty /test-bin (discovered by pulling a pushed image
+# and finding /test-bin empty; backend-integration-build had been reporting
+# success throughout). The heredoc form gets a real `set -euo pipefail` so
+# any future extraction failure fails the build loudly instead of silently
+# shipping an empty image.
+FROM source AS test-artifacts
+RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
+    --mount=type=cache,id=ak-quality-target,target=/target <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd /work/artifact-keeper
+cargo test --tests --no-run --message-format=json > /tmp/build.json
+mkdir -p /test-bin
+jq -r 'select(.reason=="compiler-artifact" and .profile.test==true and .executable!=null) | "\(.target.name)\t\(.executable)"' /tmp/build.json \
+  | while IFS=$'\t' read -r test_name exe; do cp "${exe}" "/test-bin/${test_name}"; done
+ls -la /test-bin
+EOF
 
 FROM source AS coverage
 RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \

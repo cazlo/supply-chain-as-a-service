@@ -13,7 +13,18 @@ case "${mode}" in
   integration|coverage) ;;
   *) echo "QUALITY_MODE must be integration or coverage" >&2; exit 2 ;;
 esac
-readonly name="ak-${mode}-${revision}-${run_suffix}"
+readonly test_target="${TEST:-}"
+if [[ "${mode}" == "integration" && -z "${test_target}" ]]; then
+  echo "TEST=<backend/tests/*.rs target> is required when QUALITY_MODE=integration" >&2
+  exit 2
+fi
+# Deployment/service name must stay a valid k8s DNS-1035 label. Suffix it with
+# the sanitized test target so concurrent integration matrix legs (one
+# Postgres deployment per `backend/tests/*.rs` target) never collide on the
+# same resource name in the shared ak-smoke namespace.
+name_suffix="${test_target//_/-}"
+name="$(printf '%s' "ak-${mode}-${revision}-${run_suffix}${name_suffix:+-${name_suffix}}" | cut -c1-63)"
+readonly name="${name%-}"
 readonly results_dir="${QUALITY_RESULTS_DIR:-/tmp/artifact-keeper-quality}"
 
 cleanup() {
@@ -69,23 +80,35 @@ YAML
 
 kubectl -n "${namespace}" rollout status "deployment/${name}" --timeout=120s
 
+# Only coverage mode uses COVERAGE_BASE (the new-code diff gate); computing
+# it needs history the integration job's checkout deliberately doesn't fetch
+# (plain shallow checkout, no fetch-depth: 0). Skip it outside coverage mode
+# so integration runs can't fail on an unrelated, unused git lookup.
 coverage_base="${COVERAGE_BASE:-}"
-if [[ -z "${coverage_base}" ]]; then
+if [[ "${mode}" == "coverage" && -z "${coverage_base}" ]]; then
   coverage_base="$(git -C "${root}" merge-base main HEAD 2>/dev/null \
     || git -C "${root}" merge-base origin/main HEAD 2>/dev/null \
-    || git -C "${root}" rev-parse HEAD^)"
+    || git -C "${root}" rev-parse HEAD^ 2>/dev/null \
+    || true)"
+fi
+
+build_args=(
+  --progress plain
+  --file "${root}/ci/local-ci/Dockerfile.runner"
+  --target "${mode}-results"
+  --no-cache-filter "${mode}"
+  --build-arg "DATABASE_URL=postgresql://registry:registry@${name}.${namespace}.svc.cluster.local:5432/artifact_registry"
+  --build-arg "COVERAGE_BASE=${coverage_base}"
+  --build-arg "NEW_CODE_MIN=${NEW_CODE_MIN:-70}"
+  --build-arg "TOTAL_MIN=${TOTAL_MIN:-50}"
+)
+if [[ "${mode}" == "integration" ]]; then
+  build_args+=(--build-arg "TEST=${test_target}")
 fi
 
 echo "==> ${mode} on BuildKit (diff base ${coverage_base})"
 docker buildx build \
-  --progress plain \
-  --file "${root}/ci/local-ci/Dockerfile.runner" \
-  --target "${mode}-results" \
-  --no-cache-filter "${mode}" \
-  --build-arg "DATABASE_URL=postgresql://registry:registry@${name}.${namespace}.svc.cluster.local:5432/artifact_registry" \
-  --build-arg "COVERAGE_BASE=${coverage_base}" \
-  --build-arg "NEW_CODE_MIN=${NEW_CODE_MIN:-70}" \
-  --build-arg "TOTAL_MIN=${TOTAL_MIN:-50}" \
+  "${build_args[@]}" \
   --output "type=local,dest=${results_dir}" \
   "${root}"
 

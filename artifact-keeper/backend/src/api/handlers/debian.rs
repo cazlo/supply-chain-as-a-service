@@ -305,13 +305,7 @@ async fn fetch_package_entries(
     .bind(super::escape_like_literal(component))
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let mut entries = Vec::new();
     for a in &artifacts {
@@ -430,13 +424,7 @@ async fn discover_release_layout(
     .bind(repo_id)
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let mut components = BTreeSet::new();
     let mut architectures = BTreeSet::new();
@@ -1368,13 +1356,7 @@ async fn pool_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response());
 
     let artifact = match artifact {
@@ -1642,13 +1624,7 @@ async fn persist_debian_upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());
@@ -1721,6 +1697,7 @@ async fn pool_upload(
     let user_id = require_auth_basic_scope(auth, "debian", "write")?.user_id;
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let upload = prepare_debian_upload(&component, &path, &body)?;
     persist_debian_upload(
@@ -1763,6 +1740,7 @@ async fn upload_raw(
     let user_id = require_auth_basic_scope(auth, "debian", "write")?.user_id;
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // Extract filename from X-Filename or Content-Disposition header
     let filename = headers

@@ -31,6 +31,21 @@ pub(crate) fn is_name_too_long(msg: &str) -> bool {
         || lower.contains("enametoolong")
 }
 
+/// Detect SQLx connection-pool saturation across both the typed
+/// `sqlx::Error::PoolTimedOut` and its stringified forms.
+///
+/// The hot proxy path wraps DB errors as `AppError::Database(e.to_string())`,
+/// which erases the typed variant. `e.to_string()` for `PoolTimedOut` renders
+/// "pool timed out while waiting for an open connection" (sqlx 0.8), which does
+/// NOT contain the literal "PoolTimedOut". Matching only the variant name
+/// therefore missed every stringified pool timeout on the proxy hot path and
+/// surfaced 500 instead of 503 (#1437 follow-up). We match both fragments so
+/// the mapping holds whether the error arrived typed or stringified.
+pub(crate) fn is_pool_timeout(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("pool timed out") || lower.contains("pooltimedout")
+}
+
 /// Application error types.
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -103,6 +118,26 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// True when this error is a SQLx connection-pool acquire timeout, in
+    /// either its typed (`Sqlx(PoolTimedOut)`) or stringified
+    /// (`Database("pool timed out …")`) form.
+    ///
+    /// This is the single source of truth for the POOL_EXHAUSTED -> 503
+    /// classification (#1437 / #2101 / #2102): `status_and_code` and
+    /// `user_message` consult it below, and callers outside this module reuse
+    /// it instead of re-deriving the variant/string check. In particular the
+    /// auth pre-check (`api::middleware::auth`) uses it to reclassify a
+    /// pool-acquire timeout during its own DB lookup as a retryable 503 rather
+    /// than flattening it to a misleading 401 (#2125). A pool timeout is a
+    /// transient capacity problem, never a bad credential.
+    pub(crate) fn is_pool_timeout(&self) -> bool {
+        match self {
+            Self::Sqlx(sqlx::Error::PoolTimedOut) => true,
+            Self::Database(msg) => is_pool_timeout(msg),
+            _ => false,
+        }
+    }
+
     /// Map error variant to HTTP status code and machine-readable error code.
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
@@ -113,12 +148,7 @@ impl AppError {
             // alerts and makes saturation look like a fault; 503 +
             // Retry-After lets clients back off and retry on the same
             // path. See #1437 / #1442.
-            Self::Sqlx(sqlx::Error::PoolTimedOut) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "POOL_EXHAUSTED")
-            }
-            Self::Database(msg) if msg.contains("PoolTimedOut") => {
-                (StatusCode::SERVICE_UNAVAILABLE, "POOL_EXHAUSTED")
-            }
+            e if e.is_pool_timeout() => (StatusCode::SERVICE_UNAVAILABLE, "POOL_EXHAUSTED"),
             Self::Database(_) | Self::Sqlx(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR")
             }
@@ -164,10 +194,7 @@ impl AppError {
     fn user_message(&self) -> String {
         match self {
             // Server-side errors: return generic messages (details are logged)
-            Self::Sqlx(sqlx::Error::PoolTimedOut) => {
-                "Database connection pool is saturated, retry shortly".to_string()
-            }
-            Self::Database(msg) if msg.contains("PoolTimedOut") => {
+            e if e.is_pool_timeout() => {
                 "Database connection pool is saturated, retry shortly".to_string()
             }
             Self::Database(_) | Self::Sqlx(_) => "Database operation failed".to_string(),
@@ -248,6 +275,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_is_pool_timeout_predicate_matches_typed_and_stringified() {
+        // Typed variant.
+        assert!(AppError::Sqlx(sqlx::Error::PoolTimedOut).is_pool_timeout());
+        // Stringified form the hot path (and the auth layer's
+        // `map_err(|e| AppError::Database(e.to_string()))`) produces.
+        assert!(AppError::Database(sqlx::Error::PoolTimedOut.to_string()).is_pool_timeout());
+        // Genuine non-pool errors must NOT be classified as pool timeouts, so
+        // real DB faults and bad credentials keep their existing status codes.
+        assert!(!AppError::Sqlx(sqlx::Error::RowNotFound).is_pool_timeout());
+        assert!(!AppError::Database("connection refused".to_string()).is_pool_timeout());
+        assert!(
+            !AppError::Authentication("Invalid username or password".to_string()).is_pool_timeout()
+        );
+        assert!(!AppError::Unauthorized("Token has been revoked".to_string()).is_pool_timeout());
+    }
+
+    #[test]
     fn test_sqlx_pool_timed_out_maps_to_503() {
         let err = AppError::Sqlx(sqlx::Error::PoolTimedOut);
         let (status, code) = err.status_and_code();
@@ -271,12 +315,23 @@ mod tests {
 
     #[test]
     fn test_pool_timeout_string_wrapped_as_database_also_503s() {
-        // Some callers stringify the sqlx error (`map_err(|e| e.to_string())`)
-        // before wrapping it as `AppError::Database`. The 503 mapping must
-        // still fire so wrapped pool timeouts don't slip back to 500.
-        let err = AppError::Database("pool error: PoolTimedOut".into());
-        let (status, _) = err.status_and_code();
+        // The proxy hot path stringifies sqlx errors
+        // (`map_err(|e| AppError::Database(e.to_string()))`) before wrapping
+        // them, which erases the typed variant. Reproduce the EXACT string
+        // sqlx produces for a pool timeout rather than a synthetic string that
+        // merely contains the variant name -- the real Display does NOT contain
+        // "PoolTimedOut", so a guard keyed off the variant name silently let
+        // saturated proxy requests fall back to 500 (#1437).
+        let real = sqlx::Error::PoolTimedOut.to_string();
+        assert!(
+            !real.contains("PoolTimedOut"),
+            "guard must not rely on the Debug variant name; sqlx Display = {real:?}"
+        );
+        let err = AppError::Database(real);
+        let (status, code) = err.status_and_code();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "POOL_EXHAUSTED");
+        assert!(err.user_message().contains("retry"));
     }
 
     #[test]

@@ -25,10 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Checkout IAC repo
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: artifact-keeper/artifact-keeper-iac
           path: iac
@@ -51,7 +51,7 @@ jobs:
           aws-region: us-east-1
 
       - name: Setup Packer
-        uses: hashicorp/setup-packer@3286471d6cc6756d056a0b199fea5e0becdbc189 # main
+        uses: hashicorp/setup-packer@ce93c3c08a6c2ff2275bf4b54ff0d9a75f6c9789 # main
         with:
           version: "1.11.2"
 

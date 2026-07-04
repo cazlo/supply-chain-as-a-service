@@ -8,6 +8,9 @@
 //!   GET  /maven/{repo_key}/*path — Download artifact, metadata, or checksum
 //!   PUT  /maven/{repo_key}/*path — Upload artifact (mvn deploy)
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -17,10 +20,14 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use moka::future::Cache as MokaCache;
+use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{info, warn};
+use uuid::Uuid;
 
+use crate::api::handlers::cache_headers;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
@@ -31,6 +38,41 @@ use crate::models::repository::RepositoryType;
 
 // TODO: Remaining format handlers (beyond maven, npm, pypi, cargo) still use
 // plain-text error responses and should be migrated to AppError (#553).
+
+// ---------------------------------------------------------------------------
+// Maven `maven-metadata.xml` generation cache (#2079)
+// ---------------------------------------------------------------------------
+
+const MAVEN_METADATA_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAVEN_METADATA_CACHE_CAPACITY: u64 = 10_000;
+
+#[derive(Clone)]
+struct MavenMetadataCacheEntry {
+    versions: Vec<String>,
+    last_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+type MavenMetadataCacheKey = (Uuid, String, String);
+
+static MAVEN_METADATA_CACHE: Lazy<MokaCache<MavenMetadataCacheKey, Arc<MavenMetadataCacheEntry>>> =
+    Lazy::new(|| {
+        MokaCache::builder()
+            .max_capacity(MAVEN_METADATA_CACHE_CAPACITY)
+            .time_to_live(MAVEN_METADATA_CACHE_TTL)
+            .build()
+    });
+
+/// Invalidate the cached `maven-metadata.xml` for one `(repo, group, artifact)`
+/// tuple. Called whenever the version set for a GAV changes — i.e. on artifact
+/// upload and delete — so a GET within the 60s TTL window immediately reflects
+/// the new version list (and emits a fresh ETag) instead of serving a stale
+/// aggregate. The TTL only bounds staleness for changes we don't observe
+/// directly (e.g. bulk lifecycle sweeps).
+pub async fn invalidate_maven_metadata_cache(repo_id: Uuid, group_id: &str, artifact_id: &str) {
+    MAVEN_METADATA_CACHE
+        .invalidate(&(repo_id, group_id.to_string(), artifact_id.to_string()))
+        .await;
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -780,6 +822,7 @@ async fn download(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
     let storage = state
@@ -809,24 +852,34 @@ async fn download(
     if MavenHandler::is_metadata(&path) {
         let content =
             fetch_maven_metadata_bytes(&state, &repo, &repo_key, &path, auth.as_ref()).await?;
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "text/xml")
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .body(Body::from(content))
-            .unwrap());
+        return Ok(cache_headers::cacheable_response(
+            content.to_vec(),
+            "text/xml",
+            &headers,
+        ));
     }
 
     // 3. Check if this is a checksum request for a stored file
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
-        // First try to find a stored checksum file
-        let checksum_storage_key = format!("maven/{}", path);
-        if let Ok(content) = storage.get(&checksum_storage_key).await {
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from(content))
-                .unwrap());
+        // The `maven/` storage prefix is reserved for Hosted/Staging repos —
+        // only the PUT handler ever writes there. Remote proxy repos serve
+        // cached content exclusively from `proxy-cache/`, and Virtual repos
+        // resolve through their members, so probing `maven/{path}` for them
+        // always misses and needlessly touches the reserved prefix (#1547).
+        // Restrict the stored-sidecar lookup to repo types that can own objects
+        // under `maven/`. (The SNAPSHOT branch below is inherently hosted-only:
+        // `resolve_snapshot_artifact` reads the `artifacts` table, which never
+        // has rows for Remote/Virtual repos, so it short-circuits for them.)
+        if checksum_compute_eligible(&repo.repo_type) {
+            // First try to find a stored checksum file
+            let checksum_storage_key = format!("maven/{}", path);
+            if let Ok(content) = storage.get(&checksum_storage_key).await {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(Body::from(content))
+                    .unwrap());
+            }
         }
 
         // If this is a SNAPSHOT path, try the stored checksum under the
@@ -940,6 +993,32 @@ async fn download(
     serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref()).await
 }
 
+/// Fetch a single Remote virtual member's Maven metadata document at `path`
+/// from upstream (via the proxy cache), as a UTF-8 string. Returns `None` for a
+/// non-Remote member or any miss.
+///
+/// Extracted so the Maven virtual metadata-merge loops can fan out across remote
+/// members CONCURRENTLY (#2069): a cold metadata merge then costs the slowest
+/// single upstream rather than the sum of every member's round-trip. Member
+/// (priority) order is preserved by collecting the per-member futures with
+/// `join_all`, so the merge precedence is unchanged.
+async fn fetch_remote_member_metadata(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    path: &str,
+) -> Option<String> {
+    if member.repo_type != RepositoryType::Remote {
+        return None;
+    }
+    let upstream_url = member.upstream_url.as_deref()?;
+    let proxy = state.proxy_service.as_ref()?;
+    let (content, _) =
+        proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, path)
+            .await
+            .ok()?;
+    std::str::from_utf8(&content).ok().map(|s| s.to_string())
+}
+
 async fn fetch_maven_metadata_bytes(
     state: &SharedState,
     repo: &RepoInfo,
@@ -970,45 +1049,32 @@ async fn fetch_maven_metadata_bytes(
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
             let mut all_versions: Vec<String> = Vec::new();
 
-            for member in &members {
-                if member.repo_type == RepositoryType::Remote {
-                    // Remote members: proxy metadata from upstream directly.
-                    if let (Some(upstream_url), Some(ref proxy)) =
-                        (member.upstream_url.as_deref(), &state.proxy_service)
-                    {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                            proxy,
+            // Fan out across members CONCURRENTLY (#2069) in priority-order
+            // batches of at most `MAX_VIRTUAL_FANOUT`: Remote members proxy their
+            // metadata from upstream, Local/Staging members generate it from
+            // artifact rows. Batching bounds concurrent upstream connections;
+            // `join_all` preserves within-batch (member) order.
+            for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+                let member_docs = futures::future::join_all(chunk.iter().map(|member| async {
+                    if member.repo_type == RepositoryType::Remote {
+                        fetch_remote_member_metadata(state, member, path).await
+                    } else {
+                        generate_metadata_for_artifact(
+                            &state.db,
                             member.id,
-                            &member.key,
-                            upstream_url,
-                            path,
+                            &group_id,
+                            &artifact_id,
                         )
                         .await
-                        {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                if let Some((_, _, versions)) =
-                                    crate::formats::maven::parse_metadata_versions(xml_str)
-                                {
-                                    all_versions.extend(versions);
-                                }
-                            }
-                        }
+                        .ok()
                     }
-                } else {
-                    // Local/Staging members: generate from artifact rows.
-                    if let Ok(xml) = generate_metadata_for_artifact(
-                        &state.db,
-                        member.id,
-                        &group_id,
-                        &artifact_id,
-                    )
-                    .await
+                }))
+                .await;
+                for xml in member_docs.into_iter().flatten() {
+                    if let Some((_, _, versions)) =
+                        crate::formats::maven::parse_metadata_versions(&xml)
                     {
-                        if let Some((_, _, versions)) =
-                            crate::formats::maven::parse_metadata_versions(&xml)
-                        {
-                            all_versions.extend(versions);
-                        }
+                        all_versions.extend(versions);
                     }
                 }
             }
@@ -1022,12 +1088,16 @@ async fn fetch_maven_metadata_bytes(
                 let latest = sorted.last().unwrap().clone();
                 let release = maven_version::latest_release(&sorted).cloned();
 
+                // No single `MAX(updated_at)` across heterogeneous members;
+                // wall clock is the best we can do for the virtual aggregate.
+                let last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
                 let xml = generate_metadata_xml(
                     &group_id,
                     &artifact_id,
                     &sorted,
                     &latest,
                     release.as_deref(),
+                    &last_updated,
                 );
 
                 return Ok(Bytes::from(xml));
@@ -1038,38 +1108,32 @@ async fn fetch_maven_metadata_bytes(
             // parse_metadata_path but carries <plugins> entries instead of a
             // <versions> block. Collect each member's plugin-prefix metadata
             // and serve the union of <plugin> entries deduped by <prefix>.
+            // Fan out across members CONCURRENTLY (#2069) in priority-order
+            // batches of at most `MAX_VIRTUAL_FANOUT`, preserving member order so
+            // the prefix-dedup precedence is unchanged and bounding concurrent
+            // upstream connections. Remote members fetch from upstream;
+            // Local/Staging members read their stored metadata file.
             let mut member_docs: Vec<String> = Vec::new();
-            for member in &members {
-                if member.repo_type == RepositoryType::Remote {
-                    // Remote members: fetch from upstream.
-                    if let (Some(upstream_url), Some(ref proxy)) =
-                        (member.upstream_url.as_deref(), &state.proxy_service)
-                    {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                            proxy,
-                            member.id,
-                            &member.key,
-                            upstream_url,
-                            path,
-                        )
-                        .await
-                        {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                member_docs.push(xml_str.to_string());
+            for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+                let batch = futures::future::join_all(chunk.iter().map(|member| async {
+                    if member.repo_type == RepositoryType::Remote {
+                        fetch_remote_member_metadata(state, member, path).await
+                    } else {
+                        let member_storage_key = format!("maven/{}", path);
+                        match state.storage_for_repo(&member.storage_location()) {
+                            Ok(member_storage) => {
+                                member_storage.get(&member_storage_key).await.ok().and_then(
+                                    |content| {
+                                        std::str::from_utf8(&content).ok().map(|s| s.to_string())
+                                    },
+                                )
                             }
+                            Err(_) => None,
                         }
                     }
-                } else {
-                    // Local/Staging members: try stored metadata file.
-                    let member_storage_key = format!("maven/{}", path);
-                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
-                        if let Ok(content) = member_storage.get(&member_storage_key).await {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                member_docs.push(xml_str.to_string());
-                            }
-                        }
-                    }
-                }
+                }))
+                .await;
+                member_docs.extend(batch.into_iter().flatten());
             }
 
             if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs) {
@@ -1081,48 +1145,47 @@ async fn fetch_maven_metadata_bytes(
         // parse_metadata_path returns None for `g/a/v-SNAPSHOT/maven-metadata.xml`
         // paths, so handle those separately.
         if let Some((group_id, artifact_id, version)) = parse_snapshot_metadata_path(path) {
+            // Fan out across members CONCURRENTLY (#2069) in priority-order
+            // batches of at most `MAX_VIRTUAL_FANOUT`, preserving member order
+            // and bounding concurrent upstream connections. Remote members proxy
+            // snapshot metadata from upstream; Local/Staging members combine
+            // their stored metadata file with entries from artifact rows.
             let mut all_entries: Vec<SnapshotEntry> = Vec::new();
-
-            for member in &members {
-                if member.repo_type == RepositoryType::Remote {
-                    // Remote members: proxy snapshot metadata from upstream.
-                    if let (Some(upstream_url), Some(ref proxy)) =
-                        (member.upstream_url.as_deref(), &state.proxy_service)
-                    {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
-                            proxy,
-                            member.id,
-                            &member.key,
-                            upstream_url,
-                            path,
-                        )
-                        .await
+            for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+                let per_member = futures::future::join_all(chunk.iter().map(|member| async {
+                    let mut entries: Vec<SnapshotEntry> = Vec::new();
+                    if member.repo_type == RepositoryType::Remote {
+                        if let Some(xml_str) =
+                            fetch_remote_member_metadata(state, member, path).await
                         {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                all_entries.extend(parse_snapshot_versions_xml(xml_str));
+                            entries.extend(parse_snapshot_versions_xml(&xml_str));
+                        }
+                    } else {
+                        let member_storage_key = format!("maven/{}", path);
+                        if let Ok(member_storage) =
+                            state.storage_for_repo(&member.storage_location())
+                        {
+                            if let Ok(content) = member_storage.get(&member_storage_key).await {
+                                if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                    entries.extend(parse_snapshot_versions_xml(xml_str));
+                                }
                             }
                         }
+                        entries.extend(
+                            collect_snapshot_entries(
+                                &state.db,
+                                member.id,
+                                &group_id,
+                                &artifact_id,
+                                &version,
+                            )
+                            .await,
+                        );
                     }
-                } else {
-                    // Local/Staging members: try stored metadata file, then
-                    // collect entries from artifact rows.
-                    let member_storage_key = format!("maven/{}", path);
-                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
-                        if let Ok(content) = member_storage.get(&member_storage_key).await {
-                            if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                all_entries.extend(parse_snapshot_versions_xml(xml_str));
-                            }
-                        }
-                    }
-
-                    let entries = collect_snapshot_entries(
-                        &state.db,
-                        member.id,
-                        &group_id,
-                        &artifact_id,
-                        &version,
-                    )
-                    .await;
+                    entries
+                }))
+                .await;
+                for entries in per_member {
                     all_entries.extend(entries);
                 }
             }
@@ -1157,6 +1220,16 @@ async fn fetch_maven_metadata_bytes(
         }
     }
 
+    if let Some((group_id, artifact_id, version)) = parse_snapshot_metadata_path(path) {
+        let entries =
+            collect_snapshot_entries(&state.db, repo.id, &group_id, &artifact_id, &version).await;
+        if let Some(xml) =
+            generate_snapshot_metadata_xml(&group_id, &artifact_id, &version, &entries)
+        {
+            return Ok(Bytes::from(xml));
+        }
+    }
+
     Err(AppError::NotFound("Metadata not found".to_string()).into_response())
 }
 
@@ -1166,9 +1239,60 @@ async fn generate_metadata_for_artifact(
     group_id: &str,
     artifact_id: &str,
 ) -> Result<String, Response> {
-    let rows = sqlx::query!(
+    let entry = MAVEN_METADATA_CACHE
+        .try_get_with(
+            (repo_id, group_id.to_string(), artifact_id.to_string()),
+            load_maven_metadata_entry(db, repo_id, group_id, artifact_id),
+        )
+        .await
+        .map_err(|err: Arc<String>| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", err),
+            )
+                .into_response()
+        })?;
+
+    if entry.versions.is_empty() {
+        return Err(AppError::NotFound("No versions found".to_string()).into_response());
+    }
+
+    use crate::formats::maven_version;
+
+    let versions = entry.versions.clone();
+    let sorted = maven_version::sort_maven_versions(&versions);
+    let latest = sorted.last().unwrap().clone();
+    let release = maven_version::latest_release(&sorted).cloned();
+    let last_updated = entry
+        .last_updated_at
+        .map(|dt| dt.format("%Y%m%d%H%M%S").to_string())
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d%H%M%S").to_string());
+
+    Ok(generate_metadata_xml(
+        group_id,
+        artifact_id,
+        &sorted,
+        &latest,
+        release.as_deref(),
+        &last_updated,
+    ))
+}
+
+/// Load `(versions, max(updated_at))` for one GAV. Two queries — both served
+/// by `idx_artifact_metadata_maven_gav` (#2079) — so a Hosted repo's
+/// `maven-metadata.xml` response stabilizes `<lastUpdated>` across requests
+/// instead of always reporting `Utc::now()` like the previous handler did.
+async fn load_maven_metadata_entry(
+    db: &PgPool,
+    repo_id: Uuid,
+    group_id: &str,
+    artifact_id: &str,
+) -> Result<Arc<MavenMetadataCacheEntry>, String> {
+    use sqlx::Row;
+
+    let versions: Vec<String> = sqlx::query(
         r#"
-        SELECT DISTINCT a.version as "version?"
+        SELECT DISTINCT a.version
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -1178,29 +1302,44 @@ async fn generate_metadata_for_artifact(
           AND am.metadata->>'artifactId' = $3
           AND a.version IS NOT NULL
         "#,
-        repo_id,
-        group_id,
-        artifact_id,
     )
+    .bind(repo_id)
+    .bind(group_id)
+    .bind(artifact_id)
     .fetch_all(db)
     .await
-    .map_err(map_db_err)?;
+    .map_err(|e| format!("db error: {}", e))?
+    .into_iter()
+    .filter_map(|row| row.try_get::<Option<String>, _>("version").ok().flatten())
+    .collect();
 
-    let versions: Vec<String> = rows.into_iter().filter_map(|r| r.version).collect();
+    let last_updated_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query(
+        r#"
+        SELECT MAX(a.updated_at)
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'maven'
+          AND am.metadata->>'groupId' = $2
+          AND am.metadata->>'artifactId' = $3
+          AND a.version IS NOT NULL
+        "#,
+    )
+    .bind(repo_id)
+    .bind(group_id)
+    .bind(artifact_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| format!("db error: {}", e))?
+    .try_get("max")
+    .ok()
+    .flatten();
 
-    if versions.is_empty() {
-        return Err(AppError::NotFound("No versions found".to_string()).into_response());
-    }
-
-    use crate::formats::maven_version;
-
-    let sorted = maven_version::sort_maven_versions(&versions);
-    let latest = sorted.last().unwrap().clone();
-    let release = maven_version::latest_release(&sorted).cloned();
-
-    let xml = generate_metadata_xml(group_id, artifact_id, &sorted, &latest, release.as_deref());
-
-    Ok(xml)
+    Ok(Arc::new(MavenMetadataCacheEntry {
+        versions,
+        last_updated_at,
+    }))
 }
 
 async fn serve_artifact(
@@ -1210,8 +1349,21 @@ async fn serve_artifact(
     path: &str,
     auth: Option<&AuthExtension>,
 ) -> Result<Response, Response> {
-    let artifact = sqlx::query!(
-        r#"
+    // Remote (proxy) repos never persist rows in the `artifacts` table: the
+    // proxy cache writes to the package catalog + filesystem only (guarded by
+    // `test_cache_artifact_does_not_insert_into_artifacts_table`, #1278). So the
+    // exact-path lookup and SNAPSHOT resolution below always miss for them.
+    // Skip those 1-2 DB acquires and fall straight through to the upstream
+    // proxy fetch, cutting the per-request DB pressure on the remote
+    // artifact-GET hot path. Hosted/Virtual repos are unaffected.
+    let artifact = if repo.repo_type == RepositoryType::Remote {
+        None
+    } else {
+        // NOTE: the SQL string keeps its original 8-space indentation (not the
+        // block's) so the compile-time-checked query text matches the committed
+        // .sqlx offline cache key byte-for-byte.
+        let artifact = sqlx::query!(
+            r#"
         SELECT id, path, size_bytes, checksum_sha256,
                checksum_md5, checksum_sha1,
                content_type, storage_key
@@ -1221,38 +1373,39 @@ async fn serve_artifact(
           AND path = $2
         LIMIT 1
         "#,
-        repo.id,
-        path,
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(map_db_err)?;
+            repo.id,
+            path,
+        )
+        .fetch_optional(&state.db)
+        .await
+        .map_err(map_db_err)?;
 
-    // If artifact not found by exact path, try SNAPSHOT resolution
-    let artifact = match artifact {
-        Some(a) => Some(a),
-        None if path.contains("-SNAPSHOT") => {
-            if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, path).await {
-                let storage = state
-                    .storage_for_repo(&repo.storage_location())
-                    .map_err(|e| e.into_response())?;
-                let content = storage
-                    .get(&resolved.storage_key)
-                    .await
-                    .map_err(map_storage_err)?;
+        // If artifact not found by exact path, try SNAPSHOT resolution
+        match artifact {
+            Some(a) => Some(a),
+            None if path.contains("-SNAPSHOT") => {
+                if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, path).await {
+                    let storage = state
+                        .storage_for_repo(&repo.storage_location())
+                        .map_err(|e| e.into_response())?;
+                    let content = storage
+                        .get(&resolved.storage_key)
+                        .await
+                        .map_err(map_storage_err)?;
 
-                let ct = content_type_for_path(path);
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, ct)
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .header("X-Checksum-SHA256", &resolved.checksum_sha256)
-                    .body(Body::from(content))
-                    .unwrap());
+                    let ct = content_type_for_path(path);
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, ct)
+                        .header(CONTENT_LENGTH, content.len().to_string())
+                        .header("X-Checksum-SHA256", &resolved.checksum_sha256)
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+                None
             }
-            None
+            None => None,
         }
-        None => None,
     };
 
     // If artifact not found locally, try proxy for remote repos
@@ -1881,6 +2034,9 @@ async fn upload(
         .await
         .map_err(map_db_err)?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
+
     sqlx::query(
         r#"
         INSERT INTO artifact_metadata (artifact_id, format, metadata)
@@ -1925,6 +2081,12 @@ async fn upload(
     )
     .execute(&state.db)
     .await;
+
+    // The version set for this GAV just changed; drop any cached
+    // maven-metadata.xml so the next GET (even within the TTL window) rebuilds
+    // the aggregate and emits a fresh ETag instead of serving a stale list
+    // that omits the version just published.
+    invalidate_maven_metadata_cache(repo.id, &coords.group_id, &coords.artifact_id).await;
 
     info!(
         "Maven upload: {}:{}:{} ({}) to repo {}",
@@ -2411,6 +2573,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.repo_type, "hosted");
@@ -2425,6 +2588,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
+            promotion_only: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
@@ -2941,6 +3105,70 @@ mod tests {
         assert!(parsed.is_empty());
     }
 
+    #[tokio::test]
+    async fn test_hosted_snapshot_metadata_generated_from_replicated_timestamped_rows() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let router = fx.router_with_auth(super::router());
+        let base = "org/example/ak/maven/ak-snapshot/1.0-SNAPSHOT";
+        let timestamped = "1.0-20260702.120000-1";
+        let uploads = [
+            (
+                format!("{base}/ak-snapshot-{timestamped}.jar"),
+                bytes::Bytes::from_static(b"snapshot jar bytes"),
+            ),
+            (
+                format!("{base}/ak-snapshot-{timestamped}.pom"),
+                bytes::Bytes::from_static(
+                    br#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example.ak.maven</groupId>
+  <artifactId>ak-snapshot</artifactId>
+  <version>1.0-SNAPSHOT</version>
+</project>"#,
+                ),
+            ),
+        ];
+
+        for (path, body) in uploads {
+            let (status, response_body) = tdh::send(
+                router.clone(),
+                tdh::put(format!("/{}/{}", fx.repo_key, path), body),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "Maven PUT must create {path}; body={}",
+                String::from_utf8_lossy(&response_body)
+            );
+        }
+
+        let metadata_path = format!("/{}/{}/maven-metadata.xml", fx.repo_key, base);
+        let (status, body) = tdh::send(router, tdh::get(metadata_path.clone())).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "hosted target peer must synthesize SNAPSHOT metadata from replicated timestamped rows; body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let xml = String::from_utf8(body.to_vec()).expect("metadata is utf-8");
+        assert!(xml.contains("<groupId>org.example.ak.maven</groupId>"));
+        assert!(xml.contains("<artifactId>ak-snapshot</artifactId>"));
+        assert!(xml.contains("<version>1.0-SNAPSHOT</version>"));
+        assert!(xml.contains("<extension>jar</extension>"));
+        assert!(xml.contains("<extension>pom</extension>"));
+        assert!(xml.contains("<value>1.0-20260702.120000-1</value>"));
+    }
+
     // ── DB-backed HTTP-level regression tests (no_op without DATABASE_URL) ──
     //
     // These exercise the maven `download` handler end-to-end through the
@@ -3025,6 +3253,112 @@ mod tests {
         assert_eq!(metadata["format"], "maven");
         assert_eq!(metadata["groupId"], "com.example.catalog");
         assert_eq!(metadata["artifactId"], "demo-lib");
+    }
+
+    /// Publishing a new Maven version must immediately invalidate the cached
+    /// `maven-metadata.xml` for that GAV: a GET inside the 60s TTL window must
+    /// return the NEW version set (not a stale list) and a NEW ETag. A
+    /// conditional GET (`If-None-Match`) must return `304` while the metadata is
+    /// unchanged, and stop matching once the version set changes. Regression
+    /// guard for the previously unwired invalidation hook (#2079).
+    #[tokio::test]
+    async fn test_maven_metadata_cache_invalidated_on_publish_2079() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::to_bytes;
+        use axum::http::header::{ETAG, IF_NONE_MATCH};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let router = fx.router_with_auth(super::router());
+
+        let ga = "com/example/cacheinval/widget";
+        let meta_path = format!("/{}/{}/maven-metadata.xml", fx.repo_key, ga);
+
+        let publish = |ver: &str| {
+            let path = format!("/{}/{}/{ver}/widget-{ver}.jar", fx.repo_key, ga);
+            (path, bytes::Bytes::from(format!("jar-bytes-{ver}")))
+        };
+        let etag_of = |resp: &Response| {
+            resp.headers()
+                .get(ETAG)
+                .expect("ETag header present")
+                .to_str()
+                .expect("ETag is ascii")
+                .to_string()
+        };
+        let cond_get = |etag: &str| {
+            Request::builder()
+                .method("GET")
+                .uri(meta_path.clone())
+                .header(IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .expect("build conditional GET")
+        };
+
+        // Publish 1.0.0.
+        let (p1, b1) = publish("1.0.0");
+        let (s1, _) = tdh::send(router.clone(), tdh::put(p1, b1)).await;
+        assert_eq!(s1, StatusCode::CREATED);
+
+        // First metadata GET: 200, lists 1.0.0 only, and yields an ETag.
+        let resp = router
+            .clone()
+            .oneshot(tdh::get(meta_path.clone()))
+            .await
+            .expect("metadata GET");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag1 = etag_of(&resp);
+        let body1 = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body1 = String::from_utf8_lossy(&body1);
+        assert!(body1.contains("<version>1.0.0</version>"), "body={body1}");
+        assert!(!body1.contains("2.0.0"), "unexpected 2.0.0; body={body1}");
+
+        // Conditional GET with the matching ETag -> 304 (cache is serving).
+        let resp = router
+            .clone()
+            .oneshot(cond_get(&etag1))
+            .await
+            .expect("conditional GET");
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+
+        // Publish 2.0.0 within the 60s TTL window. Invalidation (not TTL expiry)
+        // must be what makes the new version visible.
+        let (p2, b2) = publish("2.0.0");
+        let (s2, _) = tdh::send(router.clone(), tdh::put(p2, b2)).await;
+        assert_eq!(s2, StatusCode::CREATED);
+
+        // Metadata GET now reflects 2.0.0 immediately with a NEW ETag.
+        let resp = router
+            .clone()
+            .oneshot(tdh::get(meta_path.clone()))
+            .await
+            .expect("metadata GET after publish");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag2 = etag_of(&resp);
+        let body2 = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body2 = String::from_utf8_lossy(&body2);
+        assert!(body2.contains("<version>1.0.0</version>"), "body={body2}");
+        assert!(
+            body2.contains("<version>2.0.0</version>"),
+            "stale metadata after publish (invalidation not wired); body={body2}"
+        );
+        assert_ne!(
+            etag1, etag2,
+            "ETag must change once the version set changes"
+        );
+
+        // The stale ETag must no longer produce a 304.
+        let resp = router
+            .clone()
+            .oneshot(cond_get(&etag1))
+            .await
+            .expect("stale conditional GET");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        fx.teardown().await;
     }
 
     /// Maven uploads must keep a physical artifact row for every uploaded
@@ -3644,6 +3978,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), meta_path.to_string())),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect("metadata download must succeed");
@@ -3660,6 +3995,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), format!("{}.{}", meta_path, ext))),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect("checksum download must succeed");
@@ -3852,6 +4188,7 @@ mod tests {
             &["1.0.0".to_string(), "1.1.0".to_string()],
             "1.1.0",
             Some("1.1.0"),
+            "20240101000000",
         );
 
         let mock = MockServer::start().await;
@@ -3902,6 +4239,122 @@ mod tests {
         assert_ne!(
             sha1, "0000bogussha1value0000",
             "resolver must not forward the upstream's mismatched sidecar"
+        );
+    }
+
+    /// VIRTUAL maven repo merging a LOCAL member's versions with a REMOTE
+    /// member's versions proxied from upstream — exercises the CONCURRENT
+    /// metadata-merge fan-out (#2069): `fetch_remote_member_metadata` plus the
+    /// versions-merge loop's Remote branch. The merged document must list
+    /// versions contributed by BOTH members. Uses a wiremock upstream (no real
+    /// egress). DB-gated (runs in CI where Postgres exists).
+    #[tokio::test]
+    async fn test_virtual_metadata_merges_local_and_remote_versions_2069() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let group_id = "com.example.cov2069merge";
+        let artifact_id = "lib";
+        let meta_path = format!(
+            "{}/{}/maven-metadata.xml",
+            group_id.replace('.', "/"),
+            artifact_id
+        );
+        // Remote upstream serves metadata listing a version the local lacks.
+        let upstream_meta = generate_metadata_xml(
+            group_id,
+            artifact_id,
+            &["3.0.0".to_string()],
+            "3.0.0",
+            Some("3.0.0"),
+            "20240101000000",
+        );
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*maven-metadata\.xml$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_meta))
+            .mount(&mock)
+            .await;
+
+        let (local_id, _lk, dir_l) = tdh::create_repo(&pool, "local", "maven").await;
+        let (remote_id, _rk, dir_r) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        seed_maven_version(&pool, local_id, user_id, group_id, artifact_id, "1.0.0").await;
+
+        // Virtual repo: local (priority 0) + remote (priority 1).
+        let virtual_id = uuid::Uuid::new_v4();
+        let virtual_key = format!("v-cov2069-{}", virtual_id.simple());
+        let virtual_dir = std::env::temp_dir().join(format!("cov2069-{}", virtual_id));
+        std::fs::create_dir_all(&virtual_dir).expect("create virtual dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'maven'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(virtual_dir.to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .expect("insert virtual repo");
+        for (i, m) in [local_id, remote_id].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(m)
+            .bind(i as i32)
+            .execute(&pool)
+            .await
+            .expect("link virtual member");
+        }
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir_r.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir_r.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(user_id, &username);
+
+        let resp = download(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path((virtual_key.clone(), meta_path.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("virtual metadata download must succeed");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read merged metadata body");
+        let body_str = String::from_utf8(body.to_vec()).expect("merged metadata is utf-8");
+
+        // cleanup
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+        tdh::cleanup(&pool, remote_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir_l);
+        let _ = std::fs::remove_dir_all(&dir_r);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert!(
+            body_str.contains("1.0.0") && body_str.contains("3.0.0"),
+            "virtual maven metadata must merge LOCAL (1.0.0) + REMOTE (3.0.0) \
+             versions via the concurrent fan-out (#2069); got: {body_str}"
         );
     }
 
@@ -3988,6 +4441,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth)),
             Path((virtual_key.clone(), pom_path.to_string())),
+            HeaderMap::new(),
         )
         .await;
 
@@ -4014,5 +4468,147 @@ mod tests {
             pom_body.as_bytes(),
             "virtual must return the upstream POM bytes (#1562)"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_skip_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Remote (proxy) repos never persist rows in `artifacts` (the proxy cache
+    // writes to the package catalog + filesystem only, #1278), so serve_artifact
+    // must skip the artifacts-table lookup for them. Proof: seed an `artifacts`
+    // row for a REMOTE repo, then GET it with no proxy service configured. The
+    // pre-fix code consulted the table and served the seeded row (200); the fix
+    // skips the lookup and falls through to a not-found (non-200).
+    #[tokio::test]
+    async fn test_serve_artifact_remote_skips_artifacts_lookup() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let repo = fx.repo_info("remote", Some("https://upstream.example.test"));
+        let path = "com/example/lib/1.0/lib-1.0.jar";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            "pr2-remote-skip",
+            path,
+            "lib",
+            "1.0",
+            "application/java-archive",
+            bytes::Bytes::from_static(b"seeded"),
+            fx.user_id,
+        )
+        .await;
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, path))).await;
+        assert_ne!(
+            status,
+            axum::http::StatusCode::OK,
+            "Remote repo must not serve rows from the artifacts table; the lookup should be skipped"
+        );
+        fx.teardown().await;
+    }
+
+    // Hosted repos still resolve the `-SNAPSHOT` alias to the timestamped file
+    // Maven actually deploys. Seed the timestamped artifact, request the
+    // `-SNAPSHOT` alias, and assert serve_artifact resolves + streams it. This
+    // exercises the SNAPSHOT-resolution branch that the Remote skip wraps.
+    #[tokio::test]
+    async fn test_serve_artifact_snapshot_alias_resolves_and_serves() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let stored = "com/example/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-1.jar";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            "pr2-snapshot-key",
+            stored,
+            "lib",
+            "1.0-SNAPSHOT",
+            "application/java-archive",
+            bytes::Bytes::from_static(b"snap-bytes"),
+            fx.user_id,
+        )
+        .await;
+        let alias = "com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar";
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, alias))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], b"snap-bytes");
+        fx.teardown().await;
+    }
+}
+
+#[cfg(test)]
+mod maven_prefix_reserved_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // #1547 (regression, hosted path preserved): a Hosted repo may still serve
+    // a checksum sidecar stored under the reserved `maven/` prefix. PUT a
+    // `.sha1` sidecar (which the upload handler stores at `maven/{path}`), then
+    // GET it and assert the stored bytes are returned. This exercises the
+    // eligibility-gated stored-sidecar lookup in `download`.
+    #[tokio::test]
+    async fn test_hosted_serves_stored_maven_checksum_sidecar() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let path = "com/example/lib/1.0/lib-1.0.jar.sha1";
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::put(
+                format!("/{}/{}", fx.repo_key, path),
+                bytes::Bytes::from(sha1),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "sidecar PUT stored"
+        );
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, path))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], sha1.as_bytes());
+        // The reserved prefix is legitimately populated for a Hosted repo.
+        assert!(
+            fx.storage_dir.join("maven").exists(),
+            "hosted checksum sidecar must live under the maven/ prefix"
+        );
+        fx.teardown().await;
+    }
+
+    // #1547 (fix): a Remote proxy repo must NOT touch the reserved `maven/`
+    // prefix when a Maven/Gradle client probes for a checksum sidecar. With no
+    // proxy service configured the request 404s, and crucially no `maven/`
+    // directory hierarchy is materialised — proxy content belongs under
+    // `proxy-cache/`, never `maven/`.
+    #[tokio::test]
+    async fn test_remote_checksum_probe_leaves_maven_prefix_untouched() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        let path = "com/example/lib/1.0/lib-1.0.jar.sha1";
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, path))).await;
+        assert_ne!(
+            status,
+            axum::http::StatusCode::OK,
+            "remote repo has no proxy service; checksum request must not succeed"
+        );
+        assert!(
+            !fx.storage_dir.join("maven").exists(),
+            "remote proxy checksum probe must not create anything under maven/ (#1547)"
+        );
+        fx.teardown().await;
     }
 }

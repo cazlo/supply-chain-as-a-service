@@ -174,13 +174,7 @@ async fn fetch_composer_artifacts(
     )
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     Ok(rows
         .into_iter()
@@ -223,13 +217,7 @@ async fn fetch_package_index_rows(
     )
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     Ok(rows
         .into_iter()
@@ -652,13 +640,7 @@ async fn download_archive(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Archive not found").into_response());
 
     let artifact = match artifact {
@@ -860,13 +842,7 @@ async fn search(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let search_results: Vec<serde_json::Value> = results
         .iter()
@@ -907,13 +883,7 @@ async fn search(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .unwrap_or(0);
 
     let total_pages = ((total_count as f64) / (per_page as f64)).ceil() as i64;
@@ -956,6 +926,7 @@ async fn upload(
     let user_id = require_auth_basic_scope(auth, "composer", "write")?.user_id;
     let repo = resolve_composer_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     // The body should be a zip archive containing composer.json
     if body.is_empty() {
@@ -1008,11 +979,7 @@ async fn upload(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        crate::api::handlers::db_err(e)
     })?;
 
     if existing.is_some() {
@@ -1070,13 +1037,10 @@ async fn upload(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     // Store metadata
     let composer_metadata = serde_json::json!({
@@ -1167,6 +1131,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: Some("https://packagist.org".to_string()),
+            promotion_only: false,
         };
         assert_eq!(info.id, id);
         assert_eq!(info.repo_type, "hosted");

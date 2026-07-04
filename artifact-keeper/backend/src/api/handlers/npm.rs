@@ -191,7 +191,9 @@ fn validate_package_name(name: &str) -> Result<(), Response> {
 }
 
 fn map_status(status: StatusCode, msg: &str) -> Response {
-    (status, axum::Json(serde_json::json!({"error": msg}))).into_response()
+    super::with_retry_after_on_503(
+        (status, axum::Json(serde_json::json!({"error": msg}))).into_response(),
+    )
 }
 
 /// Encode a package name for use in upstream registry URLs.
@@ -1314,7 +1316,7 @@ async fn npm_local_fetch(
     .await
     .map_err(|e| {
         map_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_status(&e),
             &format!("Database error: {}", e),
         )
     })?
@@ -1780,6 +1782,9 @@ async fn store_npm_version(
     .await
     .map_err(map_db_err)?;
 
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo_id, artifact_id)
+        .await;
+
     // Store metadata
     let npm_metadata = serde_json::json!({
         "name": package_name,
@@ -1841,6 +1846,7 @@ async fn publish_package(
         require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let parsed = parse_npm_publish_payload(&body, package_name)?;
 
@@ -1952,6 +1958,7 @@ async fn dist_tags_put(
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if tag.is_empty() {
         return Err(
@@ -2024,6 +2031,7 @@ async fn dist_tags_delete(
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     if tag == "latest" {
         return Err(
@@ -2771,6 +2779,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            promotion_only: false,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
@@ -4546,6 +4555,65 @@ mod tests {
         );
     }
 
+    /// #2022: a direct `npm publish` to a `promotion_only` repository must be
+    /// rejected with 409 CONFLICT; the same publish to a normal repository must
+    /// still succeed. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_publish_blocked_on_promotion_only_repo() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let publish_body = serde_json::json!({
+            "name": "widget",
+            "versions": { "1.0.0": { "name": "widget", "version": "1.0.0" } },
+            "_attachments": { "widget-1.0.0.tgz": { "data": tarball_b64 } },
+        });
+        let body_bytes =
+            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body"));
+
+        // Flag the repo promotion_only -> direct publish is rejected with 409.
+        fx.set_promotion_only(true).await;
+        let blocked = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "widget",
+            &HeaderMap::new(),
+            body_bytes.clone(),
+        )
+        .await;
+
+        // Clear the flag -> the same publish succeeds.
+        fx.set_promotion_only(false).await;
+        let allowed = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "widget",
+            &HeaderMap::new(),
+            body_bytes,
+        )
+        .await;
+
+        fx.teardown().await;
+
+        let err = blocked.expect_err("publish to promotion_only repo must be rejected");
+        assert_eq!(
+            err.status(),
+            StatusCode::CONFLICT,
+            "promotion_only direct publish must return 409"
+        );
+        assert!(
+            allowed.is_ok(),
+            "publish to a normal repo must still succeed: {:?}",
+            allowed.err().map(|r| r.status())
+        );
+    }
+
     #[test]
     fn test_parse_npm_publish_payload_extracts_dist_tags() {
         let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
@@ -4858,5 +4926,30 @@ mod tests {
                 "/-/ping must not be treated as package lookup, got: {body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_npm_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![
+            format!("/{k}/mypkg"),
+            format!("/{k}/mypkg/1.0.0"),
+            format!("/{k}/mypkg/-/mypkg-1.0.0.tgz"),
+        ];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }

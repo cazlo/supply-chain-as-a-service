@@ -19,18 +19,26 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use serde::{Deserialize, Deserializer};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tracing::info;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, RawPackage, Severity};
+use crate::models::user::User;
+use crate::services::auth_service::AuthService;
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
     is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, resolve_scan_reference,
-    validate_trivy_purl, ScanOutput, ScanTarget, ScanWorkspace, Scanner, VersionCache,
+    validate_trivy_purl, ScanOutput, ScanReferenceResolution, ScanTarget, ScanWorkspace, Scanner,
+    VersionCache,
 };
+use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
+use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
 // Grype JSON output structures
@@ -242,8 +250,8 @@ fn classify_grype_spawn_error(err: &std::io::Error) -> AppError {
 /// The returned value has any scheme (`https://`, `http://`) stripped and
 /// trailing `/` trimmed, because Grype expects `host[:port]`, not a URL.
 ///
-/// `pub(crate)` so `ImageScanner::extract_image_ref_for_repo` reuses the same
-/// host-resolution logic when qualifying the Trivy scan target.
+/// `pub(crate)` so `ImageScanner::registry_url` reuses the same host-resolution
+/// logic when telling the Harbor scanner-adapter which registry to pull from.
 pub(crate) fn resolve_registry_host() -> String {
     let raw = std::env::var("AK_GRYPE_REGISTRY_HOST")
         .ok()
@@ -280,6 +288,151 @@ pub struct GrypeScanner {
     /// does not pay an extra subprocess; failed probes expire after 60s so
     /// the field starts populating once the binary becomes available.
     cached_version: VersionCache,
+    /// Optional token minter for private-repo registry pulls (#2093). When
+    /// wired, a registry-mode scan of a known repository injects a short-lived,
+    /// single-repo-scoped JWT into grype's child process via
+    /// `GRYPE_REGISTRY_AUTH_*` so grype can pull internal/private images that
+    /// anonymous pulls 401 on. Absent in the default (anonymous) wiring.
+    auth: Option<Arc<AuthService>>,
+    scan_identity: Option<User>,
+    /// TTL (seconds) for the per-repo scan token (config
+    /// `scan_token_ttl_seconds`). Only consulted when a minter is wired.
+    scan_token_ttl_seconds: i64,
+}
+
+struct LocalOciBlob {
+    digest: String,
+    storage_key: String,
+}
+
+/// The concrete single-platform image manifest a local OCI layout is built
+/// from. For a single-arch artifact this is the artifact's own manifest; for
+/// an image index it is the resolved child-platform manifest (#2053).
+struct LayoutManifest {
+    /// `sha256:...` digest of the manifest the layout's `index.json` points at.
+    digest: String,
+    /// The manifest body written as the layout's referenced manifest blob.
+    body: Bytes,
+    /// `mediaType` for the layout descriptor (empty ⇒ omitted).
+    media_type: String,
+}
+
+fn artifact_digest(checksum_sha256: &str) -> String {
+    let trimmed = checksum_sha256.trim();
+    if trimmed.starts_with("sha256:") {
+        trimmed.to_string()
+    } else {
+        format!("sha256:{}", trimmed)
+    }
+}
+
+fn digest_hex(digest: &str) -> Result<&str> {
+    let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
+        AppError::Internal(format!(
+            "Grype OCI local layout only supports sha256 digests, got {}",
+            digest
+        ))
+    })?;
+    if hex.is_empty() || hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AppError::Internal(format!(
+            "Invalid sha256 digest for Grype OCI local layout: {}",
+            digest
+        )));
+    }
+    Ok(hex)
+}
+
+async fn fetch_local_oci_blobs(
+    target: &ScanTarget<'_>,
+    manifest_digest: &str,
+) -> Result<Vec<LocalOciBlob>> {
+    let Some(db) = target.db else {
+        tracing::debug!(
+            artifact_id = %target.artifact.id,
+            "No database context available for Grype OCI local layout; falling back to registry scan"
+        );
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        r#"
+        SELECT mbr.blob_digest, ob.storage_key
+        FROM manifest_blob_refs mbr
+        JOIN oci_blobs ob
+          ON ob.repository_id = mbr.repository_id
+         AND ob.digest = mbr.blob_digest
+        WHERE mbr.repository_id = $1
+          AND mbr.manifest_digest = $2
+        ORDER BY
+          CASE mbr.kind WHEN 'config' THEN 0 WHEN 'layer' THEN 1 ELSE 2 END,
+          mbr.blob_digest
+        "#,
+    )
+    .bind(target.artifact.repository_id)
+    .bind(manifest_digest)
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        AppError::Database(format!(
+            "Failed to load OCI blob refs for manifest {}: {}",
+            manifest_digest, e
+        ))
+    })?;
+
+    rows.into_iter()
+        .map(|row| {
+            use sqlx::Row;
+            Ok(LocalOciBlob {
+                digest: row.try_get("blob_digest").map_err(|e| {
+                    AppError::Database(format!("Invalid OCI blob digest row: {}", e))
+                })?,
+                storage_key: row.try_get("storage_key").map_err(|e| {
+                    AppError::Database(format!("Invalid OCI blob storage key row: {}", e))
+                })?,
+            })
+        })
+        .collect()
+}
+
+async fn copy_storage_object_to_file(
+    storage: &dyn StorageBackend,
+    storage_key: &str,
+    path: &Path,
+) -> Result<()> {
+    let mut stream = storage.get_stream(storage_key).await.map_err(|e| {
+        AppError::Storage(format!(
+            "Failed to open OCI blob stream for key {}: {}",
+            storage_key, e
+        ))
+    })?;
+    let mut file = tokio::fs::File::create(path).await.map_err(|e| {
+        AppError::Storage(format!(
+            "Failed to create OCI blob file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            AppError::Storage(format!(
+                "Stream error while materializing OCI blob {}: {}",
+                storage_key, e
+            ))
+        })?;
+        file.write_all(&chunk).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to write OCI blob file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+    }
+    file.flush().await.map_err(|e| {
+        AppError::Storage(format!(
+            "Failed to flush OCI blob file {}: {}",
+            path.display(),
+            e
+        ))
+    })
 }
 
 impl GrypeScanner {
@@ -287,7 +440,71 @@ impl GrypeScanner {
         Self {
             scan_workspace,
             cached_version: VersionCache::new(),
+            auth: None,
+            scan_identity: None,
+            scan_token_ttl_seconds: 300,
         }
+    }
+
+    /// Attach a token minter so registry-mode scans of a known repository pull
+    /// with a short-lived, single-repo-scoped JWT (#2093). The identity is the
+    /// scanner service account; the token is minted per scan via
+    /// `AuthService::generate_scan_token` and injected into grype's child
+    /// process env — NEVER written to a file or logged.
+    #[must_use]
+    pub fn with_token_minter(
+        mut self,
+        auth: Arc<AuthService>,
+        identity: User,
+        ttl_seconds: i64,
+    ) -> Self {
+        self.auth = Some(auth);
+        self.scan_identity = Some(identity);
+        self.scan_token_ttl_seconds = ttl_seconds;
+        self
+    }
+
+    /// Assemble the `GRYPE_REGISTRY_AUTH_*` child-process env pairs for a
+    /// registry pull. Pure fn (no minting / no I/O) so it is directly
+    /// unit-testable: given the resolved registry `authority` (host) and an
+    /// optional bearer `token`, it returns the env vars grype's registry
+    /// client consumes. Returns an empty vec when there is no token (anonymous
+    /// pull — the legacy behavior). `GRYPE_REGISTRY_INSECURE_USE_HTTP` is set
+    /// because the in-cluster / dev registry endpoint is plain HTTP.
+    fn grype_registry_auth_env(
+        authority: &str,
+        token: Option<&str>,
+    ) -> Vec<(&'static str, String)> {
+        match token {
+            Some(t) => vec![
+                ("GRYPE_REGISTRY_AUTH_AUTHORITY", authority.to_string()),
+                ("GRYPE_REGISTRY_AUTH_TOKEN", t.to_string()),
+                ("GRYPE_REGISTRY_INSECURE_USE_HTTP", "true".to_string()),
+            ],
+            None => Vec::new(),
+        }
+    }
+
+    /// Mint the registry-auth env for a scoped registry pull of `repo_key`, or
+    /// an empty vec for an anonymous pull (no minter wired, or no repo key).
+    /// The minted token is single-repo-scoped and short-lived; NEVER logged.
+    fn registry_auth_env_for_repo(&self, repo_key: Option<&str>) -> Vec<(&'static str, String)> {
+        let token = match (repo_key, &self.auth, &self.scan_identity) {
+            (Some(key), Some(auth), Some(user)) => {
+                match auth.generate_scan_token(user, key, self.scan_token_ttl_seconds) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        // Degrade to an anonymous pull; the scan still
+                        // fails-closed downstream if the (now anonymous) pull
+                        // is rejected. Never include token material in the log.
+                        info!("Grype registry token minting failed: {}", e);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        Self::grype_registry_auth_env(&resolve_registry_host(), token.as_deref())
     }
 
     /// Build the `<host>/<name><sep><reference>` image ref that Grype's
@@ -379,11 +596,16 @@ impl GrypeScanner {
         &self,
         artifact: &Artifact,
         image_ref: String,
+        repo_key: Option<&str>,
     ) -> Result<ScanOutput> {
         let target = format!("registry:{}", image_ref);
         info!("Grype OCI registry scan target: {}", target);
 
-        let report = match self.run_grype_target(&target).await {
+        // Mint a per-repository scoped pull token when a minter is wired and we
+        // know the owning repo (production `scan_target` path). Legacy keyless
+        // scans pull anonymously (empty env), preserving prior behavior.
+        let auth_env = self.registry_auth_env_for_repo(repo_key);
+        let report = match self.run_grype_target(&target, &auth_env).await {
             Ok(report) => report,
             Err(e) => {
                 return Err(
@@ -413,10 +635,263 @@ impl GrypeScanner {
         })
     }
 
+    async fn scan_oci_layout_dir(
+        &self,
+        artifact: &Artifact,
+        target: &ScanTarget<'_>,
+        content: &Bytes,
+    ) -> Result<Option<ScanOutput>> {
+        let Some(layout_dir) = self
+            .prepare_local_oci_layout(artifact, target, content)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let grype_target = format!("oci-dir:{}", layout_dir.to_string_lossy());
+        info!("Grype OCI local layout scan target: {}", grype_target);
+        // Local OCI layout: no registry pull, so no registry-auth env.
+        let result = match self.run_grype_target(&grype_target, &[]).await {
+            Ok(report) => {
+                let findings = Self::convert_findings(&report);
+                let packages = Self::convert_packages(&report);
+                info!(
+                    "Grype OCI local layout scan complete for {}: {} vulnerabilities, {} components",
+                    artifact.name,
+                    findings.len(),
+                    packages.len()
+                );
+                Ok(ScanOutput {
+                    findings,
+                    packages,
+                    scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+                })
+            }
+            Err(e) => Err(fail_scan(
+                "Grype OCI local layout scan",
+                artifact,
+                &e,
+                &self.scan_workspace,
+                None,
+            )
+            .await),
+        };
+
+        if let Err(e) = tokio::fs::remove_dir_all(&layout_dir).await {
+            tracing::warn!(
+                path = %layout_dir.display(),
+                "Failed to clean up Grype OCI layout workspace: {}",
+                e
+            );
+        }
+
+        result.map(Some)
+    }
+
+    /// Resolve the concrete single-platform image manifest the local OCI
+    /// layout should be built from.
+    ///
+    /// For a single-arch image manifest the artifact's own manifest digest and
+    /// in-hand body are used directly (`mediaType` from `artifact.content_type`).
+    ///
+    /// For an image **index** / manifest list (#2053 follow-up), the artifact's
+    /// own manifest digest has no `manifest_blob_refs` rows (per migration 120,
+    /// only image manifests record config+layer edges), so the local-layout
+    /// path previously gave up and fell back to the broken `registry:` scan.
+    /// Instead we reuse [`resolve_scan_reference`] to pick a concrete scannable
+    /// child-platform digest, load that child manifest body from its
+    /// `oci-manifests/<digest>` storage key, and build the layout from the
+    /// **child** manifest (whose config+layer edges DO exist). The child
+    /// manifest body itself becomes the layout's single referenced manifest.
+    ///
+    /// Returns `None` when the index cannot be resolved to a local child
+    /// manifest (no storage context, missing child body), so the caller keeps
+    /// the existing `registry:` fallback.
+    async fn resolve_layout_manifest(
+        &self,
+        artifact: &Artifact,
+        target: &ScanTarget<'_>,
+        reference: &str,
+        content: &Bytes,
+    ) -> Result<Option<LayoutManifest>> {
+        let artifact_manifest_digest = artifact_digest(&artifact.checksum_sha256);
+
+        // Single-arch / malformed / non-index bodies pass through unchanged so
+        // the dominant path is byte-for-byte identical to before.
+        let child_digest = match resolve_scan_reference(content, reference) {
+            ScanReferenceResolution::ResolvedIndexChild(digest) => digest,
+            ScanReferenceResolution::Passthrough(_)
+            | ScanReferenceResolution::UnresolvableIndex(_) => {
+                return Ok(Some(LayoutManifest {
+                    digest: artifact_manifest_digest,
+                    body: content.clone(),
+                    media_type: artifact.content_type.clone(),
+                }));
+            }
+        };
+
+        // The body is an image index. The child manifest is stored under its
+        // own `oci-manifests/<digest>` key with its config+layer edges recorded
+        // in `manifest_blob_refs`; load that body and build the layout from it.
+        let Some(storage) = target.storage else {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                "No storage context available to resolve OCI index child for Grype; falling back to registry scan"
+            );
+            return Ok(None);
+        };
+        // Validate the child digest shape before using it in a storage key.
+        digest_hex(&child_digest)?;
+        let child_key = format!("{}{}", OCI_MANIFEST_STORAGE_PREFIX, child_digest);
+        let child_body = match storage.get(&child_key).await {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::debug!(
+                    artifact_id = %artifact.id,
+                    child_digest = %child_digest,
+                    "OCI index child manifest unavailable from local storage ({}); falling back to registry scan",
+                    e
+                );
+                return Ok(None);
+            }
+        };
+
+        // Prefer the child manifest's own declared mediaType; fall back to the
+        // generic OCI image manifest type so the oci-dir descriptor is valid.
+        let media_type = serde_json::from_slice::<serde_json::Value>(&child_body)
+            .ok()
+            .and_then(|v| {
+                v.get("mediaType")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+
+        Ok(Some(LayoutManifest {
+            digest: child_digest,
+            body: child_body,
+            media_type,
+        }))
+    }
+
+    async fn prepare_local_oci_layout(
+        &self,
+        artifact: &Artifact,
+        target: &ScanTarget<'_>,
+        content: &Bytes,
+    ) -> Result<Option<PathBuf>> {
+        let (image_name, reference) = parse_oci_manifest_path(&artifact.path).ok_or_else(|| {
+            AppError::Internal(format!(
+                "Grype OCI local layout: invalid OCI manifest path {}",
+                artifact.path
+            ))
+        })?;
+        let Some(layout_manifest) = self
+            .resolve_layout_manifest(artifact, target, reference, content)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let manifest_digest = layout_manifest.digest;
+        let manifest_body = layout_manifest.body;
+        let manifest_media_type = layout_manifest.media_type;
+        let blobs = fetch_local_oci_blobs(target, &manifest_digest).await?;
+        if blobs.is_empty() {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                manifest_digest = %manifest_digest,
+                "No local OCI blob refs available for Grype; falling back to registry scan"
+            );
+            return Ok(None);
+        }
+        let Some(storage) = target.storage else {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                "No storage context available for Grype OCI local layout; falling back to registry scan"
+            );
+            return Ok(None);
+        };
+
+        let layout_dir = PathBuf::from(&self.scan_workspace)
+            .join("grype-oci")
+            .join(artifact.id.to_string());
+        if tokio::fs::metadata(&layout_dir).await.is_ok() {
+            tokio::fs::remove_dir_all(&layout_dir).await.map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to reset Grype OCI layout workspace {}: {}",
+                    layout_dir.display(),
+                    e
+                ))
+            })?;
+        }
+
+        let blob_dir = layout_dir.join("blobs").join("sha256");
+        tokio::fs::create_dir_all(&blob_dir).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to create Grype OCI layout workspace {}: {}",
+                blob_dir.display(),
+                e
+            ))
+        })?;
+
+        tokio::fs::write(
+            layout_dir.join("oci-layout"),
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .await
+        .map_err(|e| AppError::Storage(format!("Failed to write OCI layout marker: {}", e)))?;
+
+        let manifest_path = blob_dir.join(digest_hex(&manifest_digest)?);
+        tokio::fs::write(&manifest_path, &manifest_body)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to write OCI manifest blob {}: {}",
+                    manifest_path.display(),
+                    e
+                ))
+            })?;
+
+        for blob in blobs {
+            let out_path = blob_dir.join(digest_hex(&blob.digest)?);
+            copy_storage_object_to_file(storage, &blob.storage_key, &out_path).await?;
+        }
+
+        let mut descriptor = serde_json::json!({
+            "mediaType": manifest_media_type,
+            "digest": manifest_digest,
+            "size": manifest_body.len(),
+            "annotations": {
+                "org.opencontainers.image.ref.name": reference,
+                "io.artifact-keeper.repository": target.repository_key,
+                "io.artifact-keeper.image": image_name,
+            }
+        });
+        if manifest_media_type.is_empty() {
+            descriptor
+                .as_object_mut()
+                .and_then(|o| o.remove("mediaType"));
+        }
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [descriptor],
+        });
+        let index_bytes = serde_json::to_vec(&index)
+            .map_err(|e| AppError::Internal(format!("Failed to encode OCI index: {}", e)))?;
+        tokio::fs::write(layout_dir.join("index.json"), index_bytes)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to write OCI index: {}", e)))?;
+
+        Ok(Some(layout_dir))
+    }
+
     /// Run grype against the workspace directory.
     async fn run_grype(&self, workspace: &Path) -> Result<GrypeReport> {
         let dir_arg = format!("dir:{}", workspace.to_string_lossy());
-        self.run_grype_target(&dir_arg).await
+        // Directory (local layout) scans never touch the registry, so no
+        // registry-auth env is needed.
+        self.run_grype_target(&dir_arg, &[]).await
     }
 
     /// Run grype against an arbitrary target string (e.g. `dir:/path`,
@@ -444,7 +919,11 @@ impl GrypeScanner {
     ///    keeps working under deployment configs that wipe inherited env
     ///    (Helm charts, k8s `env:` blocks that replace rather than append).
     ///    See artifact-keeper#1001 and PR #1002 (commit 23d9743).
-    async fn run_grype_target(&self, target: &str) -> Result<GrypeReport> {
+    async fn run_grype_target(
+        &self,
+        target: &str,
+        auth_env: &[(&'static str, String)],
+    ) -> Result<GrypeReport> {
         // Issue #1465: detect "grype binary missing from PATH" via the
         // io::ErrorKind of the spawn failure, NOT a substring search on
         // stderr. The previous implementation classified any non-zero exit
@@ -457,11 +936,19 @@ impl GrypeScanner {
         // ref, sending operators down a wild-goose chase patching their
         // Docker image. The kernel already gives us a precise NotFound
         // signal when execve() cannot resolve "grype"; use that.
-        let output = tokio::process::Command::new("grype")
+        let mut command = tokio::process::Command::new("grype");
+        command
             .args([target, "-o", "json"])
             .env("GRYPE_DB_AUTO_UPDATE", "false")
             .env("GRYPE_DB_VALIDATE_AGE", "false")
-            .env("GRYPE_CHECK_FOR_APP_UPDATE", "false")
+            .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
+        // Registry-auth env for a scoped private-repo pull (#2093). Applied as
+        // child-process env only — never persisted or logged. Empty for local
+        // (dir-mode) and anonymous registry scans.
+        for (key, value) in auth_env {
+            command.env(key, value);
+        }
+        let output = command
             .output()
             .await
             .map_err(|e| classify_grype_spawn_error(&e))?;
@@ -764,7 +1251,15 @@ impl Scanner for GrypeScanner {
             // artifact paths omit the routing key, so Grype must validate that
             // a ref can be built with the owning repository key restored.
             // Path-only applicability: no manifest body at gate time (#1971).
-            return Self::oci_registry_target(artifact, target, None).is_some();
+            //
+            // when the orchestrator supplies the manifest body, also
+            // require the body to classify as a real container image so a
+            // Helm-OCI chart / cosign sig / SBOM / WASM module (which all share
+            // the image manifest mediaType but would fail in `scan` as an
+            // unsupported layer) is rejected as not-applicable up front rather
+            // than failing the scan.
+            return crate::services::scanner_service::oci_target_is_scannable_image(target)
+                && Self::oci_registry_target(artifact, target, None).is_some();
         }
         self.is_applicable(artifact)
     }
@@ -809,7 +1304,8 @@ impl Scanner for GrypeScanner {
                             .to_string(),
                     )
                 })?;
-            return self.scan_oci_registry_ref(artifact, image_ref).await;
+            // Legacy keyless path: no owning repository key, anonymous pull.
+            return self.scan_oci_registry_ref(artifact, image_ref, None).await;
         }
 
         let workspace =
@@ -862,6 +1358,10 @@ impl Scanner for GrypeScanner {
     ) -> Result<ScanOutput> {
         let artifact = target.artifact;
         if is_oci_image_artifact(artifact) {
+            if let Some(output) = self.scan_oci_layout_dir(artifact, target, content).await? {
+                return Ok(output);
+            }
+
             // #1971: thread the in-hand manifest body for index→child resolution.
             let image_ref =
                 Self::oci_registry_target(artifact, target, Some(content)).ok_or_else(|| {
@@ -871,7 +1371,10 @@ impl Scanner for GrypeScanner {
                             .to_string(),
                     )
                 })?;
-            return self.scan_oci_registry_ref(artifact, image_ref).await;
+            // Repository-aware path: mint a pull token scoped to this repo.
+            return self
+                .scan_oci_registry_ref(artifact, image_ref, Some(target.repository_key))
+                .await;
         }
 
         self.scan(artifact, metadata, content).await
@@ -885,6 +1388,139 @@ mod tests {
 
     fn make_artifact(name: &str, content_type: &str) -> Artifact {
         make_test_artifact(name, content_type, &format!("test/{}", name))
+    }
+
+    // ---- #2093: registry-auth env builder --------------------------------
+
+    use crate::services::scanner_service::test_helpers::{make_scanner_auth, make_scanner_user};
+
+    #[test]
+    fn test_grype_registry_auth_env_empty_without_token() {
+        // Anonymous pull: no token -> no GRYPE_REGISTRY_AUTH_* env, so grype
+        // keeps its prior public-only behavior.
+        let env = GrypeScanner::grype_registry_auth_env("host:8080", None);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_grype_registry_auth_env_sets_authority_and_token() {
+        let env = GrypeScanner::grype_registry_auth_env("host:8080", Some("jwt-abc"));
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(
+            map.get("GRYPE_REGISTRY_AUTH_AUTHORITY").map(String::as_str),
+            Some("host:8080")
+        );
+        assert_eq!(
+            map.get("GRYPE_REGISTRY_AUTH_TOKEN").map(String::as_str),
+            Some("jwt-abc")
+        );
+        // Plain-HTTP dev/in-cluster registry endpoint.
+        assert_eq!(
+            map.get("GRYPE_REGISTRY_INSECURE_USE_HTTP")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_registry_auth_env_for_repo_empty_without_minter() {
+        let scanner = GrypeScanner::new("/tmp/grype-2093-noauth".to_string());
+        assert!(scanner
+            .registry_auth_env_for_repo(Some("docker-private-a"))
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_registry_auth_env_for_repo_mints_scoped_token() {
+        let auth = make_scanner_auth();
+        let scanner = GrypeScanner::new("/tmp/grype-2093-auth".to_string()).with_token_minter(
+            auth.clone(),
+            make_scanner_user(),
+            300,
+        );
+
+        // No repo key -> anonymous even with a minter wired.
+        assert!(scanner.registry_auth_env_for_repo(None).is_empty());
+
+        let env = scanner.registry_auth_env_for_repo(Some("docker-private-a"));
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        let token = map
+            .get("GRYPE_REGISTRY_AUTH_TOKEN")
+            .expect("scoped pull must inject a token");
+        let claims = auth
+            .validate_access_token(token)
+            .expect("minted token must validate");
+        assert_eq!(claims.scan_pull_repo.as_deref(), Some("docker-private-a"));
+    }
+
+    /// Canonical config/layer digests reused by the local-OCI-layout tests.
+    const TEST_CONFIG_DIGEST: &str =
+        "sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4";
+    const TEST_LAYER_DIGEST: &str =
+        "sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78";
+    /// A single-arch image manifest body referencing the two digests above.
+    const TEST_IMAGE_MANIFEST: &[u8] = br#"{"schemaVersion":2,"config":{"digest":"sha256:ab3fe4defd29ba6231229a4d41440ac8bde8218e85870e53876277faa24b35c4"},"layers":[{"digest":"sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78"}]}"#;
+
+    /// Insert the `oci_blobs` rows (config + layer) and the `manifest_blob_refs`
+    /// edges that link them to `manifest_digest`, scoped to `repo_id`. The
+    /// three `#[tokio::test]` layout cases share this setup verbatim; factoring
+    /// it keeps the duplicated SQL out of jscpd's reach.
+    async fn insert_image_manifest_refs(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        manifest_digest: &str,
+    ) {
+        let config_key = format!("oci-blobs/{TEST_CONFIG_DIGEST}");
+        let layer_key = format!("oci-blobs/{TEST_LAYER_DIGEST}");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(repo_id)
+        .bind(TEST_CONFIG_DIGEST)
+        .bind(24_i64)
+        .bind(&config_key)
+        .execute(pool)
+        .await
+        .expect("insert config blob row");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(repo_id)
+        .bind(TEST_LAYER_DIGEST)
+        .bind(11_i64)
+        .bind(&layer_key)
+        .execute(pool)
+        .await
+        .expect("insert layer blob row");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) VALUES ($1,$2,$3,'config'), ($1,$4,$3,'layer')",
+        )
+        .bind(manifest_digest)
+        .bind(TEST_CONFIG_DIGEST)
+        .bind(repo_id)
+        .bind(TEST_LAYER_DIGEST)
+        .execute(pool)
+        .await
+        .expect("insert manifest blob refs");
+    }
+
+    /// Write the config + layer blob bodies into `storage` under their
+    /// `oci-blobs/<digest>` keys (companion to [`insert_image_manifest_refs`]).
+    async fn put_image_blob_bodies(storage: &dyn StorageBackend) {
+        storage
+            .put(
+                &format!("oci-blobs/{TEST_CONFIG_DIGEST}"),
+                Bytes::from_static(br#"{"architecture":"arm64"}"#),
+            )
+            .await
+            .expect("write config blob");
+        storage
+            .put(
+                &format!("oci-blobs/{TEST_LAYER_DIGEST}"),
+                Bytes::from_static(b"layer bytes"),
+            )
+            .await
+            .expect("write layer blob");
     }
 
     // -----------------------------------------------------------------------
@@ -993,6 +1629,59 @@ mod tests {
             "v2/foo/blobs/sha256:deadbeef",
         );
         assert!(!grype().is_applicable(&a));
+    }
+
+    /// a Helm-OCI chart builds a valid registry ref (so the path gate
+    /// passes) but is not a container image. With the manifest body in the
+    /// target, GrypeScanner must reject it as not-applicable rather than
+    /// failing later in `scan` on the unsupported Helm layer.
+    #[test]
+    fn test_is_applicable_for_target_rejects_helm_oci_chart() {
+        let _env = EnvGuard::new();
+        let artifact = make_test_artifact(
+            "demochart",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/demochart/manifests/0.1.0",
+        );
+        let helm_body: &[u8] = br#"{"schemaVersion":2,
+          "config":{"mediaType":"application/vnd.cncf.helm.config.v1+json","digest":"sha256:cfg","size":7},
+          "layers":[{"mediaType":"application/vnd.cncf.helm.chart.content.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "helm-local",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: Some(helm_body),
+        };
+        assert!(
+            !grype().is_applicable_for_target(&target),
+            "a Helm-OCI chart must be not-applicable for Grype"
+        );
+    }
+
+    /// Regression guard: a real OCI image with a container config in the
+    /// body stays applicable for Grype registry-mode scanning.
+    #[test]
+    fn test_is_applicable_for_target_accepts_real_oci_image_with_body() {
+        let _env = EnvGuard::new();
+        let artifact = make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        let image_body: &[u8] = br#"{"schemaVersion":2,
+          "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cfg","size":7},
+          "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:l1","size":9}]}"#;
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-repo1",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: Some(image_body),
+        };
+        assert!(grype().is_applicable_for_target(&target));
     }
 
     #[test]
@@ -1275,6 +1964,9 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-repo1",
             repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
         };
 
         // The scan dispatch resolves a routable, repository-scoped ref.
@@ -1318,6 +2010,9 @@ mod tests {
             artifact: &artifact,
             repository_key: "docker-repo1",
             repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
         };
         assert!(
             grype().is_applicable_for_target(&target),
@@ -1334,6 +2029,294 @@ mod tests {
             ),
             "applicability and dispatch must agree on the repo-scoped ref"
         );
+    }
+
+    #[test]
+    fn test_digest_hex_accepts_only_canonical_sha256() {
+        let digest = "sha256:d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068";
+        assert_eq!(
+            digest_hex(digest).expect("valid digest"),
+            "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068"
+        );
+        assert!(digest_hex("sha512:abc").is_err());
+        assert!(digest_hex("sha256:not-hex").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_local_oci_layout_materializes_manifest_and_blobs() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let manifest_hex = "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068";
+        let config_digest = TEST_CONFIG_DIGEST;
+        let layer_digest = TEST_LAYER_DIGEST;
+        let manifest_digest = format!("sha256:{manifest_hex}");
+
+        put_image_blob_bodies(fx.state.storage.as_ref()).await;
+        insert_image_manifest_refs(&fx.pool, fx.repo_id, &manifest_digest).await;
+
+        let mut artifact = make_test_artifact(
+            "alpine:3.20",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/alpine/manifests/3.20",
+        );
+        artifact.repository_id = fx.repo_id;
+        artifact.checksum_sha256 = manifest_hex.to_string();
+        let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
+        let workspace = fx
+            .storage_dir
+            .join("grype-layout-test")
+            .to_string_lossy()
+            .into_owned();
+        let scanner = GrypeScanner::new(workspace);
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: Some(&fx.pool),
+            storage: Some(fx.state.storage.as_ref()),
+            manifest_body: None,
+        };
+
+        let layout = scanner
+            .prepare_local_oci_layout(&artifact, &target, &manifest)
+            .await
+            .expect("layout materialization should succeed")
+            .expect("local blob refs should produce an OCI layout");
+
+        assert!(layout.join("oci-layout").exists());
+        assert!(layout.join("index.json").exists());
+        assert_eq!(
+            tokio::fs::read(layout.join("blobs/sha256").join(manifest_hex))
+                .await
+                .expect("read manifest"),
+            manifest.to_vec()
+        );
+        assert_eq!(
+            tokio::fs::read(
+                layout
+                    .join("blobs/sha256")
+                    .join(config_digest.trim_start_matches("sha256:"))
+            )
+            .await
+            .expect("read config"),
+            br#"{"architecture":"arm64"}"#
+        );
+        assert_eq!(
+            tokio::fs::read(
+                layout
+                    .join("blobs/sha256")
+                    .join(layer_digest.trim_start_matches("sha256:"))
+            )
+            .await
+            .expect("read layer"),
+            b"layer bytes"
+        );
+
+        tokio::fs::remove_dir_all(&layout)
+            .await
+            .expect("cleanup layout");
+        fx.teardown().await;
+    }
+
+    /// #2053 follow-up: a multi-arch image **index** artifact has no
+    /// `manifest_blob_refs` rows under its own digest, so the local-layout
+    /// path must resolve the index to its concrete child-platform manifest
+    /// (whose config+layer edges DO exist), materialize the child layout, and
+    /// scan locally instead of falling back to the `registry:` path. Before
+    /// this fix the index case returned `None` and regressed to the broken
+    /// authenticated `registry:` scan (UNAUTHORIZED).
+    #[tokio::test]
+    async fn test_prepare_local_oci_layout_resolves_index_to_child_layout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        // The child (per-arch) image manifest the index points at. Its digest
+        // is what `manifest_blob_refs` is keyed on, NOT the index digest.
+        let child_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+        let child_digest = format!("sha256:{child_hex}");
+        let child_body = Bytes::from_static(TEST_IMAGE_MANIFEST);
+        let child_key = format!("oci-manifests/{child_digest}");
+
+        // The index/manifest-list body the artifact itself stores. It carries
+        // no blobs of its own — only child references.
+        let index_hex = "2222222222222222222222222222222222222222222222222222222222222222";
+        let index_body = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{child_digest}","platform":{{"os":"linux","architecture":"{arch}"}}}}]}}"#,
+            arch = crate::services::scanner_service::runner_arch(),
+        ));
+
+        // Child manifest body lives under its oci-manifests/<digest> key; its
+        // config+layer blobs and edges are recorded against the CHILD digest.
+        fx.state
+            .storage
+            .put(&child_key, child_body.clone())
+            .await
+            .expect("write child manifest");
+        put_image_blob_bodies(fx.state.storage.as_ref()).await;
+        insert_image_manifest_refs(&fx.pool, fx.repo_id, &child_digest).await;
+
+        let mut artifact = make_test_artifact(
+            "alpine:3.20",
+            "application/vnd.oci.image.index.v1+json",
+            "v2/alpine/manifests/3.20",
+        );
+        artifact.repository_id = fx.repo_id;
+        artifact.checksum_sha256 = index_hex.to_string();
+
+        let workspace = fx
+            .storage_dir
+            .join("grype-layout-index-test")
+            .to_string_lossy()
+            .into_owned();
+        let scanner = GrypeScanner::new(workspace);
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: Some(&fx.pool),
+            storage: Some(fx.state.storage.as_ref()),
+            manifest_body: None,
+        };
+
+        let layout = scanner
+            .prepare_local_oci_layout(&artifact, &target, &index_body)
+            .await
+            .expect("index layout materialization should succeed")
+            .expect("index should resolve to a local child layout, not registry fallback");
+
+        assert!(layout.join("oci-layout").exists());
+        assert!(layout.join("index.json").exists());
+        // The materialized manifest blob is the CHILD manifest (by child digest),
+        // not the index body.
+        assert_eq!(
+            tokio::fs::read(layout.join("blobs/sha256").join(child_hex))
+                .await
+                .expect("read child manifest"),
+            child_body.to_vec()
+        );
+        assert!(
+            tokio::fs::metadata(layout.join("blobs/sha256").join(index_hex))
+                .await
+                .is_err(),
+            "index manifest body must not be written as the scannable manifest"
+        );
+        // index.json points at the child manifest digest, so Grype scans a
+        // valid single-platform oci-dir.
+        let index_json: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(layout.join("index.json")).await.unwrap())
+                .expect("parse layout index.json");
+        assert_eq!(
+            index_json["manifests"][0]["digest"].as_str(),
+            Some(child_digest.as_str())
+        );
+        // Child config + layer blobs were materialized from the child's edges.
+        assert!(layout
+            .join("blobs/sha256")
+            .join(TEST_CONFIG_DIGEST.trim_start_matches("sha256:"))
+            .exists());
+        assert!(layout
+            .join("blobs/sha256")
+            .join(TEST_LAYER_DIGEST.trim_start_matches("sha256:"))
+            .exists());
+
+        tokio::fs::remove_dir_all(&layout)
+            .await
+            .expect("cleanup layout");
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_prepare_local_oci_layout_returns_none_without_db_context() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let mut artifact = make_test_artifact(
+            "alpine:3.20",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/alpine/manifests/3.20",
+        );
+        artifact.repository_id = fx.repo_id;
+        artifact.checksum_sha256 =
+            "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068".to_string();
+        let scanner = GrypeScanner::new(
+            fx.storage_dir
+                .join("grype-layout-test-no-db")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: None,
+            storage: Some(fx.state.storage.as_ref()),
+            manifest_body: None,
+        };
+
+        let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
+
+        assert!(scanner
+            .prepare_local_oci_layout(&artifact, &target, &manifest)
+            .await
+            .expect("layout preparation should not error")
+            .is_none());
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_prepare_local_oci_layout_returns_none_without_storage_context() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        let manifest_hex = "d10bea758e065a0cbf1f2d524b90b30a2ef986bdb4294fe9dbdb5fa59174b068";
+        let manifest_digest = format!("sha256:{manifest_hex}");
+
+        insert_image_manifest_refs(&fx.pool, fx.repo_id, &manifest_digest).await;
+
+        let mut artifact = make_test_artifact(
+            "alpine:3.20",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/alpine/manifests/3.20",
+        );
+        artifact.repository_id = fx.repo_id;
+        artifact.checksum_sha256 = manifest_hex.to_string();
+        let scanner = GrypeScanner::new(
+            fx.storage_dir
+                .join("grype-layout-test-no-storage")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-local",
+            repository_type: "local",
+            db: Some(&fx.pool),
+            storage: None,
+            manifest_body: None,
+        };
+        let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
+
+        assert!(scanner
+            .prepare_local_oci_layout(&artifact, &target, &manifest)
+            .await
+            .expect("layout preparation should not error")
+            .is_none());
+
+        fx.teardown().await;
     }
 
     #[test]

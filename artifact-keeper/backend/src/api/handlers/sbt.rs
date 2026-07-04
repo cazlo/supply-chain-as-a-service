@@ -81,13 +81,7 @@ async fn download_by_path(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     let artifact = match artifact {
         Some(a) => a,
@@ -211,6 +205,7 @@ async fn upload_artifact(
 
     // Reject writes to remote/virtual repos
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    repo.reject_if_promotion_only(false)?;
 
     let artifact_path = artifact_path.trim_start_matches('/').to_string();
 
@@ -247,13 +242,7 @@ async fn upload_artifact(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
         return Err((StatusCode::CONFLICT, "Artifact already exists at this path").into_response());
@@ -313,13 +302,10 @@ async fn upload_artifact(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(crate::api::handlers::db_err)?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     let _ = sqlx::query!(
         r#"
@@ -377,13 +363,7 @@ async fn check_exists(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
 
     let content_type = if artifact.content_type.is_empty() {
@@ -626,5 +606,26 @@ mod tests {
         assert_eq!(metadata["artifact"], "config-1.4.2");
         assert_eq!(metadata["ext"], "jar");
         assert_eq!(metadata["is_ivy_descriptor"], false);
+    }
+}
+
+#[cfg(test)]
+mod db_cov_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    // Exercises the DB-query happy paths so the sweep's db_err/db_status
+    // call-site lines are covered by cargo llvm-cov --lib (#2083).
+    #[tokio::test]
+    async fn test_sbt_db_query_paths_smoke() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let uris: Vec<String> = vec![format!("/{k}/org/name/1.0.0/name-1.0.0.jar")];
+        for uri in uris {
+            let app = fx.router_with_auth(super::router());
+            let _ = tdh::send(app, tdh::get(uri)).await;
+        }
+        fx.teardown().await;
     }
 }

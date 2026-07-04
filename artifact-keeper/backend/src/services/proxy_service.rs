@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use reqwest::header::{
     ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE,
 };
@@ -252,6 +254,26 @@ fn parse_release_file_paths(release_content: &str) -> Vec<String> {
     paths
 }
 
+/// Remove credential-bearing URL material before rendering an upstream target
+/// into logs or [`AppError`] messages.
+fn redact_url_for_diagnostics(url: &str) -> String {
+    if let Ok(mut parsed) = reqwest::Url::parse(url) {
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        return parsed.to_string();
+    }
+
+    let query_pos = url.find('?');
+    let fragment_pos = url.find('#');
+    let end = match (query_pos, fragment_pos) {
+        (Some(q), Some(f)) => q.min(f),
+        (Some(q), None) => q,
+        (None, Some(f)) => f,
+        (None, None) => url.len(),
+    };
+    url[..end].to_string()
+}
+
 /// * `404` → `AppError::NotFound` (cache-miss-class error; callers treat
 ///   as a real "upstream doesn't have it" signal, not a backend failure)
 /// * Other 5xx → `AppError::ServiceUnavailable` (transient upstream failure;
@@ -266,22 +288,23 @@ fn parse_release_file_paths(release_content: &str) -> Vec<String> {
 ///   503 would be misleading.
 /// * 2xx → `Ok(())`
 fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
+    let diagnostic_url = redact_url_for_diagnostics(url);
     if status == StatusCode::NOT_FOUND {
         return Err(AppError::NotFound(format!(
             "Artifact not found at upstream: {}",
-            url
+            diagnostic_url
         )));
     }
     if status.is_server_error() {
         return Err(AppError::ServiceUnavailable(format!(
             "Upstream returned error status {}: {}",
-            status, url
+            status, diagnostic_url
         )));
     }
     if !status.is_success() {
         return Err(AppError::BadGateway(format!(
             "Upstream returned error status {}: {}",
-            status, url
+            status, diagnostic_url
         )));
     }
     Ok(())
@@ -608,6 +631,25 @@ fn repo_key_from_cache_key(cache_key: &str) -> &str {
         .unwrap_or("unknown")
 }
 
+/// Matches the shape of an S3 *multipart* upload ETag: 32 hex digits (the MD5
+/// of the concatenated part digests) followed by `-<partcount>`, e.g.
+/// `d41d8cd98f00b204e9800998ecf8427e-3`.
+///
+/// Unlike a single-part ETag — which is the raw MD5 of the whole object body —
+/// a multipart ETag is an *opaque per-upload* value. Two replicas re-uploading
+/// byte-identical content produce different multipart ETags because the value
+/// depends on the upload's part boundaries, not just the bytes. It is therefore
+/// NOT a content hash and must not be used to prove two objects differ (#2120).
+static MULTIPART_ETAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[0-9a-fA-F]{32}-\d+$").unwrap());
+
+/// True when `etag` has the S3 multipart-upload shape (see
+/// [`MULTIPART_ETAG_RE`]). Surrounding double quotes — which S3 / `object_store`
+/// carry on the raw ETag header value — are stripped before matching so both
+/// `"<md5>-2"` and `<md5>-2` are recognized. Pure and side-effect free.
+fn is_multipart_etag(etag: &str) -> bool {
+    MULTIPART_ETAG_RE.is_match(etag.trim_matches('"'))
+}
+
 async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<String> {
     storage.head_etag(cache_key).await.unwrap_or_else(|e| {
         tracing::debug!(
@@ -879,6 +921,27 @@ impl CacheStore {
             Some(ref pinned) => match self.storage.head_etag(cache_key).await {
                 Ok(Some(current)) => {
                     if current != *pinned {
+                        // #2120: S3 multipart ETags are opaque per-upload
+                        // values, not content hashes. Two replicas re-uploading
+                        // byte-identical pull-through content mint DIFFERENT
+                        // multipart ETags, so a value mismatch does NOT imply
+                        // the object changed. When either side is multipart-
+                        // shaped, treat the mismatch as inconclusive and fall
+                        // back to an existence check rather than forcing the
+                        // slow path — which would re-fetch + re-upload, mint yet
+                        // another ETag, and thrash the fast path permanently.
+                        // Single-part (real-MD5) ETags keep full
+                        // mismatch = not-fresh semantics below. The robust
+                        // cross-replica single-flight fix is tracked in #1609.
+                        if is_multipart_etag(pinned) || is_multipart_etag(&current) {
+                            tracing::debug!(
+                                cache_key = %cache_key,
+                                pinned_etag = %pinned,
+                                current_etag = %current,
+                                "proxy cache multipart ETag mismatch on fast-path revalidation; falling back to existence check (#2120)"
+                            );
+                            return matches!(self.storage.exists(cache_key).await, Ok(true));
+                        }
                         tracing::warn!(
                             cache_key = %cache_key,
                             pinned_etag = %pinned,
@@ -1356,9 +1419,10 @@ impl UpstreamClient {
         repo_id: Uuid,
         accept: Option<&str>,
     ) -> Result<UpstreamResponse> {
+        let diagnostic_url = redact_url_for_diagnostics(url);
         tracing::info!(
             "Fetching artifact from upstream: {} (accept={:?})",
-            url,
+            diagnostic_url,
             accept
         );
 
@@ -1376,10 +1440,13 @@ impl UpstreamClient {
             request = request.header(ACCEPT, accept_value);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
+        let response = request.send().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to fetch from upstream {}: {}",
+                diagnostic_url,
+                e.without_url()
+            ))
+        })?;
 
         let status = response.status();
 
@@ -1405,7 +1472,7 @@ impl UpstreamClient {
 
             return Err(AppError::Storage(format!(
                 "Upstream returned error status {}: {}",
-                status, url
+                status, diagnostic_url
             )));
         }
 
@@ -1453,10 +1520,12 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
-        let content = response
-            .bytes()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?;
+        let content = response.bytes().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to read upstream response: {}",
+                e.without_url()
+            ))
+        })?;
 
         tracing::info!(
             "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?}, link: {:?})",
@@ -1488,7 +1557,11 @@ impl UpstreamClient {
     /// buffered variant; only the body extraction differs — and, critically,
     /// the streaming path sets NO `Accept` header anywhere (see below).
     async fn fetch_stream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamStream> {
-        tracing::info!("Fetching artifact from upstream (streaming): {}", url);
+        let diagnostic_url = redact_url_for_diagnostics(url);
+        tracing::info!(
+            "Fetching artifact from upstream (streaming): {}",
+            diagnostic_url
+        );
 
         let upstream_auth =
             crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
@@ -1502,10 +1575,13 @@ impl UpstreamClient {
         // both the initial request and the retry. This asymmetry is deliberate
         // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
+        let response = request.send().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to fetch from upstream {}: {}",
+                diagnostic_url,
+                e.without_url()
+            ))
+        })?;
 
         let status = response.status();
 
@@ -1522,7 +1598,7 @@ impl UpstreamClient {
 
             return Err(AppError::Storage(format!(
                 "Upstream returned error status {}: {}",
-                status, url
+                status, diagnostic_url
             )));
         }
 
@@ -1600,10 +1676,12 @@ impl UpstreamClient {
                 // method doc on the intentional asymmetry (#1618 S8).
                 let retry_request = build_request(self.http_client.get(url).bearer_auth(&token));
 
+                let retry_diagnostic_url = redact_url_for_diagnostics(url);
                 let retry_response = retry_request.send().await.map_err(|e| {
                     AppError::Storage(format!(
-                        "Failed to fetch from upstream after token exchange: {}",
-                        e
+                        "Failed to fetch from upstream {} after token exchange: {}",
+                        retry_diagnostic_url,
+                        e.without_url()
                     ))
                 })?;
 
@@ -1628,7 +1706,12 @@ impl UpstreamClient {
         let (content_type, etag, content_length) = extract_streaming_headers(response.headers());
 
         let body = response.bytes_stream().map(|r| {
-            r.map_err(|e| AppError::Storage(format!("Failed to read upstream stream: {}", e)))
+            r.map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to read upstream stream: {}",
+                    e.without_url()
+                ))
+            })
         });
 
         Ok(UpstreamStream {
@@ -2006,10 +2089,15 @@ impl ProxyService {
     ///
     ///   * **S3 / GCS / Azure**: ETag is the backend's per-object value.
     ///     For S3 single-part PUTs this equals the MD5 of the body and
-    ///     gives cryptographic-grade replacement detection; for multipart
-    ///     uploads it is an opaque per-upload identifier that still
-    ///     changes on any rewrite. Both are sufficient for tamper
-    ///     detection in the cache-poisoning threat model.
+    ///     gives cryptographic-grade replacement detection; a genuine
+    ///     mismatch there still forces the slow path. For S3 *multipart*
+    ///     uploads the ETag is an opaque per-upload identifier (not a
+    ///     content hash): byte-identical re-uploads on different replicas
+    ///     mint different values, so a mismatch is not a reliable
+    ///     "replaced" signal. Per #2120 a multipart-shaped ETag mismatch
+    ///     therefore falls back to an existence check (relying on cache
+    ///     TTL for staleness) instead of thrashing the fast path. The
+    ///     robust cross-replica single-flight fix is tracked in #1609.
     ///   * **Filesystem**: no native ETag. `storage_etag` is `None` for
     ///     these entries, revalidation is a no-op, and behavior matches
     ///     pre-#1051 semantics — i.e. the local filesystem is the trust
@@ -2046,6 +2134,35 @@ impl ProxyService {
         self.cache_store.is_fresh(&keys).await
     }
 
+    /// Gate a presigned-redirect fast path on a Package Age Policy hold (#2075).
+    ///
+    /// The redirect fast path (`proxy_fetch_or_redirect` and the virtual-member
+    /// proxy redirect) short-circuits a fresh cache hit into a 302 pointing at a
+    /// presigned URL without ever pulling the body through the backend. That skips
+    /// the quarantine gate the buffered/streaming fetch paths enforce via
+    /// [`check_quarantine_until`], so on redirect-capable backends a fresh entry
+    /// still inside its hold window would be handed out. This probe closes that
+    /// gap: it loads the same cache sidecar and applies the identical hold
+    /// decision BEFORE any redirect is issued.
+    ///
+    /// Mirrors the B6-safe stance elsewhere in this service (see the follower
+    /// re-check in `fetch_artifact_with_cache_path_and_accept`): a missing
+    /// sidecar, an absent hold, an elapsed hold, or a sidecar READ error all
+    /// resolve to `Ok(())` ("no hold known"). Only a sidecar recording a
+    /// still-active `quarantine_until` returns `Err` (Conflict/Authorization),
+    /// which the handler maps to 409/403 — no redirect, no upstream refetch.
+    pub async fn cache_quarantine_gate(&self, repo_key: &str, path: &str) -> Result<()> {
+        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
+        if let Some(metadata) = self
+            .load_cache_metadata(&metadata_key)
+            .await
+            .unwrap_or(None)
+        {
+            check_quarantine_until(metadata.quarantine_until)?;
+        }
+        Ok(())
+    }
+
     /// Fetch artifact from upstream, but use `cache_path` instead of
     /// `fetch_path` when reading and writing the proxy cache.
     ///
@@ -2063,11 +2180,13 @@ impl ProxyService {
             .await
     }
 
-    /// Inner variant of [`Self::fetch_artifact_with_cache_path`] that also
-    /// forwards an optional `Accept` header to the upstream request. Used by
-    /// callers that need OCI content negotiation (manifest GETs). Pass
-    /// `None` to preserve the buffered-fetch behaviour exactly.
-    async fn fetch_artifact_with_cache_path_and_accept(
+    /// Variant of [`Self::fetch_artifact_with_cache_path`] that also forwards
+    /// an optional `Accept` header to the upstream request. Used by callers
+    /// that need content negotiation: OCI manifest GETs, and the PyPI
+    /// simple-index proxy requesting the PEP 691 JSON representation under a
+    /// format-qualified `cache_path`. Pass `None` to preserve the buffered
+    /// fetch behaviour exactly.
+    pub async fn fetch_artifact_with_cache_path_and_accept(
         &self,
         repo: &Repository,
         fetch_path: &str,
@@ -2179,6 +2298,20 @@ impl ProxyService {
                             // unimplemented setting fails loudly, not silently.
                             self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
                                 .await;
+
+                            // #1999: index the newly-cached Maven artifact into
+                            // the package catalog (packages/package_versions
+                            // only — never the artifacts table, preserving
+                            // #1278). Best-effort: failures are swallowed and
+                            // never fail the client's proxy fetch.
+                            let checksum = StorageService::calculate_hash(&resp.content);
+                            self.index_cached_package(
+                                repo.id,
+                                cache_path,
+                                resp.content.len() as i64,
+                                Some(&checksum),
+                            )
+                            .await;
                         }
 
                         // Package Age Policy (#1770): hold the just-fetched
@@ -2555,6 +2688,20 @@ impl ProxyService {
         // setting is observable in logs rather than silently doing nothing.
         self.warn_if_proxy_scan_unsupported(repo.id, cache_path)
             .await;
+
+        // #1999: index the newly-cached Maven artifact into the package
+        // catalog (packages/package_versions only — never the artifacts
+        // table, preserving #1278). The streaming tee computes the checksum
+        // only after the body is fully written, so it is unknown here; pass
+        // the upstream Content-Length when advertised (0 otherwise) and no
+        // checksum. Best-effort: failures never fail the client's fetch.
+        self.index_cached_package(
+            repo.id,
+            cache_path,
+            upstream.content_length.unwrap_or(0) as i64,
+            None,
+        )
+        .await;
 
         let headers = StreamHeaders {
             content_type: upstream.content_type.clone(),
@@ -3164,6 +3311,52 @@ impl ProxyService {
         storage_key.starts_with("proxy-cache/")
     }
 
+    /// Purge every proxy-cache object for a repository from the global default
+    /// storage backend, returning the number of keys deleted.
+    ///
+    /// Proxy-cached content is keyed by the repository *key* (not its id) and
+    /// is intentionally NOT recorded in the `artifacts` table (#1278), so the
+    /// repository-delete path that purges `artifacts`-backed objects never sees
+    /// these blobs. Left behind, the whole `proxy-cache/<repo_key>/` subtree
+    /// outlives the repository; a later repository created with the same key
+    /// derives the same cache keys and would serve the deleted repository's
+    /// stale upstream content instead of fetching from its own upstream (#2047,
+    /// a content-integrity / supply-chain hazard).
+    ///
+    /// This lists the entire `proxy-cache/<repo_key>/` prefix on the same
+    /// global-default backend the cache writer uses (`self.storage`) and deletes
+    /// every returned key. Listing the raw keys (rather than reconstructing
+    /// logical paths via [`Self::cached_artifact_paths`]) is deliberate: it
+    /// covers the `__content__` body, the `__cache_meta__.json` sidecar, AND
+    /// negative-cache sidecars that exist with no `__content__` companion, so a
+    /// previously cached 404 is re-evaluated against the new upstream too.
+    ///
+    /// Best-effort: a listing failure yields a no-op (logged by the caller via
+    /// the returned `Result`), and individual `NotFound` deletes are tolerated
+    /// so a concurrent eviction does not turn the purge into an error. The
+    /// prefix is repo-key scoped, so calling this for a hosted repository (which
+    /// has no proxy cache) is a harmless empty list.
+    pub async fn purge_repo_cache(&self, repo_key: &str) -> Result<usize> {
+        let prefix = format!("proxy-cache/{}/", repo_key);
+        let keys = self.storage.list(Some(&prefix)).await?;
+        let mut deleted = 0usize;
+        for key in keys {
+            match self.storage.delete(&key).await {
+                Ok(()) => deleted += 1,
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        repo_key = %repo_key,
+                        storage_key = %key,
+                        error = %e,
+                        "failed to purge proxy-cache object on repository delete"
+                    );
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Generate storage key for cache metadata
     fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
         CacheKeys::derive(repo_key, path).map(|k| k.metadata)
@@ -3344,6 +3537,51 @@ impl ProxyService {
                 }
                 Ok(outcome)
             }
+        }
+    }
+
+    /// Cache-only, classifier- and quarantine-aware buffered read for the
+    /// virtual metadata first-match resolver (#2069).
+    ///
+    /// Unlike [`Self::get_cached_artifact_by_path`] (a raw, expiry-only read)
+    /// this runs the #1611 freshness classifier and the #1770 Package-Age-Policy
+    /// gate; unlike [`Self::read_cached_with_revalidation`] it NEVER contacts
+    /// upstream — a stale mutable entry is reported as a miss so the caller can
+    /// fall through to its own (parallel) upstream fetch instead of serializing
+    /// a revalidation here.
+    ///
+    /// Returns:
+    /// * `Ok(Some((body, content_type)))` — a fresh, non-quarantined cache hit;
+    /// * `Ok(None)` — miss / negative-cache / stale (caller re-fetches upstream);
+    /// * `Err(Conflict)` — a fresh entry held by Package-Age-Policy, so the
+    ///   caller skips this member (matching the buffered fetch path, which also
+    ///   surfaces the 409 rather than serving the held bytes).
+    pub async fn cached_metadata_if_servable(
+        &self,
+        repo: &Repository,
+        cache_path: &str,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
+        let mutability = cache_classifier::classify(&repo.format, cache_path);
+        let metadata = self
+            .load_cache_metadata(&metadata_key)
+            .await
+            .unwrap_or(None);
+        let entry = metadata.as_ref().map(|m| m.as_cache_entry(mutability));
+        match cache_classifier::evaluate(entry.as_ref(), Utc::now()) {
+            cache_classifier::Freshness::Fresh => {
+                check_quarantine_until(
+                    metadata
+                        .as_ref()
+                        .expect("fresh implies metadata present")
+                        .quarantine_until,
+                )?;
+                self.get_cached_artifact(&cache_key, &metadata_key).await
+            }
+            // Miss / NegativeHit / Stale: no upstream contact here — the caller
+            // falls through to its own (parallel) upstream fetch.
+            _ => Ok(None),
         }
     }
 
@@ -3708,6 +3946,90 @@ impl ProxyService {
         }
     }
 
+    /// Index a newly proxy-cached artifact into the `packages` /
+    /// `package_versions` catalog (#1999).
+    ///
+    /// Proxy-cached artifacts are deliberately NOT written to the `artifacts`
+    /// table (#1278 / #1280): doing so reintroduced a doubled-prefix storage
+    /// bug on filesystem backends, and the contract is pinned by the meta-test
+    /// `test_cache_artifact_does_not_insert_into_artifacts_table`. As a result
+    /// the package catalog — populated only by the local-upload handlers via
+    /// [`PackageService::try_create_or_update_from_artifact`] — stayed empty for
+    /// remote/proxy repositories, so `GET /api/v1/packages` and Maven component
+    /// grouping returned nothing for cached artifacts (#1999, regression in
+    /// 1.2.1).
+    ///
+    /// This best-effort helper closes that gap WITHOUT touching the `artifacts`
+    /// table: it writes ONLY `packages` / `package_versions` rows (idempotent
+    /// `ON CONFLICT` upsert), so a second pull of the same GAV (cache hit) does
+    /// not double the catalog and the #1278 meta-test stays green.
+    ///
+    /// Invariants:
+    /// * Called ONLY on the new-cache branch (the same gated spot as
+    ///   [`Self::warn_if_proxy_scan_unsupported`]), so it fires once per new
+    ///   write and never on cache hits.
+    /// * Maven checksum sidecars (`.sha1` / `.md5`) and `maven-metadata.xml`
+    ///   are skipped — they are not packages.
+    /// * A path with no extractable version yields no row.
+    /// * Indexing failure must NOT fail the client's proxy fetch:
+    ///   [`PackageService::try_create_or_update_from_artifact`] swallows + logs.
+    ///
+    /// The repository format is resolved from the DB by `repository_id` rather
+    /// than taken from the caller: the proxy fetch path operates on a synthetic
+    /// `Repository` whose `format` is always `Generic`
+    /// (`proxy_helpers::build_remote_repo`), so trusting it would skip every
+    /// real Maven repo.
+    async fn index_cached_package(
+        &self,
+        repository_id: Uuid,
+        artifact_path: &str,
+        size_bytes: i64,
+        checksum_sha256: Option<&str>,
+    ) {
+        // Resolve the real repository format (the synthetic proxy `Repository`
+        // carries `Generic`, not the configured format). A read failure or
+        // unparseable format degrades to "not indexed" (best-effort).
+        let format_text: Option<String> =
+            sqlx::query_scalar(r#"SELECT format::text FROM repositories WHERE id = $1"#)
+                .bind(repository_id)
+                .fetch_optional(&self.db)
+                .await
+                .ok()
+                .flatten();
+        let Some(repo_format) = catalog_indexable_format(format_text.as_deref()) else {
+            // Only Maven-family proxy repos populate the catalog for now
+            // (#1999). Other formats keep the pre-fix behavior until their
+            // grouping/listing paths are taught to read from the catalog too.
+            return;
+        };
+
+        let Some(name) = maven_proxy_package_name(artifact_path) else {
+            return;
+        };
+        let Some(version) = extract_version_from_path(&repo_format, artifact_path) else {
+            return;
+        };
+
+        // The streaming tee computes the checksum only after the body is fully
+        // written, so it is unknown at this gated spot; fall back to an empty
+        // string. The buffered path passes the real digest. Either way the
+        // catalog row exists; a later buffered pull refreshes the digest.
+        let checksum = checksum_sha256.unwrap_or("");
+
+        let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
+        pkg_svc
+            .try_create_or_update_from_artifact(
+                repository_id,
+                &name,
+                &version,
+                size_bytes,
+                checksum,
+                None,
+                None,
+            )
+            .await;
+    }
+
     /// Attempt to retrieve a cached artifact even if it has expired.
     /// Used as a fallback when upstream is unavailable.
     ///
@@ -3738,6 +4060,56 @@ impl ProxyService {
     }
 }
 
+/// Derive the package-catalog name (`groupId:artifactId`) for a Maven-family
+/// proxy-cached artifact path (#1999), or `None` if the path is not a Maven
+/// package asset that should be indexed.
+///
+/// Skip rules (these are not packages):
+/// * Maven checksum sidecars — `*.sha1`, `*.md5`, `*.sha256`, `*.sha512`, `*.asc`.
+/// * `maven-metadata.xml` (and its own checksum sidecars).
+/// * Any path that does not parse as Maven coordinates
+///   (`groupId/artifactId/version/filename`).
+///
+/// Using `groupId:artifactId` (rather than the bare `artifactId` that the
+/// local-upload path stores) keeps proxy package names globally unambiguous and
+/// lets the remote component-grouping branch reconstruct the `groupId` /
+/// `artifactId` split without consulting the storage path.
+pub(crate) fn maven_proxy_package_name(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let lower = filename.to_ascii_lowercase();
+
+    // Checksum / signature sidecars are not packages.
+    const SKIP_SUFFIXES: [&str; 5] = [".sha1", ".md5", ".sha256", ".sha512", ".asc"];
+    if SKIP_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+        return None;
+    }
+
+    // Maven metadata index files are not packages.
+    if lower == "maven-metadata.xml" || lower.starts_with("maven-metadata.xml.") {
+        return None;
+    }
+
+    let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
+    Some(format!("{}:{}", coords.group_id, coords.artifact_id))
+}
+
+/// Map a repository `format::text` value to the [`RepositoryFormat`] whose
+/// proxy-cached artifacts are indexed into the package catalog (#1999).
+///
+/// Only the Maven family is indexed for now; every other format (including a
+/// missing/unknown value) returns `None`, leaving the pre-fix behavior intact.
+/// Factored out of [`ProxyService::index_cached_package`] so the eligibility
+/// decision is unit-testable without a database round-trip.
+pub(crate) fn catalog_indexable_format(format_text: Option<&str>) -> Option<RepositoryFormat> {
+    match format_text {
+        Some("maven") => Some(RepositoryFormat::Maven),
+        Some("gradle") => Some(RepositoryFormat::Gradle),
+        Some("sbt") => Some(RepositoryFormat::Sbt),
+        _ => None,
+    }
+}
+
 /// Extract version from an artifact path based on the repository format.
 ///
 /// Each package format encodes the version differently in the path. This
@@ -3745,12 +4117,9 @@ impl ProxyService {
 /// for metadata files, index pages, or paths where the version cannot be
 /// determined.
 ///
-/// Currently unused: the previous caller in `cache_artifact` was removed
-/// when proxy-cached items stopped being inserted into the `artifacts`
-/// table (issue #1278). Kept around because the version-extraction logic
-/// is broadly useful and tests still exercise it; if a future cache
-/// listing/UX feature wants per-version metadata it should call this.
-#[allow(dead_code)]
+/// Called by [`ProxyService::index_cached_package`] (#1999) to populate the
+/// package catalog for proxy-cached Maven artifacts, and exercised directly by
+/// the unit tests below.
 pub(crate) fn extract_version_from_path(format: &RepositoryFormat, path: &str) -> Option<String> {
     let path = path.trim_start_matches('/');
 
@@ -5440,6 +5809,119 @@ SHA256:
         assert!(version.is_none());
     }
 
+    // =======================================================================
+    // maven_proxy_package_name — package-catalog name derivation + skip logic
+    // for proxy-cached Maven artifacts (#1999)
+    // =======================================================================
+
+    #[test]
+    fn test_maven_proxy_package_name_jar() {
+        assert_eq!(
+            maven_proxy_package_name(
+                "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"
+            )
+            .as_deref(),
+            Some("org.apache.commons:commons-lang3")
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_pom() {
+        assert_eq!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.pom").as_deref(),
+            Some("org.junit:junit-bom")
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_leading_slash() {
+        // The cache_path may arrive with a leading slash; it must be trimmed.
+        assert_eq!(
+            maven_proxy_package_name("/org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar").as_deref(),
+            Some("org.junit:junit-bom")
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_sha1() {
+        // Checksum sidecars are not packages and must NOT create a row.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_md5() {
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/junit-bom-5.10.1.pom.md5")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_signature_and_other_checksums() {
+        for path in [
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.asc",
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha256",
+            "org/junit/junit-bom/5.10.1/junit-bom-5.10.1.jar.sha512",
+        ] {
+            assert!(
+                maven_proxy_package_name(path).is_none(),
+                "expected {path} to be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_maven_metadata() {
+        // Version-level maven-metadata.xml (and its checksums) are index files.
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/maven-metadata.xml").is_none()
+        );
+        assert!(
+            maven_proxy_package_name("org/junit/junit-bom/5.10.1/maven-metadata.xml.sha1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_maven_proxy_package_name_skips_unparseable_path() {
+        // Too few segments to be a GAV → no package.
+        assert!(maven_proxy_package_name("org/junit/something.jar").is_none());
+    }
+
+    #[test]
+    fn test_catalog_indexable_format_maven_family() {
+        assert_eq!(
+            catalog_indexable_format(Some("maven")),
+            Some(RepositoryFormat::Maven)
+        );
+        assert_eq!(
+            catalog_indexable_format(Some("gradle")),
+            Some(RepositoryFormat::Gradle)
+        );
+        assert_eq!(
+            catalog_indexable_format(Some("sbt")),
+            Some(RepositoryFormat::Sbt)
+        );
+    }
+
+    #[test]
+    fn test_catalog_indexable_format_other_formats_not_indexed() {
+        for f in ["npm", "pypi", "docker", "generic", "cargo", "nuget"] {
+            assert!(
+                catalog_indexable_format(Some(f)).is_none(),
+                "{f} must not be catalog-indexed yet"
+            );
+        }
+    }
+
+    #[test]
+    fn test_catalog_indexable_format_missing_value() {
+        assert!(catalog_indexable_format(None).is_none());
+    }
+
     #[test]
     fn test_extract_version_npm_unscoped_tarball() {
         let version =
@@ -5756,6 +6238,113 @@ SHA256:
         Bytes::from(serde_json::to_vec(&metadata).unwrap())
     }
 
+    /// Build a fresh sidecar carrying the supplied Package Age Policy hold
+    /// (`quarantine_until`). Used to drive `cache_quarantine_gate` (#2075)
+    /// through the held / elapsed / no-hold states.
+    fn metadata_bytes_with_quarantine(quarantine_until: Option<DateTime<Utc>>) -> Bytes {
+        let metadata = CacheMetadata {
+            cached_at: Utc::now(),
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: 42,
+            checksum_sha256: "a".repeat(64),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_blocks_when_hold_active() {
+        let until = Utc::now() + chrono::Duration::minutes(30);
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(metadata_bytes_with_quarantine(Some(until))),
+            true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let err = service
+            .cache_quarantine_gate("npm-proxy", "lodash")
+            .await
+            .expect_err("an active hold must block the redirect fast path");
+        match err {
+            AppError::Conflict(_) => {}
+            other => panic!("expected Conflict for an active hold, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_allows_when_hold_elapsed() {
+        let until = Utc::now() - chrono::Duration::minutes(30);
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(metadata_bytes_with_quarantine(Some(until))),
+            true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        assert!(
+            service
+                .cache_quarantine_gate("npm-proxy", "lodash")
+                .await
+                .is_ok(),
+            "an elapsed hold must not block the redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_allows_when_no_hold() {
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(metadata_bytes_with_quarantine(None)),
+            true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        assert!(
+            service
+                .cache_quarantine_gate("npm-proxy", "lodash")
+                .await
+                .is_ok(),
+            "a sidecar with no hold must not block the redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_allows_when_sidecar_missing() {
+        let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        assert!(
+            service
+                .cache_quarantine_gate("npm-proxy", "lodash")
+                .await
+                .is_ok(),
+            "a missing sidecar means no hold known -> allow"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_quarantine_gate_allows_on_sidecar_read_error() {
+        // Malformed JSON makes load_metadata return Err (not NotFound); the
+        // B6-safe stance degrades that to "no hold known" -> Ok, so a transient
+        // sidecar read/parse failure never blocks a legitimate redirect.
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(Bytes::from_static(b"{ not valid json")),
+            true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        assert!(
+            service
+                .cache_quarantine_gate("npm-proxy", "lodash")
+                .await
+                .is_ok(),
+            "a sidecar read/parse error must be treated as no hold known"
+        );
+    }
+
     #[tokio::test]
     async fn test_is_cache_fresh_false_when_metadata_sidecar_missing() {
         let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
@@ -6001,6 +6590,144 @@ SHA256:
         );
     }
 
+    // =======================================================================
+    // Multipart-ETag tolerance on fast-path revalidation (#2120)
+    //
+    // S3 multipart ETags are opaque per-upload values (<md5hex>-<partcount>),
+    // NOT content hashes. Two replicas re-uploading byte-identical pull-through
+    // content mint DIFFERENT multipart ETags, which under the strict #1051
+    // rule made every fast-path hit re-fetch + re-upload forever. When either
+    // the pinned or the current ETag is multipart-shaped, a value mismatch is
+    // now treated as inconclusive and falls back to an existence check.
+    // Single-part (real-MD5) ETags keep FULL mismatch = not-fresh semantics.
+    // =======================================================================
+
+    #[test]
+    fn test_is_multipart_etag_recognizes_multipart_shape() {
+        // 32 hex digits + "-" + part count, with and without the surrounding
+        // quotes S3 / object_store carry on the raw header value.
+        assert!(is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e-3"));
+        assert!(is_multipart_etag("\"d41d8cd98f00b204e9800998ecf8427e-3\""));
+        assert!(is_multipart_etag("D41D8CD98F00B204E9800998ECF8427E-12"));
+        assert!(is_multipart_etag("00000000000000000000000000000000-1"));
+    }
+
+    #[test]
+    fn test_is_multipart_etag_rejects_singlepart_and_junk() {
+        // A bare MD5 (single-part ETag) is NOT multipart.
+        assert!(!is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e"));
+        assert!(!is_multipart_etag("\"d41d8cd98f00b204e9800998ecf8427e\""));
+        // Wrong hex length, missing/garbled part count, or non-hex.
+        assert!(!is_multipart_etag("deadbeef-2"));
+        assert!(!is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e-"));
+        assert!(!is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e-x"));
+        assert!(!is_multipart_etag("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-2"));
+        assert!(!is_multipart_etag(""));
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_true_when_multipart_pin_vs_singlepart_current_and_present() {
+        // Pinned ETag is multipart-shaped; current HEAD returns a different,
+        // single-part value. Because the pin is multipart the mismatch is
+        // inconclusive and we fall back to an existence check — object present
+        // → fresh (no thrash). #2120.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"d41d8cd98f00b204e9800998ecf8427e-4\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present("\"d41d8cd98f00b204e9800998ecf8427e\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            fresh,
+            "multipart-shaped pin mismatch with object present must fall back to existence → fresh"
+        );
+        assert_eq!(
+            mock.head_etag_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "still HEADs exactly once"
+        );
+        assert_eq!(
+            mock.exists_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "multipart mismatch path falls back to a single exists() probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_true_when_multipart_vs_multipart_differ_and_present() {
+        // Both pinned and current are multipart ETags for the same content but
+        // with different part counts (classic cross-replica re-upload). Object
+        // present → fresh. #2120.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"d41d8cd98f00b204e9800998ecf8427e-4\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present("\"d41d8cd98f00b204e9800998ecf8427e-7\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            fresh,
+            "multipart-vs-multipart mismatch with object present must yield fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_multipart_mismatch_but_content_gone() {
+        // Multipart mismatch but the existence fallback finds no object:
+        // still not fresh. Guards against serving a presigned URL to a 404.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"d41d8cd98f00b204e9800998ecf8427e-4\"".to_string(),
+            ))),
+            /* content_exists = */ false,
+            HeadEtagBehavior::Present("\"d41d8cd98f00b204e9800998ecf8427e-7\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "multipart mismatch with missing content must still yield not-fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_singlepart_mismatch_still_not_fresh() {
+        // Both ETags are single-part (real MD5) and differ: this is a genuine
+        // replacement signal and MUST keep the strict #1051 not-fresh behavior
+        // — the #2120 tolerance is scoped to multipart-shaped ETags only.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present("\"ffffffffffffffffffffffffffffffff\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "single-part ETag mismatch must remain not-fresh (no multipart tolerance)"
+        );
+        assert_eq!(
+            mock.exists_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "single-part mismatch must NOT fall back to an existence probe"
+        );
+    }
+
     #[test]
     fn test_cache_metadata_legacy_sidecar_deserializes_without_storage_etag() {
         // Sidecars written before #1051 do not include `storage_etag`.
@@ -6132,6 +6859,166 @@ SHA256:
             deletes.is_empty(),
             "no delete should be issued on path-traversal: {:?}",
             deletes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // purge_repo_cache (#2047)
+    //
+    // Repository delete must purge the whole `proxy-cache/<repo_key>/` subtree
+    // from the global default backend so a later repo created with the same key
+    // cannot serve the deleted repo's stale upstream content. The helper is
+    // storage-only (list + delete), so a recording mock that serves a fixed key
+    // set from `list` and captures every `delete` pins the contract.
+    // -----------------------------------------------------------------------
+
+    /// Recording mock that serves a fixed key set from `list(prefix)` (filtered
+    /// by prefix) and captures every `delete()` call, with a configurable
+    /// listing failure to exercise the best-effort error path.
+    struct PrefixListDeleteStorage {
+        keys: Vec<String>,
+        deletes: tokio::sync::Mutex<Vec<String>>,
+        list_fails: bool,
+    }
+
+    impl PrefixListDeleteStorage {
+        fn new(keys: Vec<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                keys: keys.into_iter().map(String::from).collect(),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
+                list_fails: false,
+            })
+        }
+        fn failing_list() -> Arc<Self> {
+            Arc::new(Self {
+                keys: Vec::new(),
+                deletes: tokio::sync::Mutex::new(Vec::new()),
+                list_fails: true,
+            })
+        }
+        async fn deletes_snapshot(&self) -> Vec<String> {
+            self.deletes.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for PrefixListDeleteStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.deletes.lock().await.push(key.to_string());
+            Ok(())
+        }
+        async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+            if self.list_fails {
+                return Err(AppError::Storage("mock list failure".to_string()));
+            }
+            let p = prefix.unwrap_or("");
+            Ok(self
+                .keys
+                .iter()
+                .filter(|k| k.starts_with(p))
+                .cloned()
+                .collect())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_purge_repo_cache_deletes_entire_repo_key_subtree() {
+        // Two cached entries (body + sidecar each) plus a negative-cache
+        // sidecar with no `__content__` companion, all under the target repo
+        // key, and an unrelated repo's entry that must be left untouched.
+        let storage = PrefixListDeleteStorage::new(vec![
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__content__",
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__cache_meta__.json",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__content__",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__cache_meta__.json",
+            // Negative-cache sidecar: a previously-404'd path, sidecar only.
+            "proxy-cache/rpm-remote/missing/pkg.rpm/__cache_meta__.json",
+            // Different repo that happens to share a key prefix substring:
+            // must NOT be purged (prefix is slash-terminated).
+            "proxy-cache/rpm-remote-other/repodata/repomd.xml/__content__",
+        ]);
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let deleted = service
+            .purge_repo_cache("rpm-remote")
+            .await
+            .expect("purge should succeed");
+
+        let deletes = storage.deletes_snapshot().await;
+        assert_eq!(deleted, 5, "should report 5 purged keys, got {:?}", deletes);
+        // Every object under the target repo key — content, sidecar, AND the
+        // negative-cache-only sidecar — must be gone.
+        for k in [
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__content__",
+            "proxy-cache/rpm-remote/repodata/repomd.xml/__cache_meta__.json",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__content__",
+            "proxy-cache/rpm-remote/Packages/foo.rpm/__cache_meta__.json",
+            "proxy-cache/rpm-remote/missing/pkg.rpm/__cache_meta__.json",
+        ] {
+            assert!(deletes.iter().any(|d| d == k), "expected delete of {k}");
+        }
+        // A different repo's cache must survive.
+        assert!(
+            !deletes
+                .iter()
+                .any(|d| d.starts_with("proxy-cache/rpm-remote-other/")),
+            "must not purge a sibling repo's cache: {:?}",
+            deletes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_repo_cache_empty_for_repo_with_no_cache() {
+        // A hosted repo (or a remote that was never fetched) has no
+        // proxy-cache objects: the helper must be a clean no-op, not an error.
+        let storage = PrefixListDeleteStorage::new(vec![
+            "proxy-cache/some-other-repo/repodata/repomd.xml/__content__",
+        ]);
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let deleted = service
+            .purge_repo_cache("hosted-repo")
+            .await
+            .expect("purge should succeed");
+
+        assert_eq!(
+            deleted, 0,
+            "no keys should be purged for a repo with no cache"
+        );
+        assert!(
+            storage.deletes_snapshot().await.is_empty(),
+            "no delete should fire when nothing matches the prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_repo_cache_propagates_list_failure() {
+        // A listing failure surfaces as Err so the caller can log it; the
+        // caller (delete_repository) swallows it so the delete still proceeds.
+        let storage = PrefixListDeleteStorage::failing_list();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let result = service.purge_repo_cache("rpm-remote").await;
+
+        assert!(result.is_err(), "list failure should surface as Err");
+        assert!(
+            storage.deletes_snapshot().await.is_empty(),
+            "no delete should fire when listing failed"
         );
     }
 
@@ -7075,6 +7962,21 @@ SHA256:
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_redact_url_for_diagnostics_strips_query_and_fragment() {
+        let signed = "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip\
+                      ?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIAEXAMPLE#section";
+        assert_eq!(
+            redact_url_for_diagnostics(signed),
+            "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip"
+        );
+
+        assert_eq!(
+            redact_url_for_diagnostics("packages/pkg.zip?token=secret#frag"),
+            "packages/pkg.zip"
+        );
+    }
+
+    #[test]
     fn test_validate_upstream_status_2xx_is_ok() {
         validate_upstream_status(StatusCode::OK, "http://x").expect("200 must pass");
         validate_upstream_status(StatusCode::PARTIAL_CONTENT, "http://x")
@@ -7153,6 +8055,23 @@ SHA256:
         match validate_upstream_status(StatusCode::UNAUTHORIZED, "http://up/x") {
             Err(AppError::BadGateway(_)) => {}
             other => panic!("401 must map to AppError::BadGateway; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_upstream_status_redacts_signed_url_diagnostics() {
+        let signed_url = "https://provider-bucket.s3.amazonaws.com/releases/pkg.zip\
+                          ?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIAEXAMPLE#frag";
+
+        match validate_upstream_status(StatusCode::FORBIDDEN, signed_url) {
+            Err(AppError::BadGateway(msg)) => {
+                assert!(msg.contains("https://provider-bucket.s3.amazonaws.com/releases/pkg.zip"));
+                assert!(
+                    !msg.contains("X-Amz") && !msg.contains("deadbeef") && !msg.contains("#frag"),
+                    "signed URL material must not appear in diagnostics: {msg}"
+                );
+            }
+            other => panic!("403 must map to redacted AppError::BadGateway; got {other:?}"),
         }
     }
 
@@ -8264,6 +9183,92 @@ SHA256:
             ct.as_deref(),
             Some("application/vnd.oci.image.manifest.v1+json"),
         );
+    }
+
+    /// `cached_metadata_if_servable` (#2069): the cache-only, classifier- and
+    /// quarantine-aware read used by the virtual metadata first-match resolver.
+    /// Pins the three load-bearing arms — a cold miss and a negative-cached 404
+    /// both read back as `Ok(None)` (so the caller falls through to its parallel
+    /// upstream fetch), and a fresh cache hit serves the body without contacting
+    /// upstream.
+    #[tokio::test]
+    async fn test_cached_metadata_if_servable_miss_fresh_and_negative() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"INDEX-BODY".as_ref()))
+            .mount(&server)
+            .await;
+        // "/missing.json" is intentionally NOT mounted → wiremock 404 → the
+        // fetch negative-caches it.
+
+        let tmp = std::env::temp_dir().join(format!("cached-meta-servable-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "test-cached-meta-servable".to_string(),
+            name: "test-cached-meta-servable".to_string(),
+            description: None,
+            format: RepositoryFormat::Generic,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "filesystem".to_string(),
+            storage_path: tmp.to_string_lossy().to_string(),
+            upstream_url: Some(server.uri()),
+            is_public: true,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Cold miss: nothing cached yet → Ok(None).
+        let miss = proxy.cached_metadata_if_servable(&repo, "index.json").await;
+        assert!(
+            matches!(miss, Ok(None)),
+            "uncached path must read back as a miss, got {miss:?}"
+        );
+
+        // Prime the cache via a real upstream fetch, then a FRESH hit must serve
+        // the body (no upstream contact).
+        let (body, _ct) = proxy
+            .fetch_artifact(&repo, "index.json")
+            .await
+            .expect("prime cache from upstream");
+        assert_eq!(&body[..], b"INDEX-BODY");
+        match proxy.cached_metadata_if_servable(&repo, "index.json").await {
+            Ok(Some((bytes, _))) => assert_eq!(&bytes[..], b"INDEX-BODY"),
+            other => panic!("fresh cached entry must be servable, got {other:?}"),
+        }
+
+        // A negative-cached 404 reads back as Ok(None) (NOT an error, NOT a
+        // served body) so the caller's Pass-2 fetch re-honors the negative cache.
+        let _ = proxy.fetch_artifact(&repo, "missing.json").await; // 404 → negative cache
+        let neg = proxy
+            .cached_metadata_if_servable(&repo, "missing.json")
+            .await;
+        assert!(
+            matches!(neg, Ok(None)),
+            "negative-cached entry must map to Ok(None), got {neg:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

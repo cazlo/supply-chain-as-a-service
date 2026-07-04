@@ -2,6 +2,7 @@
 
 use crate::error::{AppError, Result};
 use std::env;
+use std::path::Path;
 
 /// Read an environment variable and parse it, falling back to a default on missing or invalid values.
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -9,6 +10,35 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Parse a comma-separated list of CIDR ranges from env var `key`.
+///
+/// Whitespace around each entry is trimmed and empty entries are dropped.
+/// Individual entries that fail to parse are logged at warn level and skipped
+/// (rather than aborting startup), so one typo never takes down the whole
+/// list. An unset or empty var yields an empty list. Shared by the
+/// rate-limit exemption (`RATE_LIMIT_TRUSTED_CIDRS`) and trusted-proxy
+/// (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`) lists so both honor the same syntax.
+fn parse_cidr_list_env(key: &str) -> Vec<crate::api::middleware::rate_limit::CidrRange> {
+    env::var(key)
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .filter_map(
+                    |c| match crate::api::middleware::rate_limit::CidrRange::parse(c) {
+                        Ok(cidr) => Some(cidr),
+                        Err(e) => {
+                            tracing::warn!("Ignoring invalid CIDR in {}: {}", key, e);
+                            None
+                        }
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse an opt-in boolean flag from an optional env value.
@@ -163,8 +193,29 @@ pub struct Config {
     /// LDAP base DN (optional)
     pub ldap_base_dn: Option<String>,
 
-    /// Trivy server URL for container image scanning (optional)
+    /// Trivy server URL for filesystem / incus (rootfs) scanning (optional).
+    /// Consumed by `TrivyFsScanner` and `IncusScanner`, which drive the trivy
+    /// server directly (`--server` / dir-mode). NOT used for container image
+    /// scanning — see `trivy_adapter_url`.
     pub trivy_url: Option<String>,
+
+    /// Harbor Pluggable Scanner adapter URL for container *image* scanning
+    /// (optional), e.g. `http://trivy:8090` for `harbor-scanner-trivy`. When
+    /// set, `ImageScanner` is registered and scans images via the Harbor
+    /// scanner-adapter API (fail-closed on any adapter error). When unset, no
+    /// container-image (trivy/image) scanner runs — grype still scans. This is
+    /// deliberately separate from `trivy_url`: the adapter's HTTP API is
+    /// incompatible with the trivy-server Twirp/`--server` protocol the
+    /// fs/incus scanners use. See #2088.
+    pub trivy_adapter_url: Option<String>,
+
+    /// Lifetime, in seconds, of the short-lived per-repository pull token the
+    /// scanner mints for private-image scans (#2093). Env
+    /// `SCAN_TOKEN_TTL_SECONDS`, default 300. Kept intentionally short: the
+    /// token only has to live long enough for the adapter / grype to complete
+    /// the OCI pull, and a shorter window bounds the blast radius if one leaks
+    /// (it is also single-repo-scoped via the `scan_pull_repo` claim).
+    pub scan_token_ttl_seconds: u64,
 
     /// OpenSCAP wrapper URL for compliance scanning (optional)
     pub openscap_url: Option<String>,
@@ -287,6 +338,14 @@ pub struct Config {
     /// even when SSO providers are configured. Intended as a break-glass
     /// recovery mechanism when SSO is misconfigured.
     pub allow_local_admin_login: bool,
+
+    /// Opt-in strict SSO enforcement (#2018). When true, the verified-admin
+    /// break-glass local login (issue #443) is disabled too, so a deployment
+    /// that wants "SSO-only, no exceptions" locks out *all* local logins —
+    /// including admin — while any SSO provider is enabled. Defaults to
+    /// `false`, preserving the historical break-glass behaviour so existing
+    /// deployments are unchanged. Env var: `SSO_DISABLE_ADMIN_BREAK_GLASS`.
+    pub sso_disable_admin_break_glass: bool,
 
     /// Port for the unauthenticated Prometheus metrics-only listener.
     ///
@@ -415,6 +474,22 @@ pub struct Config {
     /// Example: `10.0.0.0/8,fc00::/7,127.0.0.1/32`.
     pub rate_limit_trusted_cidrs: Vec<crate::api::middleware::rate_limit::CidrRange>,
 
+    /// Comma-separated list of CIDR ranges identifying *trusted reverse
+    /// proxies*. The `X-Forwarded-For` header is consulted to resolve the
+    /// real client IP for rate-limit keying **only** when the immediate TCP
+    /// peer (from `ConnectInfo`) falls within one of these ranges. When empty
+    /// (the default), `X-Forwarded-For` is never trusted and keying always
+    /// tracks the real TCP peer, so a spoofed/rotating `XFF` from an untrusted
+    /// client cannot steer or multiply its rate-limit budget.
+    ///
+    /// This is distinct from `rate_limit_trusted_cidrs`, which exempts IPs
+    /// from rate limiting entirely; this field only governs whether `XFF` is
+    /// believed for client-IP resolution.
+    ///
+    /// Env var: `RATE_LIMIT_TRUSTED_PROXY_CIDRS`. Default: empty.
+    /// Example (single reverse proxy on loopback): `127.0.0.0/8`.
+    pub rate_limit_trusted_proxy_cidrs: Vec<crate::api::middleware::rate_limit::CidrRange>,
+
     /// Number of consecutive failed login attempts before a local account is
     /// locked. Set to 0 to disable account lockout. Default: 5.
     pub account_lockout_threshold: u32,
@@ -526,6 +601,8 @@ redacted_debug!(Config {
     show ldap_url,
     show ldap_base_dn,
     show trivy_url,
+    show trivy_adapter_url,
+    show scan_token_ttl_seconds,
     show openscap_url,
     show openscap_profile,
     show opensearch_url,
@@ -552,6 +629,7 @@ redacted_debug!(Config {
     show stuck_scan_reap_limit,
     show max_upload_size_bytes,
     show allow_local_admin_login,
+    show sso_disable_admin_break_glass,
     show metrics_port,
     show database_max_connections,
     show database_min_connections,
@@ -618,6 +696,8 @@ impl Default for Config {
             ldap_url: None,
             ldap_base_dn: None,
             trivy_url: None,
+            trivy_adapter_url: None,
+            scan_token_ttl_seconds: 300,
             openscap_url: None,
             openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
             opensearch_url: None,
@@ -644,6 +724,7 @@ impl Default for Config {
             stuck_scan_reap_limit: 1000,
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
+            sso_disable_admin_break_glass: false,
             metrics_port: None,
             database_max_connections: 50,
             database_min_connections: 5,
@@ -665,6 +746,7 @@ impl Default for Config {
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
             rate_limit_trusted_cidrs: Vec::new(),
+            rate_limit_trusted_proxy_cidrs: Vec::new(),
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
@@ -731,6 +813,12 @@ impl Config {
             ldap_url: env::var("LDAP_URL").ok(),
             ldap_base_dn: env::var("LDAP_BASE_DN").ok(),
             trivy_url: env::var("TRIVY_URL").ok(),
+            // Treat an empty value as unset: deployment templates commonly
+            // render `TRIVY_ADAPTER_URL=` (present-but-empty) when the feature
+            // is off, and registering the image scanner with an empty URL would
+            // make every image scan fail closed instead of not running at all.
+            trivy_adapter_url: env::var("TRIVY_ADAPTER_URL").ok().filter(|s| !s.is_empty()),
+            scan_token_ttl_seconds: env_parse("SCAN_TOKEN_TTL_SECONDS", 300),
             openscap_url: env::var("OPENSCAP_URL").ok(),
             openscap_profile: env::var("OPENSCAP_PROFILE")
                 .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),
@@ -817,6 +905,10 @@ impl Config {
                 env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
                 Ok("true" | "1")
             ),
+            sso_disable_admin_break_glass: matches!(
+                env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").as_deref(),
+                Ok("true" | "1")
+            ),
             metrics_port: match env::var("METRICS_PORT") {
                 Ok(val) => match val.parse::<u16>() {
                     Ok(port) => Some(port),
@@ -870,27 +962,8 @@ impl Config {
                 env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
                 Ok("true" | "1")
             ),
-            rate_limit_trusted_cidrs: env::var("RATE_LIMIT_TRUSTED_CIDRS")
-                .ok()
-                .map(|s| {
-                    s.split(',')
-                        .map(str::trim)
-                        .filter(|c| !c.is_empty())
-                        .filter_map(
-                            |c| match crate::api::middleware::rate_limit::CidrRange::parse(c) {
-                                Ok(cidr) => Some(cidr),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Ignoring invalid CIDR in RATE_LIMIT_TRUSTED_CIDRS: {}",
-                                        e
-                                    );
-                                    None
-                                }
-                            },
-                        )
-                        .collect()
-                })
-                .unwrap_or_default(),
+            rate_limit_trusted_cidrs: parse_cidr_list_env("RATE_LIMIT_TRUSTED_CIDRS"),
+            rate_limit_trusted_proxy_cidrs: parse_cidr_list_env("RATE_LIMIT_TRUSTED_PROXY_CIDRS"),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
             quarantine_enabled: matches!(
@@ -967,6 +1040,7 @@ impl Config {
         };
 
         config.validate_jwt_secret()?;
+        config.validate_storage_paths()?;
 
         Ok(config)
     }
@@ -986,6 +1060,31 @@ impl Config {
                 "JWT_SECRET is unsuitable: {reason} \
                  Generate a secure random secret (e.g. `openssl rand -base64 48`)."
             )));
+        }
+        Ok(())
+    }
+
+    /// Validate that the filesystem storage paths are absolute.
+    ///
+    /// The `filesystem` backend uses `storage_path` (and the scanner uses
+    /// `scan_workspace_path`) as a base directory that every blob/key is joined
+    /// onto. A relative value resolves against the process working directory at
+    /// runtime, so artifacts and scan workspaces silently land somewhere other
+    /// than the intended location depending on where the process was launched.
+    /// Reject such an operator misconfiguration at startup rather than serve
+    /// from an unintended directory. Object stores (`s3`/`gcs`) treat
+    /// `storage_path` as an object-key prefix that may be empty or relative, so
+    /// the check applies only to the `filesystem` backend. This is a
+    /// `from_env`-only check (like [`validate_jwt_secret`]); constructing
+    /// `Config` directly skips it. Detection lives in the pure, unit-testable
+    /// [`storage_path_error`] helper.
+    fn validate_storage_paths(&self) -> Result<()> {
+        if let Some(message) = storage_path_error(
+            &self.storage_backend,
+            &self.storage_path,
+            &self.scan_workspace_path,
+        ) {
+            return Err(AppError::Config(message));
         }
         Ok(())
     }
@@ -1091,6 +1190,47 @@ pub(crate) fn jwt_secret_warnings(secret: &str) -> Vec<JwtSecretWarning> {
 /// startup `from_env` check so callers get a single, ready-to-surface message.
 pub(crate) fn jwt_secret_strength_error(secret: &str) -> Option<&'static str> {
     jwt_secret_warnings(secret).first().map(|w| w.message())
+}
+
+/// Pure filesystem-storage path gate. Returns `Some(message)` describing the
+/// first offending path (naming the env var and value), or `None` if the paths
+/// are acceptable for the selected backend.
+///
+/// Only the `filesystem` backend uses `storage_path`/`scan_workspace_path` as
+/// local base directories that keys are joined onto, so a relative value there
+/// resolves against the process working directory at runtime. Object stores
+/// (`s3`/`gcs`) treat `storage_path` as an object-key prefix that may be empty
+/// or relative, so the check is skipped for them — gating only when the backend
+/// is `filesystem`. Used by the startup `from_env` check so the caller gets a
+/// single, ready-to-surface message; `Path::is_absolute` keeps the rule correct
+/// on the running platform.
+pub(crate) fn storage_path_error(
+    storage_backend: &str,
+    storage_path: &str,
+    scan_workspace_path: &str,
+) -> Option<String> {
+    // Only the filesystem backend treats these as local base directories; this
+    // mirrors the exact backend-selection match in StorageService.
+    if storage_backend != "filesystem" {
+        return None;
+    }
+
+    for (var, value) in [
+        ("STORAGE_PATH", storage_path),
+        ("SCAN_WORKSPACE_PATH", scan_workspace_path),
+    ] {
+        if !Path::new(value).is_absolute() {
+            return Some(format!(
+                "{var} must be an absolute path when STORAGE_BACKEND=filesystem, \
+                 but got `{value}`. A relative path resolves against the process \
+                 working directory at runtime, so artifacts would be stored in an \
+                 unintended location; set it to an absolute path \
+                 (e.g. /var/lib/artifact-keeper/artifacts)."
+            ));
+        }
+    }
+
+    None
 }
 
 /// Heuristic low-entropy detector for JWT secrets.
@@ -2001,6 +2141,41 @@ mod tests {
         } else {
             env::remove_var("ALLOW_LOCAL_ADMIN_LOGIN");
         }
+    }
+
+    #[test]
+    fn test_config_sso_disable_admin_break_glass() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Default is false: the admin break-glass stays enabled (#2018).
+        env::remove_var("SSO_DISABLE_ADMIN_BREAK_GLASS");
+        let config = Config::from_env().unwrap();
+        assert!(!config.sso_disable_admin_break_glass);
+
+        // "true" opts into strict SSO-only enforcement.
+        env::set_var("SSO_DISABLE_ADMIN_BREAK_GLASS", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.sso_disable_admin_break_glass);
+
+        // "1" also opts in.
+        env::set_var("SSO_DISABLE_ADMIN_BREAK_GLASS", "1");
+        let config = Config::from_env().unwrap();
+        assert!(config.sso_disable_admin_break_glass);
+
+        // Any other value leaves the break-glass enabled.
+        env::set_var("SSO_DISABLE_ADMIN_BREAK_GLASS", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.sso_disable_admin_break_glass);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("SSO_DISABLE_ADMIN_BREAK_GLASS", saved_flag);
     }
 
     #[test]
@@ -3123,5 +3298,131 @@ mod tests {
     fn strength_error_accepts_strong_secret() {
         // High-entropy, 32+ chars, >=16 distinct, and NO denied substring.
         assert!(jwt_secret_strength_error(STRONG_SECRET).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // storage_path_error (pure; filesystem absolute-path gate, #2025)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn storage_path_error_rejects_relative_storage_path() {
+        // A relative STORAGE_PATH on the filesystem backend resolves against the
+        // process CWD at runtime — must be rejected, naming the var and value.
+        for value in ["data/artifacts", "./data"] {
+            let err = storage_path_error("filesystem", value, "/scan-workspace")
+                .expect("relative storage_path must be rejected");
+            assert!(err.contains("STORAGE_PATH"), "message names the var: {err}");
+            assert!(err.contains(value), "message names the value: {err}");
+        }
+    }
+
+    #[test]
+    fn storage_path_error_accepts_absolute_paths() {
+        assert!(storage_path_error(
+            "filesystem",
+            "/var/lib/artifact-keeper/artifacts",
+            "/scan-workspace",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn storage_path_error_rejects_relative_scan_workspace_path() {
+        // storage_path is fine; the scanner workspace path is relative.
+        let err = storage_path_error(
+            "filesystem",
+            "/var/lib/artifact-keeper/artifacts",
+            "scan-workspace",
+        )
+        .expect("relative scan_workspace_path must be rejected");
+        assert!(
+            err.contains("SCAN_WORKSPACE_PATH"),
+            "message names the var: {err}"
+        );
+        assert!(
+            err.contains("scan-workspace"),
+            "message names the value: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_path_error_skips_object_store_backends() {
+        // Object stores treat storage_path as an object-key prefix that may be
+        // empty or relative; the local absolute-path rule must not apply.
+        assert!(storage_path_error("s3", "artifact-keeper", "").is_none());
+        assert!(storage_path_error("s3", "", "").is_none());
+        assert!(storage_path_error("gcs", "some/prefix", "").is_none());
+    }
+
+    /// Extract the text of a top-level `services.<name>` block (a 2-space
+    /// indented key) from a compose file, up to the next sibling service or
+    /// 2-space-indented line. Comment lines are stripped so assertions match
+    /// live configuration, not documentation. Test-only, minimal parser.
+    fn compose_service_block(compose: &str, name: &str) -> String {
+        let mut out = String::new();
+        let mut in_block = false;
+        let key = format!("{name}:");
+        for line in compose.lines() {
+            let is_service_key = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && line.trim_start().starts_with(&key);
+            if is_service_key {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                let boundary =
+                    line.starts_with("  ") && !line.starts_with("   ") && !line.trim().is_empty();
+                if boundary {
+                    break;
+                }
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Regression guard for #2084: the hardened runtime image (#2059) ships no
+    /// `/bin/sh`, so no compose service that runs that image may be launched
+    /// through a shell. On `main` the `backend` service used
+    /// `entrypoint: ["/bin/sh","-c", <wait-for-DT-key>]` and `dtrack-init` ran
+    /// the backend image via `/bin/sh`; both broke `docker compose up` with
+    /// `exec: "/bin/sh": no such file or directory`.
+    #[test]
+    fn shipped_compose_does_not_run_hardened_image_through_a_shell() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+        let compose_path = repo_root.join("docker-compose.yml");
+        let compose = std::fs::read_to_string(&compose_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", compose_path.display()));
+
+        let backend = compose_service_block(&compose, "backend");
+        assert!(
+            !backend.is_empty(),
+            "backend service not found in docker-compose.yml"
+        );
+        assert!(
+            !backend.contains("/bin/sh") && !backend.contains("/bin/bash"),
+            "backend service must not use a shell entrypoint; the runtime image \
+             has no shell (#2059/#2084). Offending block:\n{backend}"
+        );
+
+        // dtrack-init may legitimately use a shell, but not on the shell-less
+        // backend image — it must run a shell-bearing image instead.
+        let dtrack_init = compose_service_block(&compose, "dtrack-init");
+        assert!(
+            !dtrack_init.is_empty(),
+            "dtrack-init service not found in docker-compose.yml"
+        );
+        assert!(
+            !dtrack_init.contains("artifact-keeper-backend"),
+            "dtrack-init must not run the shell-less backend image (#2084). \
+             Offending block:\n{dtrack_init}"
+        );
     }
 }

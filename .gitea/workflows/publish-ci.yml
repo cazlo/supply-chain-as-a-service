@@ -187,6 +187,104 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # Compile every backend/tests/*.rs integration-test binary ONCE
+  # (ci/local-ci/Dockerfile.runner's test-artifacts stage) and push the
+  # result to Harbor. backend-integration below pulls this single image for
+  # every matrix leg instead of each leg separately recompiling the whole
+  # dev-dependency graph via docker buildx build -- that redundant
+  # per-leg compile was the original design's main cost (~2m/leg even with
+  # warm cargo caches, serialized further by shared-mount lock contention
+  # under concurrent legs).
+  backend-integration-build:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: artifact-keeper-builder
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - name: Check out the vendored sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.gate.outputs.checkout_ref }}
+
+      - name: Build and push the backend test-runner image
+        id: build
+        # Two statements, not `echo "image=$(script)"`: with the build
+        # inlined as an argument, its exit code is swallowed (the outer
+        # echo still succeeds), so a failed build silently reports success
+        # with a garbage image ref -- exactly what happened the one time
+        # this was written that way in the staging branch.
+        run: |
+          set -euo pipefail
+          image="$(ci/backend-test-image-build.sh)"
+          echo "image=${image}" >> "${GITEA_OUTPUT}"
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+  # Postgres-backed `backend/tests/*.rs` suites that `cargo test --lib` (the
+  # backend-coverage job above) does not build or run. Upstream's own
+  # .github/workflows/ci.yml enumerates the same Postgres-only-safe subset by
+  # name in its "Backend Integration Tests" job; this list mirrors that one.
+  # Deliberately excluded, same reasoning as upstream: azure_rbac_live_test,
+  # azure_shared_key_live_test, s3_integration (need live cloud creds),
+  # integration_tests / replication_integration /
+  # tag_filtered_replication_tests / storage_backend_tests (need a running
+  # HTTP backend), incus_upload_tests (most cases panic without the
+  # optional_auth middleware wired in; only one case runs upstream via a
+  # named test filter, not covered here).
+  #
+  # Each leg runs ci/backend-integration-run-k8s.sh: stand up one ephemeral
+  # Postgres deployment (named after the test target so concurrent legs
+  # never collide in the shared ak-smoke namespace) and a k8s Job that pulls
+  # backend-integration-build's already-compiled image and runs exactly one
+  # pre-built test binary -- no per-leg BuildKit compile at all. That makes
+  # legs cheap enough to run with much higher concurrency than the old
+  # BuildKit-per-leg design could afford.
+  backend-integration:
+    needs: [gate, backend-integration-build]
+    if: needs.gate.outputs.run == 'true'
+    runs-on: artifact-keeper-builder
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        test:
+          - lifecycle_policy_tests
+          - api_token_cache_flush_tests
+          - grpc_sbom_tests
+          - search_reindex_tests
+          - scan_convert_to_reused_tests
+          - stuck_scan_janitor_tests
+          - virtual_members_atomicity_test
+          - virtual_members_duplicate_test
+          - oci_chunked_upload_cross_repo_tests
+    steps:
+      - name: Check out the vendored sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.gate.outputs.checkout_ref }}
+
+      - name: Run ${{ matrix.test }} (Postgres-backed, --ignored)
+        run: ci/backend-integration-run-k8s.sh
+        env:
+          TEST: ${{ matrix.test }}
+          TEST_RUNNER_IMAGE: ${{ needs.backend-integration-build.outputs.image }}
+          QUALITY_RESULTS_DIR: /tmp/artifact-keeper-integration-${{ matrix.test }}
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Retain integration log
+        if: always()
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        with:
+          name: backend-integration-${{ matrix.test }}-${{ needs.gate.outputs.checkout_ref }}
+          path: /tmp/artifact-keeper-integration-${{ matrix.test }}/
+          if-no-files-found: warn
+          retention-days: 14
+
   web-build:
     needs: gate
     if: needs.gate.outputs.run == 'true'

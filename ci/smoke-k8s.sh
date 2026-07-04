@@ -60,7 +60,12 @@ workdir=""
 reset_release() {
   helm uninstall "${release}" --namespace "${ns}" --wait --timeout 2m >/dev/null 2>&1 || true
   kubectl -n "${ns}" delete pvc --all --ignore-not-found >/dev/null 2>&1 || true
-  kubectl -n "${ns}" delete job --all --ignore-not-found >/dev/null 2>&1 || true
+  # Label-scoped, NOT `delete job --all`: the namespace is shared with the
+  # backend-integration matrix legs (ak-int-* Jobs), and a namespace-wide
+  # sweep here killed a still-running leg mid-run when the two lanes
+  # overlapped (run #133). Only this script's own native-client Jobs carry
+  # this label; ak-int-* Jobs GC themselves via ttlSecondsAfterFinished.
+  kubectl -n "${ns}" delete job -l ak-smoke-suite=native-client --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "${ns}" delete configmap test-bundle --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "${ns}" delete secret harbor --ignore-not-found >/dev/null 2>&1 || true
 }
@@ -92,6 +97,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: ${name}
+  labels: { ak-smoke-suite: native-client }
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 600

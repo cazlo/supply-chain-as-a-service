@@ -12,6 +12,29 @@ BuildKit cache and a short-lived Postgres deployment in the RBAC-confined
 `ak-smoke` namespace. The job uploads `coverage.log` and `lcov.info` as a
 `backend-coverage-*` artifact.
 
+The `backend-integration` job runs the curated, Postgres-only
+`backend/tests/*.rs` targets, but *not* by repeating a BuildKit compile per
+target the way `backend-coverage` does. `backend-integration-build` compiles
+every integration-test binary exactly once (`test-artifacts` stage of
+[`Dockerfile.runner`](Dockerfile.runner): `cargo test --tests --no-run`, then
+each compiled executable is copied out of the cargo target cache mount into
+`/test-bin/<name>`) and pushes the result to Harbor
+(`ci/backend-test-image-build.sh`). `backend-integration`'s matrix then has
+one leg per target, each running `ci/backend-integration-run-k8s.sh`: stand
+up an ephemeral Postgres deployment (named after the target so concurrent
+legs don't collide in `ak-smoke`), run a k8s Job that pulls the
+already-built image and executes exactly one pre-built binary
+(`/test-bin/<name> --ignored`), then tear both down. No per-leg compile, so
+legs run with much higher matrix concurrency than a BuildKit-per-leg design
+could afford. See `backend-integration`'s header comment in
+`.gitea/workflows/publish-ci.yml` for the current target list and what's
+deliberately excluded. Each leg uploads its `integration.log` as a
+`backend-integration-<target>-*` artifact.
+
+`ci/backend-quality-k8s.sh QUALITY_MODE=integration` (the original
+compile-and-run-in-one-BuildKit-build path) still works standalone for
+manual/ad-hoc runs — it's just no longer what Gitea CI itself calls.
+
 The runner variant uses eight compiler jobs, incremental compilation,
 `cargo llvm-cov --no-clean`, and eight nextest threads (the lab builders have
 materially more memory than upstream's constrained ARC pods). It deletes old
@@ -27,7 +50,7 @@ inside BuildKit. These exceptions do not touch the feature tests under coverage.
 |---|---|---|
 | `test-backend-unit` | `make local-test` | Postgres → `sqlx migrate run` → `cargo test --workspace --lib --test-threads=1` |
 | `coverage` | `make local-coverage` | the above tests under `cargo llvm-cov nextest --lib`, the **≥50% overall floor**, and the **≥70% new-code (diff) gate** |
-| (nightly/e2e) | `TEST=<name> make local-integration` | a DB-backed `tests/` suite `--lib` skips, run with `--ignored` for hermetic targets that need Postgres or local mock services. |
+| (nightly/e2e) | `TEST=<name> make local-integration` (locally) / `backend-integration-build` + `backend-integration` matrix (Gitea, curated target list, build-once-run-many) | a DB-backed `tests/` suite `--lib` skips, run with `--ignored` for hermetic targets that need Postgres or local mock services. |
 
 The new-code gate is a faithful port of upstream's "New code coverage gate"
 ([diff-coverage.py](diff-coverage.py)): it measures coverage on **changed
@@ -78,3 +101,11 @@ The repo is mounted into the container; all build output lands in the volumes
 - `SQLX_OFFLINE=true` uses the committed `.sqlx` cache, so the build needs no
   database; the Postgres service is only for the DB-backed lib tests at run time
   (the same reason upstream provides it).
+- `backend-integration-build` pushes the test-runner image to
+  `artifact-keeper-ci/artifact-keeper-backend-test-runner:<short-sha>` (same
+  Harbor project as the CI-built backend/web images) with a
+  `--cache-to`/`--cache-from` registry build cache under
+  `artifact-keeper-cache`, mirroring `ci/build-images.sh`'s conventions. It's
+  a throwaway CI artifact — unsigned, unscanned, one tag per run — so it
+  relies on Harbor's project-level retention policy for `artifact-keeper-ci`
+  to reap old tags rather than any cleanup step here.

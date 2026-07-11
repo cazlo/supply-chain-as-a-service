@@ -46,6 +46,11 @@ readonly web_repo="${WEB_IMAGE_REPO:?WEB_IMAGE_REPO is required}"
 readonly web_tag="${WEB_IMAGE_TAG:?WEB_IMAGE_TAG is required}"
 readonly spec="${E2E_SPEC:-e2e/suites/interactions/integrations/peers.spec.ts}"
 readonly project="${E2E_PROJECT:-interactions}"
+# Vendored playwright.config.ts leaves the default 30 s per-test timeout, which
+# the global setup (login + seed + four role logins) blows through on a cold
+# in-cluster stack (run 537: both attempts died at 30.1 s). The config is
+# vendored source this lane must not edit, so widen it from the CLI instead.
+readonly test_timeout_ms="${E2E_TEST_TIMEOUT_MS:-90000}"
 readonly results_dir="${E2E_RESULTS_DIR:-/tmp/artifact-keeper-web-e2e}"
 readonly ns="${NAMESPACE:-ak-smoke}"
 
@@ -98,6 +103,13 @@ fi
 
 # Backend rides the default SA too (chart's own SA cannot carry the pull
 # secret without a chart edit) -- same workaround as ci/smoke-k8s.sh.
+#
+# The resource overrides exist because test-values.yaml caps every component
+# at 250m CPU for kind-cluster chart-testing. The native-client smoke
+# tolerates that; an interactive browser suite does not (Next.js SSR + API
+# round-trips per page), and the throttling is what pushed the global setup
+# past its timeout in runs 536/537. Only this run's ephemeral release is
+# widened; the values file is shared with other lanes and stays untouched.
 helm install "${name}" "${chart}" --namespace "${ns}" \
   --values "${values}" \
   --set fullnameOverride="${name}" \
@@ -106,9 +118,20 @@ helm install "${name}" "${chart}" --namespace "${ns}" \
   --set backend.image.pullPolicy=IfNotPresent \
   --set backend.serviceAccount.create=false \
   --set backend.serviceAccount.name=default \
+  --set backend.resources.requests.cpu=500m \
+  --set backend.resources.requests.memory=512Mi \
+  --set backend.resources.limits.cpu=2 \
+  --set backend.resources.limits.memory=1Gi \
   --set web.image.repository="${web_repo}" \
   --set web.image.tag="${web_tag}" \
   --set web.image.pullPolicy=IfNotPresent \
+  --set web.resources.requests.cpu=250m \
+  --set web.resources.requests.memory=256Mi \
+  --set web.resources.limits.cpu=1 \
+  --set web.resources.limits.memory=1Gi \
+  --set postgres.resources.requests.cpu=250m \
+  --set postgres.resources.limits.cpu=1 \
+  --set postgres.resources.limits.memory=512Mi \
   --wait --timeout 6m
 
 base_url="http://${name}-web:3000"
@@ -150,7 +173,7 @@ spec:
             - |
               set -u
               rc=0
-              npx playwright test --project="${project}" "${spec}" || rc=\$?
+              npx playwright test --project="${project}" --timeout="${test_timeout_ms}" "${spec}" || rc=\$?
               tar czf /tmp/web-e2e-report.tgz playwright-report test-results 2>/dev/null || true
               echo "PLAYWRIGHT_EXIT_CODE=\${rc}"
               elapsed=0

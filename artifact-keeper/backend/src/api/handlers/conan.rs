@@ -467,7 +467,16 @@ async fn search_recipes_from_remote(
 ) -> Vec<String> {
     let encoded = urlencoding::encode(pattern);
     let upstream_path = format!("v2/conans/search?q={}", encoded);
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(v) => v
                 .get("results")
@@ -621,6 +630,25 @@ fn parse_latest_revision_json(bytes: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Parse an upstream Conan v2 files-list body `{"files":{"name":{}, ...}}` into
+/// the list of file names. The shape is identical to what these handlers emit
+/// via [`build_files_listing_json`], so parsing an upstream response = reading
+/// the `.files` object keys. An empty/malformed upstream body yields an empty
+/// `Vec` so the caller degrades to local-only rather than erroring.
+fn parse_files_listing_json(bytes: &[u8]) -> Vec<String> {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(v) => v
+            .get("files")
+            .and_then(|f| f.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("conan files_list: failed to parse upstream JSON: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// Forward a recipe-revisions list query to a remote upstream and parse the
 /// `revisions` array. Returns `Vec::new()` on any non-2xx response or parse
 /// error (mirrors [`search_recipes_from_remote`]) so a flaky/offline upstream
@@ -641,11 +669,62 @@ async fn recipe_revisions_from_remote(
         "v2/conans/{}/{}/{}/{}/revisions",
         name, version, user, channel
     );
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_recipe_revisions_json(&bytes),
         Err(_e) => {
             tracing::debug!(
                 "conan recipe_revisions: upstream fetch failed or non-2xx for '{}'",
+                repo_key
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Forward a recipe files-list query to a remote upstream and parse the `files`
+/// object keys. Same degradation rules as [`recipe_revisions_from_remote`]: a
+/// non-2xx response or parse error yields `Vec::new()` so a flaky/offline
+/// upstream degrades to the local cache instead of erroring. The caller merges
+/// the result with local file names, deduped.
+#[allow(clippy::too_many_arguments)]
+async fn recipe_files_list_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+) -> Vec<String> {
+    let upstream_path = format!(
+        "v2/conans/{}/{}/{}/{}/revisions/{}/files",
+        name, version, user, channel, revision
+    );
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok((bytes, _ct)) => parse_files_listing_json(&bytes),
+        Err(_e) => {
+            tracing::debug!(
+                "conan recipe_files_list: upstream fetch failed or non-2xx for '{}'",
                 repo_key
             );
             Vec::new()
@@ -675,7 +754,16 @@ async fn package_search_from_remote(
         "v2/conans/{}/{}/{}/{}/revisions/{}/search",
         name, version, user, channel, revision
     );
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_package_search_json(&bytes),
         Err(_e) => {
             tracing::debug!(
@@ -702,7 +790,16 @@ async fn recipe_latest_from_remote(
     channel: &str,
 ) -> Option<String> {
     let upstream_path = format!("v2/conans/{}/{}/{}/{}/latest", name, version, user, channel);
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_latest_revision_json(&bytes),
         Err(_e) => {
             tracing::debug!(
@@ -733,11 +830,61 @@ async fn package_revisions_from_remote(
         "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions",
         name, version, user, channel, revision, package_id
     );
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_package_revisions_json(&bytes),
         Err(_e) => {
             tracing::debug!(
                 "conan package_revisions: upstream fetch failed or non-2xx for '{}'",
+                repo_key
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Forward a package files-list query to a remote upstream and parse the `files`
+/// object keys. Same degradation rules as [`recipe_files_list_from_remote`].
+#[allow(clippy::too_many_arguments)]
+async fn package_files_list_from_remote(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+    revision: &str,
+    package_id: &str,
+    pkg_revision: &str,
+) -> Vec<String> {
+    let upstream_path = format!(
+        "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/revisions/{}/files",
+        name, version, user, channel, revision, package_id, pkg_revision
+    );
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok((bytes, _ct)) => parse_files_listing_json(&bytes),
+        Err(_e) => {
+            tracing::debug!(
+                "conan package_files_list: upstream fetch failed or non-2xx for '{}'",
                 repo_key
             );
             Vec::new()
@@ -764,7 +911,16 @@ async fn package_latest_from_remote(
         "v2/conans/{}/{}/{}/{}/revisions/{}/packages/{}/latest",
         name, version, user, channel, revision, package_id
     );
-    match proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, &upstream_path).await {
+    match proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
         Ok((bytes, _ct)) => parse_latest_revision_json(&bytes),
         Err(_e) => {
             tracing::debug!(
@@ -1341,6 +1497,36 @@ async fn recipe_files_list(
             merge_unique_by(member_files, &mut seen, &mut merged, |f| f.clone());
         }
         merged
+    } else if repo.repo_type == RepositoryType::Remote {
+        // Local cache first, then forward the files-list upstream and merge any
+        // remote file names, deduped by name. Mirrors the recipe_revisions
+        // Remote arm; upstream auth is inherited via proxy_fetch_capped.
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<String> = Vec::new();
+        let local = recipe_files_list_for_repo(
+            &state.db, repo.id, &name, &version, &user, &channel, &revision,
+        )
+        .await
+        .map_err(map_db_err)?;
+        merge_unique_by(local, &mut seen, &mut merged, |f| f.clone());
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+        {
+            let remote = recipe_files_list_from_remote(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &name,
+                &version,
+                &user,
+                &channel,
+                &revision,
+            )
+            .await;
+            merge_unique_by(remote, &mut seen, &mut merged, |f| f.clone());
+        }
+        merged
     } else {
         recipe_files_list_for_repo(
             &state.db, repo.id, &name, &version, &user, &channel, &revision,
@@ -1408,22 +1594,22 @@ async fn recipe_file_download(
                         revision,
                         file_path.trim_start_matches('/')
                     );
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    // #1608 Phase 4: stream the recipe file body (may be a
+                    // large conan_export.tgz / conan_sources.tgz) straight to
+                    // the client while teeing to the proxy cache, instead of
+                    // buffering the whole artifact in memory. Tees via the
+                    // merged coordinator so concurrent cold-misses collapse to
+                    // a single upstream fetch (#1609). octet-stream default
+                    // matches the buffered handler's prior fallback.
+                    return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
+                        "application/octet-stream",
                     )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    .await;
                 }
             }
             // Virtual repo: try each member in priority order
@@ -2070,6 +2256,47 @@ async fn package_files_list(
             merge_unique_by(member_files, &mut seen, &mut merged, |f| f.clone());
         }
         merged
+    } else if repo.repo_type == RepositoryType::Remote {
+        // Local cache first, then forward the package files-list upstream and
+        // merge any remote file names, deduped by name. Mirrors the
+        // package_revisions Remote arm; upstream auth is inherited via
+        // proxy_fetch_capped.
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut merged: Vec<String> = Vec::new();
+        let local = package_files_list_for_repo(
+            &state.db,
+            repo.id,
+            &name,
+            &version,
+            &user,
+            &channel,
+            &revision,
+            &package_id,
+            &pkg_revision,
+        )
+        .await
+        .map_err(map_db_err)?;
+        merge_unique_by(local, &mut seen, &mut merged, |f| f.clone());
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_deref())
+        {
+            let remote = package_files_list_from_remote(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &name,
+                &version,
+                &user,
+                &channel,
+                &revision,
+                &package_id,
+                &pkg_revision,
+            )
+            .await;
+            merge_unique_by(remote, &mut seen, &mut merged, |f| f.clone());
+        }
+        merged
     } else {
         package_files_list_for_repo(
             &state.db,
@@ -2175,23 +2402,21 @@ async fn package_file_download(
                         name, version, user, channel, revision, package_id, pkg_revision,
                         file_path.trim_start_matches('/')
                     );
-                        let (content, content_type) = proxy_helpers::proxy_fetch(
+                        // #1608 Phase 4: stream the package file body (the
+                        // conan_package.tgz binary can be very large) to the
+                        // client while teeing to the proxy cache, instead of
+                        // buffering it in memory. Single-flight via the merged
+                        // coordinator (#1609). octet-stream default matches the
+                        // buffered handler's prior fallback.
+                        return proxy_helpers::proxy_fetch_streaming(
                             proxy,
                             repo.id,
                             &repo_key,
                             upstream_url,
                             &upstream_path,
+                            "application/octet-stream",
                         )
-                        .await?;
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(
-                                "Content-Type",
-                                content_type
-                                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                            )
-                            .body(Body::from(content))
-                            .unwrap());
+                        .await;
                     }
                 }
                 // Virtual repo: try each member in priority order
@@ -2465,8 +2690,197 @@ async fn package_file_upload(
         .unwrap())
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn test_remote_recipe_file_download_streams_upstream_blob_1608() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "conan").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let blob: &[u8] = b"\x00\x01\x02 #1608 phase4 streamed proxy blob \x03\x04\x05";
+        Mock::given(method("GET"))
+            .and(path(
+                "/v2/conans/zlib/1.3/_/_/revisions/rev1/files/conan_sources.tgz",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{key}/v2/conans/zlib/1.3/_/_/revisions/rev1/files/conan_sources.tgz",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 from streamed remote download, got {status}");
+        }
+        assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
+        teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_remote_package_file_download_streams_upstream_blob_1608() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "conan").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let blob: &[u8] = b"\x00\x01\x02 #1608 phase4 streamed proxy blob \x03\x04\x05";
+        Mock::given(method("GET"))
+            .and(path("/v2/conans/zlib/1.3/_/_/revisions/rev1/packages/pkgid123/revisions/prev1/files/conan_package.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{key}/v2/conans/zlib/1.3/_/_/revisions/rev1/packages/pkgid123/revisions/prev1/files/conan_package.tgz", key = fx.repo_key))).await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 from streamed remote download, got {status}");
+        }
+        assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
+        teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_remote_recipe_files_list_forwards_upstream_2247() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "conan").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // Upstream files-list for an uncached recipe revision. Pre-fix, the
+        // Remote arm was missing so AK returned {"files":{}} (empty) and
+        // `conan download` aborted with "no conanfile.py".
+        Mock::given(method("GET"))
+            .and(path("/v2/conans/zlib/1.3/_/_/revisions/rev1/files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"files":{"conanfile.py":{},"conanmanifest.txt":{}}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{key}/v2/conans/zlib/1.3/_/_/revisions/rev1/files",
+                key = fx.repo_key
+            )),
+        )
+        .await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 from remote recipe files-list, got {status}");
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("files-list body must be JSON");
+        let files = json
+            .get("files")
+            .and_then(|f| f.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let has_recipe = files.contains_key("conanfile.py");
+        let has_manifest = files.contains_key("conanmanifest.txt");
+        teardown().await;
+        assert!(
+            has_recipe,
+            "remote recipe files-list must forward upstream 'conanfile.py' key (was empty pre-fix)"
+        );
+        assert!(
+            has_manifest,
+            "remote recipe files-list must forward upstream 'conanmanifest.txt' key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_package_files_list_forwards_upstream_2247() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "conan").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v2/conans/zlib/1.3/_/_/revisions/rev1/packages/pkgid123/revisions/prev1/files",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"files":{"conaninfo.txt":{},"conanmanifest.txt":{},"conan_package.tgz":{}}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{key}/v2/conans/zlib/1.3/_/_/revisions/rev1/packages/pkgid123/revisions/prev1/files", key = fx.repo_key))).await;
+
+        let teardown = || async { fx.teardown().await };
+        if status != axum::http::StatusCode::OK {
+            teardown().await;
+            panic!("expected 200 from remote package files-list, got {status}");
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("files-list body must be JSON");
+        let files = json
+            .get("files")
+            .and_then(|f| f.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let has_info = files.contains_key("conaninfo.txt");
+        let has_manifest = files.contains_key("conanmanifest.txt");
+        let has_pkg = files.contains_key("conan_package.tgz");
+        teardown().await;
+        assert!(
+            has_info && has_manifest && has_pkg,
+            "remote package files-list must forward all upstream file keys (was empty pre-fix)"
+        );
+    }
+
+    #[test]
+    fn test_parse_files_listing_json_2247() {
+        // Happy path: reads the .files object keys.
+        let body = br#"{"files":{"conanfile.py":{},"conanmanifest.txt":{}}}"#;
+        let mut names = super::parse_files_listing_json(body);
+        names.sort();
+        assert_eq!(names, vec!["conanfile.py", "conanmanifest.txt"]);
+        // Malformed body degrades to an empty Vec (caller falls back to local).
+        assert!(super::parse_files_listing_json(b"not json").is_empty());
+        // Missing `files` key also yields empty.
+        assert!(super::parse_files_listing_json(br#"{"other":1}"#).is_empty());
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -3162,7 +3576,7 @@ mod tests {
             let url = std::env::var("DATABASE_URL").ok()?;
             sqlx::postgres::PgPoolOptions::new()
                 .max_connections(5)
-                .acquire_timeout(std::time::Duration::from_secs(3))
+                .acquire_timeout(std::time::Duration::from_secs(30))
                 .connect(&url)
                 .await
                 .ok()
@@ -3203,6 +3617,8 @@ mod tests {
                 scan_workspace_path: "/tmp/scan".into(),
                 demo_mode: false,
                 guest_access_enabled: true,
+                expose_detailed_health: false,
+                grpc_reflection_enabled: false,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
                 peer_instance_name: "test".into(),
@@ -3214,6 +3630,7 @@ mod tests {
                 otel_service_name: "test".into(),
                 gc_schedule: "0 0 * * * *".into(),
                 blob_gc_enabled: false,
+                blob_gc_sweep_grace_secs: 3600,
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,
                 stuck_scan_check_interval_secs: 600,
@@ -3237,6 +3654,8 @@ mod tests {
                 rate_limit_presign_per_window: 30,
 
                 rate_limit_login_global_per_window: 8192,
+                rate_limit_login_per_window: 10,
+                rate_limit_login_window_secs: 900,
                 rate_limit_password_change_per_window: 5,
                 rate_limit_password_change_window_secs: 900,
                 rate_limit_window_secs: 60,
@@ -3261,12 +3680,19 @@ mod tests {
                 password_min_strength: 0,
                 presigned_downloads_enabled: false,
                 presigned_download_expiry_secs: 300,
+                proxy_singleflight_advisory_locks_enabled: false,
+                proxy_singleflight_lock_poll_interval_ms: 200,
+                proxy_singleflight_lock_wait_timeout_secs: 65,
                 smtp_host: None,
                 smtp_port: 587,
                 smtp_username: None,
                 smtp_password: None,
                 smtp_from_address: "noreply@artifact-keeper.local".to_string(),
                 smtp_tls_mode: "starttls".to_string(),
+                npm_packument_cache_enabled: true,
+                npm_packument_cache_fresh_ttl_secs: 300,
+                npm_packument_cache_stale_max_secs: 86_400,
+                npm_packument_cache_redis_url: None,
                 scan_token_ttl_seconds: 300,
             }
         }
@@ -3302,10 +3728,16 @@ mod tests {
             let username = format!("conan-test-u-{}", id);
             let password = "conan-test-pw".to_string();
             let hash = bcrypt::hash(&password, 4).expect("bcrypt hash failed");
+            // Watermark columns backdated 60s: conan tests login via the
+            // real endpoint, whose token must not race the DB-clock-stamped
+            // creation watermark across node clock skew.
             sqlx::query(
                 r#"
-                INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
-                VALUES ($1, $2, $3, $4, 'local', false, true)
+                INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active,
+                                   password_changed_at, privileges_changed_at, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, 'local', false, true,
+                        NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds',
+                        NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds')
                 "#,
             )
             .bind(id)
@@ -3368,7 +3800,8 @@ mod tests {
                 is_api_token: false,
                 is_service_account: false,
                 scopes: None,
-                allowed_repo_ids: None,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+                iat_ms: None,
             }
         }
 
@@ -4128,6 +4561,8 @@ mod tests {
     //
     // All tests are DB-backed and no-op when `DATABASE_URL` is unreachable.
     // -----------------------------------------------------------------------
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
     #[cfg(test)]
     mod agent1_auth_search {
         use super::test_helpers::*;

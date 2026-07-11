@@ -573,6 +573,9 @@ async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
         repo_type: repo.get("repo_type"),
         upstream_url: repo.get("upstream_url"),
         promotion_only: repo.try_get("promotion_only").unwrap_or(false),
+        format: "generic".to_string(),
+        age_gate_enabled: false,
+        age_gate_min_age_days: 7,
     })
 }
 
@@ -1582,14 +1585,21 @@ async fn run_finalize(
     Ok(artifact_id)
 }
 
-/// Run [`run_finalize`] and record its outcome on the upload session, then
-/// remove the staged temp file. The client already received `202`, so a
-/// failed backend push must be observable: on success the session flips to
+/// Run [`run_finalize`], remove the staged temp file, and only then record
+/// the outcome on the upload session. The client already received `202`, so
+/// a failed backend push must be observable: on success the session flips to
 /// `completed` with the new `artifact_id`; on failure it flips to `failed`
 /// with the error string, which `GET /incus/{repo}/uploads/{id}` surfaces.
+///
+/// Ordering matters: the terminal status is the only signal observers have
+/// that finalize is done, so staging cleanup must happen before the status
+/// flips — otherwise a poller can see `completed` while the temp file still
+/// exists.
 async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizeParams) {
     let session_id = params.session_id;
-    match run_finalize(&state, &repo, &params).await {
+    let outcome = run_finalize(&state, &repo, &params).await;
+    let _ = tokio::fs::remove_file(&params.temp_path).await;
+    match outcome {
         Ok(artifact_id) => {
             tracing::info!(
                 session = %session_id,
@@ -1627,7 +1637,6 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
             .await;
         }
     }
-    let _ = tokio::fs::remove_file(&params.temp_path).await;
 }
 
 // ===========================================================================
@@ -2362,7 +2371,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.repo_type, "hosted");
         assert_eq!(info.storage_path, "/data/incus");
@@ -2378,7 +2390,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://images.linuxcontainers.org".to_string()),
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.repo_type, "remote");
         assert_eq!(
@@ -3281,6 +3296,8 @@ mod cross_repo_session_regression_tests {
 // suite in this crate.
 // ===========================================================================
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod streaming_pipeline_regression_tests {
     use super::*;
@@ -3289,9 +3306,12 @@ mod streaming_pipeline_regression_tests {
     use tower::ServiceExt;
 
     /// Poll `GET /{repo}/uploads/{id}` until the async finalize reaches a
-    /// terminal status, returning the final progress JSON. Panics on timeout.
+    /// terminal status, returning the final progress JSON. Panics after ~60s:
+    /// the budget must exceed the 30s the finalize task's DB work may
+    /// legitimately spend just acquiring a pool connection under parallel
+    /// coverage runs (a 10s budget timed out at 16 test threads).
     async fn await_finalize(f: &tdh::Fixture, session_id: Uuid) -> serde_json::Value {
-        for _ in 0..400 {
+        for _ in 0..2400 {
             let app = f.router_with_auth(router());
             let req = axum::http::Request::builder()
                 .method("GET")
@@ -3650,8 +3670,11 @@ mod streaming_pipeline_regression_tests {
             storage_path: std::env::temp_dir().to_string_lossy().into_owned(),
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
+            format: "generic".to_string(),
             upstream_url: None,
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         finalize_upload(

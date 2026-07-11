@@ -87,6 +87,13 @@ jobs:
       - name: Pin token-minting endpoint surface
         run: ./scripts/ci/check-token-mint-surface.sh
 
+      # Auth-event audit completeness (#1617 Phase 1): every token mint/revoke
+      # handler must emit an ApiTokenCreated/ApiTokenRevoked audit event, and
+      # every federated (OIDC/SAML/LDAP) login must audit its Login/LoginFailed
+      # outcome. Guards the compliance audit trail against silent regression.
+      - name: Check auth-event audit coverage
+        run: ./scripts/ci/check-auth-event-audit.sh
+
       - name: Run Clippy
         # Cap parallel rustc invocations so the lib-test compile doesn't OOM
         # the ARC runner pod ("sccache: Compile terminated by signal 9",
@@ -113,11 +120,13 @@ jobs:
     # Same memory guard as check-rust: drop debuginfo and cap parallel rustc
     # so the lib-test compile does not OOM the runner (#1515). This step
     # previously had no CARGO_BUILD_JOBS cap and could spawn one rustc per
-    # core, which is what tipped it over.
+    # core, which is what tipped it over. Jobs raised 4 -> 8 with the same
+    # measured basis as the coverage job (7.9-11.0 GiB peak RSS at 8 jobs
+    # with debuginfo=0 — and this compile is lighter, no instrumentation).
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_BUILD_JOBS: "4"
+      CARGO_BUILD_JOBS: "8"
       # Disable incremental codegen (#1679): this job compiles the same
       # lib-test crate that OOM-killed check-rust, and incremental is useless
       # in CI's clean checkout while inflating peak RSS.
@@ -208,10 +217,13 @@ jobs:
           SQLX_OFFLINE: true
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
-        # --test-threads=1: these DB-backed suites share global tables and the
-        # blob-GC readiness gate is a cluster-wide query, so a concurrent
-        # cross-module test's transient rows can make gate/GC assertions flaky.
-        run: cargo test --workspace --lib --verbose -- --test-threads=1
+        # nextest runs each test in its own process and applies the repo's
+        # .config/nextest.toml db-serial test groups, which serialize the
+        # global-DB-state suites (stuck-scan cleanup, storage GC) that the
+        # previous single-threaded `cargo test -- --test-threads=1` run was
+        # protecting. The coverage job already executes this exact suite
+        # under nextest at 8 threads.
+        run: cargo nextest run --workspace --lib --test-threads 8
 
       # Hit-rate data to evaluate dropping the Swatinem rust-cache step once sccache sustains >80% hits.
       - name: sccache stats
@@ -244,13 +256,18 @@ jobs:
     # crate that OOM-killed check-rust, but under `-C instrument-coverage`
     # *and* `-C debuginfo=2` — the heaviest compile in CI, which got SIGKILL'd
     # (OOM) on larger PRs. CARGO_INCREMENTAL=0 drops incremental codegen
-    # (useless in a clean checkout), CARGO_BUILD_JOBS caps parallel rustc, and
-    # dropping debuginfo cuts peak RSS the most. Coverage mapping comes from
-    # the instrumentation (`__llvm_covmap`), not DWARF, so debuginfo=0 does
-    # not affect line-coverage accuracy.
+    # (useless in a clean checkout) and dropping debuginfo cuts peak RSS the
+    # most. Coverage mapping comes from the instrumentation (`__llvm_covmap`),
+    # not DWARF, so debuginfo=0 does not affect line-coverage accuracy.
+    #
+    # CARGO_BUILD_JOBS was capped at 2 when this job ran with debuginfo and
+    # an 8Gi runner limit; both changed since (#2062 raised limits to 16Gi,
+    # debuginfo=0 above). The same instrumented compile at 8 jobs with
+    # debuginfo=0 measures 7.9-11.0 GiB peak anonymous RSS, comfortably
+    # inside 16Gi, and matches the runner's 8-cpu limit.
     env:
       CARGO_INCREMENTAL: "0"
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     services:
@@ -334,21 +351,42 @@ jobs:
           # explicitly skips when this is set.
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         # nextest runs each test in its own process for faster scheduling.
-        # Cap test concurrency to 4 so parallel test processes don't OOM the
-        # memory-limited ARC runner (cf. the #1515 compile OOM).
-        run: cargo llvm-cov nextest --workspace --lib --lcov --output-path lcov.info --test-threads 4
+        # Test concurrency was capped at 4 to keep parallel test processes
+        # from OOMing the memory-limited ARC runner (cf. the #1515 compile
+        # OOM); raised to 8 here to measure test-phase scaling now that the
+        # per-process profraw I/O is pooled — revert to 4 if runner memory
+        # pressure appears.
+        #
+        # Profile counters are written through an LLVM %Nm merge pool instead
+        # of cargo-llvm-cov's default one-.profraw-per-test-process: with
+        # ~12k test processes the per-process files cost tens of GB of write
+        # I/O per run, while the pool online-merges the same counters into at
+        # most 32 files (~92MB) with byte-equal coverage aggregates. The
+        # explicit `clean --workspace` keeps the implicit-clean semantics the
+        # single `cargo llvm-cov nextest` invocation had.
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
+          cargo llvm-cov clean --workspace
+          cargo nextest run --workspace --lib --test-threads 8
+          cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Coverage summary and gate
         if: steps.detect.outputs.rust_changed == 'true'
         run: |
+          # cargo llvm-cov report resolves the profile directory from the
+          # show-env environment; without it, a fresh step shell looks in
+          # the default location and misses the pooled .profraw files.
+          source <(cargo llvm-cov show-env --sh)
+
           # Total project coverage summary
           echo "### Coverage Summary" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          cargo llvm-cov --workspace --lib --no-run --summary-only 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          cargo llvm-cov report --summary-only 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
           # Total coverage floor (never let overall coverage drop below 50%)
-          cargo llvm-cov --workspace --lib --no-run --fail-under-lines 50
+          cargo llvm-cov report --fail-under-lines 50
 
       - name: New code coverage gate
         if: github.event_name == 'pull_request' && steps.detect.outputs.rust_changed == 'true'
@@ -702,7 +740,13 @@ jobs:
       #     virtual_members_atomicity_test, virtual_members_duplicate_test,
       #     grpc_sbom_tests (in-process gRPC, no HTTP server),
       #     oci_chunked_upload_cross_repo_tests (#1317 cross-repo session
-      #     rejection regression).
+      #     rejection regression),
+      #     sso_oidc_login_callback_e2e_tests (#1617 OIDC login/callback
+      #     regression harness; drives the real sso handlers against an
+      #     in-process wiremock IdP bound to a non-loopback interface),
+      #     sso_saml_acs_e2e_tests (#2212 SAML ACS regression harness; drives
+      #     the real saml_login/saml_acs handlers against bergshamra-signed
+      #     assertions — no outbound fetch, so no wiremock/SSRF dance).
       #
       # Deliberately excluded (would panic on first .expect() without
       # extra infra, so `--ignored` stays the right gate):
@@ -738,6 +782,11 @@ jobs:
             --test virtual_members_atomicity_test \
             --test virtual_members_duplicate_test \
             --test oci_chunked_upload_cross_repo_tests \
+            --test sso_oidc_login_callback_e2e_tests \
+            --test sso_saml_acs_e2e_tests \
+            --test cache_invalidation_fanout_tests \
+            --test age_gate_tests \
+            --test scan_policy_validation_tests \
             -- --ignored --test-threads=1
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`

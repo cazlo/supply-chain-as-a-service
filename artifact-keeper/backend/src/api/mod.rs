@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::services::artifact_service::ArtifactService;
 use crate::services::dependency_track_service::DependencyTrackService;
 use crate::services::event_bus::EventBus;
+use crate::services::npm_packument_cache::NpmPackumentCache;
 use crate::services::opensearch_service::OpenSearchService;
 use crate::services::permission_service::PermissionService;
 use crate::services::plugin_registry::PluginRegistry;
@@ -79,13 +80,13 @@ pub type IndexCache = Arc<RwLock<HashMap<String, (Bytes, Instant)>>>;
 /// on every refresh. Caching by content hash means the signature is reused
 /// across requests until the underlying Release content actually changes,
 /// at which point the cache key naturally rotates. The `(repo_key,
-/// distribution) -> set of cache keys` reverse index lets the change-detect
+/// distribution) -> set of cache keys` reverse index lets the revalidation
 /// path purge stale entries when an upstream Release flip is detected
-/// (mirroring how sibling Packages caches are invalidated for #1147).
+/// (mirroring the epoch-based lazy invalidation for #1147).
 pub type SignedReleaseCache = Arc<RwLock<HashMap<String, Bytes>>>;
 
 /// Reverse index from (repo_key, distribution) to the set of cache keys
-/// installed under that scope. Lets the change-detect path drop just the
+/// installed under that scope. Lets the revalidation path drop just the
 /// signed-Release entries that belong to the changed distribution without
 /// scanning the entire cache.
 pub type SignedReleaseCacheIndex = Arc<RwLock<HashMap<(String, String), Vec<String>>>>;
@@ -113,6 +114,7 @@ pub struct AppState {
     pub proxy_service: Option<Arc<ProxyService>>,
     pub smtp_service: Option<Arc<SmtpService>>,
     pub metrics_handle: Option<Arc<PrometheusHandle>>,
+    pub age_gate_service: Option<Arc<crate::services::age_gate_service::AgeGateService>>,
     /// When true, most API endpoints return 403 until the admin changes the default password.
     pub setup_required: Arc<AtomicBool>,
     pub event_bus: Arc<EventBus>,
@@ -123,11 +125,17 @@ pub struct AppState {
     /// `"{repo_key}:{crate_name_lowercase}"`. Eliminates storage I/O and
     /// SHA-256 re-verification on every warm index request.
     pub index_cache: IndexCache,
+    /// Cache of computed npm packument responses with stale-while-revalidate
+    /// (#2162): a warm hit skips the upstream metadata fetch, tarball-URL
+    /// rewrite, abbreviation and serialize/compress work. `None` when
+    /// disabled via `NPM_PACKUMENT_CACHE_ENABLED=false`. Invalidated on npm
+    /// publish / dist-tag changes.
+    pub npm_packument_cache: Option<Arc<NpmPackumentCache>>,
     /// In-process cache of signed APT `InRelease` / `Release.gpg` payloads,
     /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
     /// re-signing on every `apt update` poll (#1236).
     pub signed_release_cache: SignedReleaseCache,
-    /// Reverse index for `signed_release_cache` so the change-detect path
+    /// Reverse index for `signed_release_cache` so the revalidation path
     /// can evict just the entries belonging to a specific
     /// `(repo_key, distribution)` when the underlying Release flips.
     pub signed_release_cache_index: SignedReleaseCacheIndex,
@@ -173,6 +181,7 @@ impl AppState {
                  the API (#991, #1088). Production deployments should leave this unset."
             );
         }
+        let npm_packument_cache = NpmPackumentCache::from_config(&config);
         Self {
             config,
             db,
@@ -186,12 +195,14 @@ impl AppState {
             dependency_track: None,
             permission_service,
             proxy_service: None,
+            age_gate_service: None,
             smtp_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            npm_packument_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             auth_semaphore,
@@ -215,6 +226,7 @@ impl AppState {
                 "AUTH_MAX_CONCURRENCY=0: bcrypt-bound auth runs without a process-wide cap"
             );
         }
+        let npm_packument_cache = NpmPackumentCache::from_config(&config);
         Self {
             config,
             db,
@@ -228,12 +240,14 @@ impl AppState {
             dependency_track: None,
             permission_service,
             proxy_service: None,
+            age_gate_service: None,
             smtp_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            npm_packument_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             auth_semaphore,
@@ -292,6 +306,14 @@ impl AppState {
     /// Set the proxy service for remote repository proxying.
     pub fn set_proxy_service(&mut self, proxy_service: Arc<ProxyService>) {
         self.proxy_service = Some(proxy_service);
+    }
+
+    /// Set the age-gate service for proxy registry quality gates.
+    pub fn set_age_gate_service(
+        &mut self,
+        age_gate_service: Arc<crate::services::age_gate_service::AgeGateService>,
+    ) {
+        self.age_gate_service = Some(age_gate_service);
     }
 
     /// Set the SMTP service for email delivery.

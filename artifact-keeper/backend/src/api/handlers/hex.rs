@@ -91,12 +91,13 @@ async fn package_info(
                 (&repo.upstream_url, &state.proxy_service)
             {
                 let upstream_path = format!("packages/{}", name);
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await?;
                 return Ok(Response::builder()
@@ -506,9 +507,15 @@ async fn list_names(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, "names")
-                    .await?;
+            let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                "names",
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(
@@ -591,9 +598,15 @@ async fn list_versions(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, "versions")
-                    .await?;
+            let (content, content_type) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                "versions",
+                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(
@@ -998,6 +1011,8 @@ fn extract_erlang_term_value(content: &str, key: &str) -> Option<String> {
     None
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,6 +1043,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 0,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1571,7 +1588,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.repo_type, "hosted");
         assert!(repo.upstream_url.is_none());
@@ -1586,7 +1606,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://repo.hex.pm".to_string()),
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.upstream_url.as_deref(), Some("https://repo.hex.pm"));
     }
@@ -1631,7 +1654,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_ne!(repo.repo_type, "remote");
         assert_ne!(repo.repo_type, "virtual");
@@ -1647,7 +1673,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://repo.hex.pm".to_string()),
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_some());
@@ -1664,7 +1693,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_none());
@@ -1680,7 +1712,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "virtual".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.repo_type, "virtual");
     }

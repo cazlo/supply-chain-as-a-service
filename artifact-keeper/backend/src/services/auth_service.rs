@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::models::user::{AuthProvider, User};
 
 /// Federated authentication credentials
@@ -85,8 +86,9 @@ pub struct ApiTokenValidation {
     pub user: User,
     /// Token scopes (e.g. "read:artifacts", "write:artifacts", "*")
     pub scopes: Vec<String>,
-    /// Repository IDs the token is restricted to (None = unrestricted)
-    pub allowed_repo_ids: Option<Vec<Uuid>>,
+    /// Repository-scope authorization decision for this token.
+    /// `Admin` = unrestricted; `Restricted(v)` = allowlist; `Restricted(vec![])` = deny-all.
+    pub allowed_repo_ids: AccessScope,
 }
 
 /// JWT claims structure.
@@ -107,6 +109,11 @@ pub struct Claims {
     pub email: String,
     /// Is admin
     pub is_admin: bool,
+    /// Repository IDs this access token is restricted to (None = unrestricted).
+    ///
+    /// Access-token only. Refresh tokens leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_repo_ids: Option<Vec<Uuid>>,
     /// Issued at (Unix timestamp)
     pub iat: i64,
     /// Issued-at in **milliseconds** (sub-second precision). Private,
@@ -189,8 +196,10 @@ pub fn mark_api_token_revoked(token_id: Uuid) {
     }
 }
 
-/// Check whether an API token has been marked as revoked.
-fn is_api_token_revoked_in_cache(token_id: Uuid) -> bool {
+/// Check whether an API token has been marked as revoked. `pub(crate)` so the
+/// cache-invalidation listener's tests can observe the effect of applying an
+/// `api_token_revoked` event without a database round-trip.
+pub(crate) fn is_api_token_revoked_in_cache(token_id: Uuid) -> bool {
     if let Ok(set) = revoked_api_token_set().read() {
         return set.contains_key(&token_id);
     }
@@ -235,6 +244,47 @@ const INVALIDATION_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 /// (worst-case latency = TTL + DB round-trip) while still avoiding a DB
 /// round-trip on every single request that comes in within a burst.
 const CREDENTIAL_DB_CACHE_TTL_SECS: u64 = 5;
+
+/// Bounded cross-host clock-skew tolerance, in **milliseconds**, applied to
+/// the **DB-derived** credential-change watermark (#2245).
+///
+/// The token's issued-at ([`Claims::effective_iat_ms`]) is stamped from the
+/// API host's clock, while the DB watermark
+/// (`GREATEST(password_changed_at, totp_verified_at, privileges_changed_at)`)
+/// is stamped by Postgres `NOW()` — two different clocks whenever the API
+/// server and the database run on different hosts. When the API host lags the
+/// database by ordinary NTP-level offset, a token minted strictly AFTER a
+/// credential change can still carry `iat_ms < watermark` and be spuriously
+/// rejected (fails closed — a 401 on a legitimate fresh login, reproduced in
+/// CI with the database pinned to a different node than the runner).
+///
+/// [`fetch_credential_change_watermark`] subtracts this tolerance from the
+/// DB-clock watermark at ingestion (see [`apply_db_clock_skew_tolerance`]),
+/// so a token is only rejected when its `iat_ms` is more than this many
+/// milliseconds behind the DB timestamp. 2 s covers NTP-grade cross-host
+/// offset (typically well under 1 s) plus the up-to-999 ms floor error of
+/// legacy whole-second `iat` tokens, while staying strictly inside the
+/// existing cross-replica revocation-latency posture
+/// ([`CREDENTIAL_DB_CACHE_TTL_SECS`] = 5 s) and a tiny fraction of the token
+/// lifetime — a credential change still invalidates every token minted more
+/// than 2 s before it, so the watermark's purpose (killing stale pre-change
+/// tokens) is preserved.
+///
+/// Deliberately NOT applied to watermarks written by the local
+/// `invalidate_user_tokens*` family: those are stamped from THIS host's
+/// clock, the same clock domain as `iat_ms`, so no skew exists and the
+/// millisecond-precision same-second ordering (#931/#1911/#1933) is kept
+/// exact on the same-replica path.
+pub(crate) const CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS: i64 = 2_000;
+
+/// Shift a DB-clock watermark into the app-clock domain conservatively:
+/// subtract [`CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS`] so the strict-`<`
+/// comparison in [`is_token_invalidated_replica_safe`] cannot spuriously
+/// reject a token minted (per the app clock) at-or-after the credential
+/// change just because the app clock lags Postgres (#2245).
+pub(crate) fn apply_db_clock_skew_tolerance(db_watermark_ms: i64) -> i64 {
+    db_watermark_ms.saturating_sub(CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS)
+}
 
 fn invalidation_map() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
     CREDENTIAL_INVALIDATIONS.get_or_init(|| RwLock::new(HashMap::new()))
@@ -287,6 +337,28 @@ pub fn invalidate_user_tokens_except_caller(user_id: Uuid, caller_iat_ms: i64) {
     // strictly-older token (including an older same-second one) is caught.
     let watermark_ms = caller_iat_ms.saturating_sub(1);
     invalidate_user_tokens_at(user_id, watermark_ms);
+}
+
+/// Invalidate every OTHER session for `user_id` on a **self-service**
+/// credential change (TOTP enable/disable), exempting the calling session's own
+/// JWT so the user is not signed out by their own action (#1370).
+///
+/// `caller_iat_ms` is the calling token's millisecond issued-at
+/// ([`Claims::effective_iat_ms`], surfaced as [`AuthExtension::iat_ms`]).
+/// `None` — a non-JWT caller (API key, Basic username/password, service
+/// account) that has no `iat` to exempt — falls back to killing ALL of the
+/// user's sessions, preserving the original #1146 semantic.
+///
+/// This is the single home for the previously-duplicated "invalidate others,
+/// keep caller" branch that lived verbatim in both `enable_totp` and
+/// `disable_totp` (#1394). It is deliberately distinct from the plain
+/// [`invalidate_user_tokens`] used by the admin-acting-on-another-user sites
+/// (deactivate / reset / SSO demotion), which have no caller session to keep.
+pub fn invalidate_other_sessions(user_id: Uuid, caller_iat_ms: Option<i64>) {
+    match caller_iat_ms {
+        Some(ms) => invalidate_user_tokens_except_caller(user_id, ms),
+        None => invalidate_user_tokens(user_id),
+    }
 }
 
 /// Set the in-memory watermark to a specific epoch **millisecond**. Shared by
@@ -365,6 +437,12 @@ pub(crate) struct CredentialWatermark {
     /// component of `password_changed_at` (microsecond TIMESTAMPTZ) so a token
     /// minted in the same wall-clock second as a credential change is ordered
     /// correctly against the watermark.
+    ///
+    /// When freshly read from the database, the DB-clock timestamp is
+    /// pre-shifted down by [`CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS`] (#2245)
+    /// so the strict-`<` comparison against the app-clock `iat_ms` tolerates
+    /// cross-host clock skew. A cache-served value may instead be a local
+    /// app-clock watermark (same clock domain as `iat_ms`, no shift needed).
     pub(crate) watermark: i64,
     /// `users.is_active`. When `false`, [`is_token_invalidated_replica_safe`]
     /// rejects every token regardless of `iat` so a deactivation processed
@@ -377,7 +455,9 @@ pub(crate) struct CredentialWatermark {
 ///
 /// Returns the highest of `users.password_changed_at` and
 /// `users.totp_verified_at` as a Unix timestamp (in **milliseconds**),
-/// alongside `users.is_active`, or `None` if the user no longer exists.
+/// shifted down by [`CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS`] to absorb
+/// app-vs-DB clock skew (#2245), alongside `users.is_active`, or `None` if
+/// the user no longer exists.
 ///
 /// Note: `users.updated_at` is deliberately NOT included. Profile edits
 /// (display name, email, last_login_at touches) bump `updated_at` without
@@ -447,7 +527,17 @@ async fn fetch_credential_change_watermark(
     // needed. Full precision is also strictly more correct cross-replica: a
     // password change observed via the DB on a peer replica now rejects
     // same-second pre-change tokens there too, which the floored value weakened.
-    let watermark = watermark_ts.timestamp_millis();
+    //
+    // The DB timestamp is then shifted down by
+    // `CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS` (#2245): the watermark is
+    // Postgres-clock while the token's `iat_ms` is app-host-clock, and when
+    // the app host lags the database a token minted strictly AFTER the change
+    // would otherwise carry `iat_ms < watermark` and be spuriously 401'd.
+    // Local `invalidate_user_tokens*` watermarks (same clock domain as
+    // `iat_ms`) are NOT adjusted, and the monotonic-max cache write below
+    // keeps the higher, full-precision local value dominant on the replica
+    // that processed the change.
+    let watermark = apply_db_clock_skew_tolerance(watermark_ts.timestamp_millis());
 
     // Only cache when the user is active. Caching `is_active=false` would
     // require expanding the cache value to a tuple; instead we skip the
@@ -498,6 +588,14 @@ async fn fetch_credential_change_watermark(
 /// `iat_ms < watermark` and is rejected to the millisecond. There is no
 /// exploitable window. Legacy tokens with no `iat_ms` fall back to the floored
 /// `iat * 1000`, the conservative side (rejected against a same-second change).
+///
+/// Cross-clock skew (#2245): `iat_ms` comes from the API host's clock while
+/// the DB watermark comes from Postgres `NOW()`. A watermark freshly read
+/// from the database is therefore pre-shifted down by
+/// [`CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS`] at ingestion
+/// ([`fetch_credential_change_watermark`]) so a token minted after the change
+/// on a lagging app clock is not spuriously rejected. Locally-written
+/// watermarks (same clock domain) keep exact millisecond ordering.
 ///
 /// Resolution order:
 ///   1. DB watermark, served from the in-memory cache when fresh
@@ -786,6 +884,33 @@ pub fn prune_stale_user_token_invalidations() -> usize {
     }
 }
 
+/// Drop every entry from every registered long-lived API-token cache,
+/// returning how many entries were flushed. Dead `Weak`s are pruned on the
+/// way through, mirroring [`invalidate_user_token_cache_entries`].
+///
+/// Called by the cache-invalidation listener on startup and after every
+/// reconnect: notifications may have been missed while this process was not
+/// listening, so every cached validation is suspect and the next request per
+/// token re-verifies against the database (one extra bcrypt per token, a
+/// bounded and acceptable cost for a rare event).
+pub fn flush_all_api_token_cache_entries() -> usize {
+    let mut flushed = 0;
+    if let Ok(mut registry) = auth_token_cache_registry().write() {
+        registry.retain(|weak| {
+            if let Some(cache_arc) = weak.upgrade() {
+                if let Ok(mut cache) = cache_arc.write() {
+                    flushed += cache.len();
+                    cache.clear();
+                }
+                true
+            } else {
+                false
+            }
+        });
+    }
+    flushed
+}
+
 /// Returns true if a cache entry inserted at `cached_at` should be rejected
 /// because the user's API tokens have been invalidated since it was cached.
 pub(crate) fn is_user_api_tokens_invalidated_after(user_id: Uuid, cached_at: Instant) -> bool {
@@ -1064,12 +1189,33 @@ impl AuthService {
     /// here; callers persist it through
     /// [`AuthService::record_refresh_token_jti`] after generation.
     pub fn generate_tokens(&self, user: &User) -> Result<TokenPair> {
-        self.generate_tokens_with_family(user, Uuid::new_v4())
+        self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), None)
+    }
+
+    /// Generate access and refresh tokens for a user, restricting the access
+    /// token to a specific repository allow-list when provided.
+    pub fn generate_tokens_with_repo_scope(
+        &self,
+        user: &User,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+    ) -> Result<TokenPair> {
+        self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), allowed_repo_ids)
     }
 
     /// Generate tokens with a specific `family_id` (refresh rotation path).
     /// See [`AuthService::generate_tokens`] for the new-login case.
     pub fn generate_tokens_with_family(&self, user: &User, family_id: Uuid) -> Result<TokenPair> {
+        self.generate_tokens_with_family_and_scope(user, family_id, None)
+    }
+
+    /// Generate tokens with a specific refresh-token family and optional
+    /// access-token repository allow-list.
+    fn generate_tokens_with_family_and_scope(
+        &self,
+        user: &User,
+        family_id: Uuid,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+    ) -> Result<TokenPair> {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
         // share the exact same `iat_ms` ordering anchor.
@@ -1082,6 +1228,7 @@ impl AuthService {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids,
             iat: now.timestamp(),
             iat_ms: Some(now_ms),
             exp: access_exp.timestamp(),
@@ -1097,6 +1244,7 @@ impl AuthService {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: Some(now_ms),
             exp: refresh_exp.timestamp(),
@@ -1150,6 +1298,7 @@ impl AuthService {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: Some(now_ms),
             exp: exp.timestamp(),
@@ -1772,7 +1921,7 @@ impl AuthService {
         let validation = ApiTokenValidation {
             user,
             scopes: stored_token.scopes,
-            allowed_repo_ids,
+            allowed_repo_ids: AccessScope::from(allowed_repo_ids),
         };
 
         // Populate cache; evict stale entries on write to keep memory bounded.
@@ -1948,6 +2097,13 @@ impl AuthService {
                         .to_string(),
                 ))
             }
+            Some(AuthProvider::Ci) => {
+                // CI authentication is handled via the CI OIDC token exchange endpoint.
+                Err(AppError::Authentication(
+                    "CI authentication requires a CI-issued OIDC JWT. Use /api/v1/auth/ci/token."
+                        .to_string(),
+                ))
+            }
         }
     }
 
@@ -2020,6 +2176,18 @@ impl AuthService {
         provider: AuthProvider,
         credentials: FederatedCredentials,
     ) -> Result<(User, TokenPair)> {
+        self.authenticate_federated_with_scope(provider, credentials, None)
+            .await
+    }
+
+    /// Authenticate a federated user after successful SSO (OIDC/SAML), with
+    /// an optional repository allow-list embedded into the issued access token.
+    pub async fn authenticate_federated_with_scope(
+        &self,
+        provider: AuthProvider,
+        credentials: FederatedCredentials,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+    ) -> Result<(User, TokenPair)> {
         // Sync or create the user based on federated credentials
         let user = self.sync_federated_user(provider, &credentials).await?;
 
@@ -2035,7 +2203,7 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let tokens = self.generate_tokens(&user)?;
+        let tokens = self.generate_tokens_with_repo_scope(&user, allowed_repo_ids)?;
         self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
         Ok((user, tokens))
     }
@@ -2519,6 +2687,7 @@ impl AuthService {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: Some(now.timestamp_millis()),
             exp: exp.timestamp(),
@@ -3058,6 +3227,8 @@ mod tests {
             scan_workspace_path: "/tmp".to_string(),
             demo_mode: false,
             guest_access_enabled: true,
+            expose_detailed_health: false,
+            grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             peer_instance_name: "test".to_string(),
@@ -3069,6 +3240,7 @@ mod tests {
             otel_service_name: "test".to_string(),
             gc_schedule: "0 0 * * * *".to_string(),
             blob_gc_enabled: false,
+            blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -3092,6 +3264,8 @@ mod tests {
             rate_limit_presign_per_window: 30,
 
             rate_limit_login_global_per_window: 8192,
+            rate_limit_login_per_window: 10,
+            rate_limit_login_window_secs: 900,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -3116,12 +3290,19 @@ mod tests {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            proxy_singleflight_advisory_locks_enabled: false,
+            proxy_singleflight_lock_poll_interval_ms: 200,
+            proxy_singleflight_lock_wait_timeout_secs: 65,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".to_string(),
             smtp_tls_mode: "starttls".to_string(),
+            npm_packument_cache_enabled: true,
+            npm_packument_cache_fresh_ttl_secs: 300,
+            npm_packument_cache_stale_max_secs: 86_400,
+            npm_packument_cache_redis_url: None,
             scan_token_ttl_seconds: 300,
         })
     }
@@ -3151,6 +3332,53 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// Pins the `ApiTokenValidation.allowed_repo_ids` ctor boundary
+    /// (`AccessScope::from` on the resolved `Option<Vec<Uuid>>` local in
+    /// `validate_api_token`) to today's authorization semantics: unscoped
+    /// tokens reach every repo, allowlisted tokens reach only their repos, and
+    /// an empty allowlist denies everything (never falls open).
+    #[test]
+    fn test_api_token_validation_scope_ctor_preserves_semantics() {
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+
+        // 1. Unrestricted (no join rows / empty selector -> None -> Admin):
+        //    reaches all repos.
+        let unrestricted = ApiTokenValidation {
+            user: make_test_user(),
+            scopes: vec!["*".to_string()],
+            allowed_repo_ids: AccessScope::from(None::<Vec<Uuid>>),
+        };
+        assert_eq!(unrestricted.allowed_repo_ids, AccessScope::Admin);
+        assert!(unrestricted.allowed_repo_ids.grants(repo_a));
+        assert!(unrestricted.allowed_repo_ids.grants(repo_b));
+
+        // 2. Allowlist (N join rows -> Some(ids) -> Restricted(ids)): reaches
+        //    only its repos.
+        let restricted = ApiTokenValidation {
+            user: make_test_user(),
+            scopes: vec!["read:artifacts".to_string()],
+            allowed_repo_ids: AccessScope::from(Some(vec![repo_a])),
+        };
+        assert_eq!(
+            restricted.allowed_repo_ids,
+            AccessScope::Restricted(vec![repo_a])
+        );
+        assert!(restricted.allowed_repo_ids.grants(repo_a));
+        assert!(!restricted.allowed_repo_ids.grants(repo_b));
+
+        // 3. Empty scope (selector resolves to zero ids -> Some(vec![]) ->
+        //    Restricted(vec![])): deny-by-default, reaches nothing.
+        let empty = ApiTokenValidation {
+            user: make_test_user(),
+            scopes: vec!["read:artifacts".to_string()],
+            allowed_repo_ids: AccessScope::from(Some(Vec::<Uuid>::new())),
+        };
+        assert_eq!(empty.allowed_repo_ids, AccessScope::Restricted(vec![]));
+        assert!(!empty.allowed_repo_ids.grants(repo_a));
+        assert!(!empty.allowed_repo_ids.grants(repo_b));
     }
 
     // We cannot create a PgPool without a real database, so for unit tests that
@@ -3250,6 +3478,7 @@ mod tests {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: None,
             exp: access_exp.timestamp(),
@@ -3264,6 +3493,7 @@ mod tests {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: None,
             exp: refresh_exp.timestamp(),
@@ -3299,6 +3529,63 @@ mod tests {
         assert_eq!(decoded.claims.token_type, "refresh");
     }
 
+    #[tokio::test]
+    async fn test_generate_tokens_with_repo_scope_embeds_access_restrictions() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let user = make_test_user();
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        let expected_scope = Some(vec![repo_a, repo_b]);
+
+        let tokens = service
+            .generate_tokens_with_repo_scope(&user, expected_scope.clone())
+            .expect("scoped token generation should succeed");
+
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let access_claims = decode::<Claims>(
+            &tokens.access_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("access token should decode")
+        .claims;
+        assert_eq!(access_claims.token_type, "access");
+        assert_eq!(access_claims.allowed_repo_ids, expected_scope);
+
+        let refresh_claims = decode::<Claims>(
+            &tokens.refresh_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("refresh token should decode")
+        .claims;
+        assert_eq!(refresh_claims.token_type, "refresh");
+        assert_eq!(refresh_claims.allowed_repo_ids, None);
+    }
+
+    #[tokio::test]
+    async fn test_generate_tokens_with_repo_scope_none_stays_unrestricted() {
+        let config = make_test_config();
+        let service = AuthService::new(lazy_pool(), config.clone());
+        let user = make_test_user();
+
+        let tokens = service
+            .generate_tokens_with_repo_scope(&user, None)
+            .expect("token generation should succeed");
+
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let access_claims = decode::<Claims>(
+            &tokens.access_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("access token should decode")
+        .claims;
+
+        assert_eq!(access_claims.allowed_repo_ids, None);
+    }
+
     #[test]
     fn test_validate_access_token_rejects_refresh_token() {
         let config = make_test_config();
@@ -3312,6 +3599,7 @@ mod tests {
             username: "user".to_string(),
             email: "user@test.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: None,
             exp: (now + Duration::days(7)).timestamp(),
@@ -3343,6 +3631,7 @@ mod tests {
             username: "expired".to_string(),
             email: "expired@test.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: (now - Duration::hours(2)).timestamp(),
             iat_ms: None,
             exp: (now - Duration::hours(1)).timestamp(), // expired 1 hour ago
@@ -3368,6 +3657,7 @@ mod tests {
             username: "user".to_string(),
             email: "u@t.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: None,
             exp: (now + Duration::hours(1)).timestamp(),
@@ -3394,6 +3684,7 @@ mod tests {
             username: "test".to_string(),
             email: "test@x.com".to_string(),
             is_admin: true,
+            allowed_repo_ids: None,
             iat: 1000,
             iat_ms: None,
             exp: 2000,
@@ -3422,6 +3713,7 @@ mod tests {
             username: "u".to_string(),
             email: "u@x.com".to_string(),
             is_admin: false,
+            allowed_repo_ids: None,
             iat: 1000,
             iat_ms: None,
             exp: 2000,
@@ -3906,44 +4198,53 @@ mod tests {
         assert!(cache.read().unwrap().is_empty());
     }
 
+    /// Build a minimal cache entry for token-cache tests. Shared so each test
+    /// does not repeat the full `User` literal.
+    fn dummy_cached_entry(
+        user_id: Uuid,
+        username: &str,
+        scopes: Vec<String>,
+    ) -> CachedApiTokenEntry {
+        CachedApiTokenEntry {
+            validation: ApiTokenValidation {
+                user: User {
+                    id: user_id,
+                    username: username.to_string(),
+                    email: format!("{username}@example.com"),
+                    password_hash: None,
+                    display_name: None,
+                    auth_provider: AuthProvider::Local,
+                    external_id: None,
+                    is_admin: false,
+                    is_active: true,
+                    is_service_account: false,
+                    must_change_password: false,
+                    totp_secret: None,
+                    totp_enabled: false,
+                    totp_backup_codes: None,
+                    totp_verified_at: None,
+                    failed_login_attempts: 0,
+                    locked_until: None,
+                    last_failed_login_at: None,
+                    password_changed_at: Utc::now(),
+                    last_login_at: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                scopes,
+                allowed_repo_ids: AccessScope::Admin,
+            },
+            token_id: Uuid::nil(),
+            expires_at: None,
+        }
+    }
+
     #[test]
     fn test_token_cache_insert_and_read() {
         let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
             RwLock::new(HashMap::new());
         let key = format!("{:x}", Sha256::digest(b"ak_testtest_token"));
-        let validation = ApiTokenValidation {
-            user: User {
-                id: Uuid::nil(),
-                username: "testuser".to_string(),
-                email: "test@example.com".to_string(),
-                password_hash: None,
-                display_name: None,
-                auth_provider: AuthProvider::Local,
-                external_id: None,
-                is_admin: false,
-                is_active: true,
-                is_service_account: false,
-                must_change_password: false,
-                totp_secret: None,
-                totp_enabled: false,
-                totp_backup_codes: None,
-                totp_verified_at: None,
-                failed_login_attempts: 0,
-                locked_until: None,
-                last_failed_login_at: None,
-                password_changed_at: Utc::now(),
-                last_login_at: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            scopes: vec!["read:artifacts".to_string()],
-            allowed_repo_ids: None,
-        };
-        let entry = CachedApiTokenEntry {
-            validation,
-            token_id: Uuid::nil(),
-            expires_at: None,
-        };
+        let entry = dummy_cached_entry(Uuid::nil(), "testuser", vec!["read:artifacts".to_string()]);
         cache
             .write()
             .unwrap()
@@ -3960,39 +4261,7 @@ mod tests {
         let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
             RwLock::new(HashMap::new());
         let key = format!("{:x}", Sha256::digest(b"ak_stalekey_token"));
-        let validation = ApiTokenValidation {
-            user: User {
-                id: Uuid::nil(),
-                username: "stale".to_string(),
-                email: "stale@example.com".to_string(),
-                password_hash: None,
-                display_name: None,
-                auth_provider: AuthProvider::Local,
-                external_id: None,
-                is_admin: false,
-                is_active: true,
-                is_service_account: false,
-                must_change_password: false,
-                totp_secret: None,
-                totp_enabled: false,
-                totp_backup_codes: None,
-                totp_verified_at: None,
-                failed_login_attempts: 0,
-                locked_until: None,
-                last_failed_login_at: None,
-                password_changed_at: Utc::now(),
-                last_login_at: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            scopes: vec![],
-            allowed_repo_ids: None,
-        };
-        let entry = CachedApiTokenEntry {
-            validation,
-            token_id: Uuid::nil(),
-            expires_at: None,
-        };
+        let entry = dummy_cached_entry(Uuid::nil(), "stale", vec![]);
 
         // Insert with a backdated timestamp
         let expired_at =
@@ -4009,6 +4278,45 @@ mod tests {
             .retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
 
         assert!(cache.read().unwrap().get(&key).is_none());
+    }
+
+    /// The cache-invalidation listener flushes every registered cache on
+    /// startup/reconnect because notifications may have been missed while
+    /// this process was not listening.
+    #[test]
+    fn test_flush_all_api_token_cache_entries_clears_registered_caches() {
+        let cache: Arc<TokenCacheMap> = Arc::new(RwLock::new(HashMap::new()));
+        cache.write().unwrap().insert(
+            "flush-all-key-a".to_string(),
+            (
+                dummy_cached_entry(Uuid::new_v4(), "flush-a", vec![]),
+                Instant::now(),
+            ),
+        );
+        cache.write().unwrap().insert(
+            "flush-all-key-b".to_string(),
+            (
+                dummy_cached_entry(Uuid::new_v4(), "flush-b", vec![]),
+                Instant::now(),
+            ),
+        );
+        auth_token_cache_registry()
+            .write()
+            .unwrap()
+            .push(Arc::downgrade(&cache));
+
+        let flushed = flush_all_api_token_cache_entries();
+
+        assert!(
+            cache.read().unwrap().is_empty(),
+            "every entry in a registered cache must be flushed"
+        );
+        // The registry is process-global, so other tests may have registered
+        // caches of their own: assert a lower bound, not an exact count.
+        assert!(
+            flushed >= 2,
+            "expected at least the two inserted entries to be counted, got {flushed}"
+        );
     }
 
     #[test]
@@ -4054,7 +4362,7 @@ mod tests {
                     updated_at: Utc::now(),
                 },
                 scopes: vec![],
-                allowed_repo_ids: None,
+                allowed_repo_ids: AccessScope::Admin,
             },
             token_id: Uuid::new_v4(),
             expires_at: Some(past),
@@ -4092,7 +4400,7 @@ mod tests {
                     updated_at: Utc::now(),
                 },
                 scopes: vec![],
-                allowed_repo_ids: None,
+                allowed_repo_ids: AccessScope::Admin,
             },
             token_id: Uuid::new_v4(),
             expires_at: Some(future),
@@ -4235,13 +4543,16 @@ mod tests {
         let url = std::env::var("DATABASE_URL").ok()?;
         let pool = sqlx::PgPool::connect(&url).await.ok()?;
         let username = format!("invtest_{}", &Uuid::new_v4().to_string()[..8]);
+        // `privileges_changed_at` (migration 131, DEFAULT NOW()) joins the
+        // watermark GREATEST; without this backdate the 120s aging of the
+        // other columns is silently defeated and minted-now tokens race it.
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, auth_provider, \
              is_admin, is_active, failed_login_attempts, password_changed_at, \
-             created_at, updated_at) \
+             privileges_changed_at, created_at, updated_at) \
              VALUES ($1, $2, $3, 'unused', 'local', false, true, 0, \
              NOW() - INTERVAL '120 seconds', NOW() - INTERVAL '120 seconds', \
-             NOW() - INTERVAL '120 seconds')",
+             NOW() - INTERVAL '120 seconds', NOW() - INTERVAL '120 seconds')",
         )
         .bind(user_id)
         .bind(&username)
@@ -4281,6 +4592,7 @@ mod tests {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat,
             iat_ms: Some(iat_ms),
             exp: iat + 3600,
@@ -4580,6 +4892,7 @@ mod tests {
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
+            allowed_repo_ids: None,
             iat: iat_sec,
             iat_ms: None,
             exp: iat_sec + 3600,
@@ -4644,6 +4957,50 @@ mod tests {
         );
     }
 
+    /// `invalidate_other_sessions` (the extracted #1394 helper) must exempt the
+    /// calling session when a JWT `iat` is supplied and fall back to killing
+    /// ALL sessions for a non-JWT caller (`None`).
+    #[test]
+    fn test_invalidate_other_sessions_exempts_caller_with_iat() {
+        let user_id = Uuid::new_v4();
+        let caller_iat_ms = Utc::now().timestamp().saturating_mul(1000) + 421;
+
+        invalidate_other_sessions(user_id, Some(caller_iat_ms));
+
+        // Caller's own token survives; strictly-older tokens (incl. same-second)
+        // are invalidated — identical to `invalidate_user_tokens_except_caller`.
+        assert!(
+            !is_token_invalidated(user_id, caller_iat_ms),
+            "the calling session must be exempt when its iat is supplied"
+        );
+        assert!(
+            is_token_invalidated(user_id, caller_iat_ms - 1),
+            "an older same-second session must be invalidated"
+        );
+        assert!(
+            is_token_invalidated(user_id, caller_iat_ms - 5000),
+            "a strictly older session must be invalidated"
+        );
+    }
+
+    /// A non-JWT caller (`None`) has no session to exempt, so every session —
+    /// including one minted at the current instant — is invalidated (the legacy
+    /// #1146 "invalidate everything" semantic).
+    #[test]
+    fn test_invalidate_other_sessions_none_kills_all() {
+        let user_id = Uuid::new_v4();
+        // A token minted "now" (its iat is <= the NOW() watermark this helper
+        // writes for the None case).
+        let now_token_iat_ms = Utc::now().timestamp_millis();
+
+        invalidate_other_sessions(user_id, None);
+
+        assert!(
+            is_token_invalidated(user_id, now_token_iat_ms),
+            "a None (non-JWT) caller must invalidate all sessions, keeping none"
+        );
+    }
+
     /// The in-memory watermark write is monotonic: a later, lower watermark
     /// (e.g. a stale DB fetch arriving after a fresh password-change
     /// invalidation) must NOT lower the recorded watermark.
@@ -4672,6 +5029,81 @@ mod tests {
         assert!(
             is_token_invalidated(user_id, low_ms),
             "the high watermark must keep rejecting pre-change tokens"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2245: app-clock `iat_ms` vs DB-clock watermark skew tolerance.
+    //
+    // `fetch_credential_change_watermark` shifts the DB-clock timestamp down
+    // by `CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS` at ingestion; the replica-
+    // safe check then rejects with strict `<`. These tests pin the combined
+    // decision — `iat_ms < apply_db_clock_skew_tolerance(db_watermark_ms)` —
+    // which is exactly the comparison a token faces against a freshly-read
+    // DB watermark.
+    // -----------------------------------------------------------------------
+
+    /// A token whose `iat_ms` equals the raw DB watermark must be accepted
+    /// (strict `<` already allowed the equal case pre-#2245; the tolerance
+    /// must not regress it).
+    #[test]
+    fn test_db_skew_iat_exactly_at_db_watermark_accepted() {
+        let db_watermark_ms = Utc::now().timestamp_millis();
+        let iat_ms = db_watermark_ms;
+        assert!(
+            iat_ms >= apply_db_clock_skew_tolerance(db_watermark_ms),
+            "iat exactly at the DB watermark must pass"
+        );
+    }
+
+    /// The #2245 defect case: the app host clock lags Postgres by ~1 s, so a
+    /// token minted strictly AFTER the credential change carries an `iat_ms`
+    /// 1 s BEFORE the DB-clock watermark. Within the tolerance it must now be
+    /// accepted (pre-fix: spurious 401).
+    #[test]
+    fn test_db_skew_iat_within_tolerance_accepted() {
+        let db_watermark_ms = Utc::now().timestamp_millis();
+        let iat_ms = db_watermark_ms - 1_000; // 1 s behind: NTP-level skew
+        assert!(
+            iat_ms >= apply_db_clock_skew_tolerance(db_watermark_ms),
+            "iat within the skew tolerance must pass (the #2245 fix)"
+        );
+        // Exact edge: iat at watermark - tolerance still passes (strict `<`).
+        let iat_edge_ms = db_watermark_ms - CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS;
+        assert!(
+            iat_edge_ms >= apply_db_clock_skew_tolerance(db_watermark_ms),
+            "iat exactly at the tolerance edge must pass"
+        );
+    }
+
+    /// A token minted well before the credential change (beyond any plausible
+    /// clock skew) must still be rejected — the tolerance must not defeat the
+    /// watermark's purpose of killing stale pre-change tokens.
+    #[test]
+    fn test_db_skew_iat_beyond_tolerance_rejected() {
+        let db_watermark_ms = Utc::now().timestamp_millis();
+        // One millisecond past the tolerance edge: rejected.
+        let iat_just_past_ms = db_watermark_ms - CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS - 1;
+        assert!(
+            iat_just_past_ms < apply_db_clock_skew_tolerance(db_watermark_ms),
+            "iat one ms beyond the tolerance must be rejected"
+        );
+        // A genuinely stale token (minted a minute before the change).
+        let iat_stale_ms = db_watermark_ms - 60_000;
+        assert!(
+            iat_stale_ms < apply_db_clock_skew_tolerance(db_watermark_ms),
+            "a genuinely pre-change token must still be rejected"
+        );
+    }
+
+    /// The tolerance is a bounded, security-reviewed window; a change to the
+    /// constant should be deliberate, not incidental.
+    #[test]
+    fn test_db_skew_tolerance_is_narrow() {
+        assert!(
+            (1_000..=2_000).contains(&CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS),
+            "the skew tolerance must stay a narrow 1-2s window; widening it \
+             weakens credential-change invalidation and needs security review"
         );
     }
 
@@ -4755,7 +5187,7 @@ mod tests {
                         updated_at: Utc::now(),
                     },
                     scopes: vec![],
-                    allowed_repo_ids: None,
+                    allowed_repo_ids: AccessScope::Admin,
                 },
                 token_id: Uuid::new_v4(),
                 expires_at: None,
@@ -4854,7 +5286,7 @@ mod tests {
                         updated_at: Utc::now(),
                     },
                     scopes: vec![],
-                    allowed_repo_ids: None,
+                    allowed_repo_ids: AccessScope::Admin,
                 },
                 token_id: Uuid::new_v4(),
                 expires_at: None,
@@ -4949,6 +5381,7 @@ mod tests {
             username: "attacker".to_string(),
             email: "evil@test.com".to_string(),
             is_admin: true,
+            allowed_repo_ids: None,
             iat: Utc::now().timestamp(),
             iat_ms: None,
             exp: (Utc::now() + Duration::hours(1)).timestamp(),
@@ -5172,6 +5605,110 @@ mod tests {
         assert_eq!(result.unwrap(), 0);
     }
 
+    #[tokio::test]
+    async fn test_authenticate_federated_with_scope_embeds_access_repo_scope() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let suffix = &Uuid::new_v4().to_string()[..8];
+        let creds = FederatedCredentials {
+            external_id: format!("ci-ext-{suffix}"),
+            username: format!("ci_scope_{suffix}"),
+            email: format!("ci_scope_{suffix}@test.local"),
+            display_name: Some("CI Scoped User".to_string()),
+            groups: vec!["ci".to_string()],
+            required_admin_group: None,
+            auto_create_users: true,
+        };
+        let expected_scope = Some(vec![Uuid::new_v4(), Uuid::new_v4()]);
+
+        let (user, tokens) = service
+            .authenticate_federated_with_scope(AuthProvider::Ci, creds, expected_scope.clone())
+            .await
+            .expect("federated scoped auth should succeed");
+
+        let access_claims = service
+            .decode_token(&tokens.access_token)
+            .expect("decode access")
+            .claims;
+        assert_eq!(access_claims.token_type, "access");
+        assert_eq!(access_claims.allowed_repo_ids, expected_scope);
+
+        let refresh_claims = service
+            .decode_token(&tokens.refresh_token)
+            .expect("decode refresh")
+            .claims;
+        assert_eq!(refresh_claims.token_type, "refresh");
+        assert_eq!(refresh_claims.allowed_repo_ids, None);
+
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM user_roles WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_federated_with_scope_none_is_unrestricted() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let suffix = &Uuid::new_v4().to_string()[..8];
+        let creds = FederatedCredentials {
+            external_id: format!("ci-ext-none-{suffix}"),
+            username: format!("ci_none_{suffix}"),
+            email: format!("ci_none_{suffix}@test.local"),
+            display_name: Some("CI Unrestricted User".to_string()),
+            groups: vec!["ci".to_string()],
+            required_admin_group: None,
+            auto_create_users: true,
+        };
+
+        let (user, tokens) = service
+            .authenticate_federated_with_scope(AuthProvider::Ci, creds, None)
+            .await
+            .expect("federated auth should succeed");
+
+        let access_claims = service
+            .decode_token(&tokens.access_token)
+            .expect("decode access")
+            .claims;
+        assert_eq!(access_claims.token_type, "access");
+        assert_eq!(access_claims.allowed_repo_ids, None);
+
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM user_roles WHERE user_id = $1", user.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user.id)
+            .execute(&pool)
+            .await;
+    }
+
     // -----------------------------------------------------------------------
     // #1173: DB-backed credential-invalidation check.
     //
@@ -5190,20 +5727,25 @@ mod tests {
     /// the password is set at user creation, not at token issuance.
     async fn insert_test_user(pool: &sqlx::PgPool, username: &str) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query!(
-            r#"
-            INSERT INTO users (id, username, email, password_hash, auth_provider,
-                               is_active, is_admin, password_changed_at,
-                               failed_login_attempts, created_at, updated_at)
-            VALUES ($1, $2, $3, 'unused', 'local', true, false,
-                    NOW() - INTERVAL '60 seconds', 0,
-                    NOW() - INTERVAL '60 seconds',
-                    NOW() - INTERVAL '60 seconds')
-            "#,
-            id,
-            username,
-            format!("{username}@test.com"),
+        // `privileges_changed_at` (migration 131, DEFAULT NOW()) joins the
+        // watermark GREATEST; backdate it with the rest or the premise above
+        // (watermark strictly before any minted token's `iat`) is violated.
+        // Runtime `sqlx::query` (not `query!`) keeps SQLX_OFFLINE builds
+        // working without regenerating .sqlx metadata for a test-only insert.
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+                                is_active, is_admin, password_changed_at, \
+                                privileges_changed_at, failed_login_attempts, \
+                                created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, false, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds', 0, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds')",
         )
+        .bind(id)
+        .bind(username)
+        .bind(format!("{username}@test.com"))
         .execute(pool)
         .await
         .expect("insert test user");
@@ -5253,6 +5795,85 @@ mod tests {
 
         // Cleanup.
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #2245 end-to-end: the DB clock running AHEAD of the app clock (the
+    /// same inequality a lagging API host produces) must not 401 a token
+    /// minted after the credential change. We simulate the skew by
+    /// future-dating `password_changed_at` relative to this process's clock —
+    /// no split-clock environment needed — and assert the replica-safe check
+    /// accepts an app-clock "now" token within the tolerance but still
+    /// rejects one beyond it.
+    #[tokio::test]
+    async fn test_replica_safe_tolerates_db_clock_ahead_of_app_clock() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let username = format!("skew_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = Uuid::new_v4();
+        // Watermark 1 s in the future of the app clock: models NTP-level
+        // app-behind-DB skew around a credential change (well within
+        // CREDENTIAL_DB_CLOCK_SKEW_TOLERANCE_MS).
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             privileges_changed_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', false, true, 0, \
+             NOW() + INTERVAL '1 second', NOW() + INTERVAL '1 second')",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert skewed user");
+
+        // A token minted "now" on the app clock (post-change in real time,
+        // but 1 s behind the DB-stamped watermark). Pre-#2245 this was
+        // spuriously rejected; with the ingestion-side tolerance it passes.
+        let app_now_iat = Utc::now().timestamp_millis();
+        let rejected = is_token_invalidated_replica_safe(&pool, user_id, app_now_iat)
+            .await
+            .expect("DB check must succeed");
+        assert!(
+            !rejected,
+            "a token minted after the change on a 1s-lagging app clock must \
+             be accepted (#2245)"
+        );
+
+        // Beyond the tolerance the watermark still bites: push the change
+        // 60 s ahead of the token's iat and re-check (cache cleared so the
+        // DB is re-read).
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+        sqlx::query(
+            "UPDATE users SET password_changed_at = NOW() + INTERVAL '60 seconds' WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("bump watermark beyond tolerance");
+        let rejected_beyond = is_token_invalidated_replica_safe(&pool, user_id, app_now_iat)
+            .await
+            .expect("DB check must succeed");
+        assert!(
+            rejected_beyond,
+            "a token more than the tolerance behind the watermark must still \
+             be rejected"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
             .execute(&pool)
             .await;
     }
@@ -5446,12 +6067,26 @@ mod tests {
         .await
         .expect("insert fresh user");
 
-        // Token iat_ms captured AFTER the INSERT, in the same wall-clock second
-        // as user creation. In production this is `POST /users` followed
-        // immediately by `POST /auth/login`. With full-ms watermarks the login
-        // is strictly later than `password_changed_at DEFAULT NOW()`, so its
-        // `iat_ms` exceeds the creation watermark and is accepted.
-        let iat_same_second_ms = Utc::now().timestamp_millis();
+        // Token iat_ms one millisecond AFTER the creation watermark — the
+        // "created then immediately logged in" production scenario. Derive it
+        // from the DB's own clock rather than `Utc::now()`: the watermark is
+        // stamped by Postgres (DEFAULT NOW()) while the app clock lives on
+        // another node in CI, and millisecond NTP skew (DB ahead) made the
+        // app-clock capture land BEFORE the watermark intermittently. Single
+        // clock domain makes the strictly-after premise deterministic while
+        // still guarding the #1248 strict-< comparator this test exists for.
+        let (watermark_ms,): (i64,) = sqlx::query_as(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM GREATEST( \
+                 password_changed_at, \
+                 COALESCE(totp_verified_at, password_changed_at), \
+                 privileges_changed_at \
+             )) * 1000)::BIGINT FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch creation watermark");
+        let iat_same_second_ms = watermark_ms + 1;
         let rejected = is_token_invalidated_replica_safe(&pool, id, iat_same_second_ms)
             .await
             .expect("DB check must succeed");
@@ -5603,6 +6238,7 @@ mod tests {
             username: "forged".to_string(),
             email: "forged@test.local".to_string(),
             is_admin: claim_is_admin,
+            allowed_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: Some(now.timestamp_millis()),
             exp: now.timestamp() + 3600,
@@ -5677,12 +6313,19 @@ mod tests {
         let username = format!("restamp_admin_{}", &Uuid::new_v4().to_string()[..8]);
         let user_id = Uuid::new_v4();
         sqlx::query(
+            // `privileges_changed_at` (migration 131, DEFAULT NOW()) MUST be
+            // backdated alongside the other timestamps. It is folded into the
+            // credential-change watermark (GREATEST(password_changed_at,
+            // totp_verified_at, privileges_changed_at)); leaving it at its NOW()
+            // default pins the watermark to insert time, which then races the
+            // freshly-minted token's `iat_ms` and intermittently rejects it with
+            // "Token invalidated by credential change" under parallel test load.
             "INSERT INTO users (id, username, email, password_hash, auth_provider, \
              is_admin, is_active, failed_login_attempts, password_changed_at, \
-             created_at, updated_at) \
+             privileges_changed_at, created_at, updated_at) \
              VALUES ($1, $2, $3, 'unused', 'local', true, true, 0, \
              NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
-             NOW() - INTERVAL '60 seconds')",
+             NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds')",
         )
         .bind(user_id)
         .bind(&username)

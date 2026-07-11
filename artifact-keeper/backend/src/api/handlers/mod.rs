@@ -207,6 +207,7 @@ pub mod error_helpers;
 pub(crate) mod test_db_helpers;
 
 pub mod admin;
+pub mod age_gate;
 pub mod alpine;
 pub mod analytics;
 pub mod ansible;
@@ -218,6 +219,8 @@ pub mod builds;
 pub mod cache_headers;
 pub mod cargo;
 pub mod chef;
+pub mod ci_auth;
+pub mod ci_auth_admin;
 pub mod cocoapods;
 pub mod composer;
 pub mod conan;
@@ -292,6 +295,8 @@ pub mod vscode;
 pub mod wasm_proxy;
 pub mod webhooks;
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -97,6 +97,9 @@ futures.workspace = true
 tokio-util.workspace = true
 tokio-stream.workspace = true
 bytes.workspace = true
+# Streaming multipart reader (nuget push: parse the dotnet client's
+# multipart/form-data envelope off the body stream without buffering).
+multer = "3.1"
 
 # CLI
 clap.workspace = true
@@ -106,6 +109,7 @@ async-trait = "0.1"
 async-stream = "0.3"
 hex = "0.4"
 moka.workspace = true
+redis.workspace = true
 rand = "0.9"
 rand08 = { package = "rand", version = "0.8" }
 pgp = "0.14.2"
@@ -193,3 +197,4 @@ tonic-build.workspace = true
 tokio-test = "0.4"
 axum-test = "18"
 wiremock = "0.6"
+metrics-util = "0.20"

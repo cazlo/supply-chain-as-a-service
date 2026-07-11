@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
@@ -14,13 +15,16 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::extractors::{trusted_external_url, RequestBaseUrl};
+use crate::api::extractors::{request_scheme_is_https, trusted_external_url, RequestBaseUrl};
 use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::validation::validate_outbound_sso_url;
 
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::AuthProvider;
+use crate::services::audit_service::{
+    audit_fire_and_forget, federated_login_details, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
@@ -38,6 +42,30 @@ pub fn router() -> Router<SharedState> {
         .route("/saml/:id/login", get(saml_login))
         .route("/saml/:id/acs", post(saml_acs))
         .route("/exchange", post(exchange_code))
+}
+
+/// Fire-and-forget audit for a federated (SSO) login outcome (#1617 Phase 1).
+///
+/// Mirrors the fidelity of the local-password login audit: a successful
+/// federated login emits [`AuditAction::Login`], a rejected attempt emits
+/// [`AuditAction::LoginFailed`], both tagged with the originating provider so
+/// the enterprise-auth paths (OIDC / SAML / LDAP) leave the same trail
+/// compliance auditors already get for password login. A write failure never
+/// fails the login (see [`audit_fire_and_forget`]); we never double-log a path
+/// that is already audited elsewhere.
+async fn audit_federated_login(
+    state: &SharedState,
+    action: AuditAction,
+    user_id: Option<Uuid>,
+    provider: &str,
+    extra: serde_json::Value,
+) {
+    let mut entry = AuditEntry::new(action, ResourceType::User)
+        .details(federated_login_details(provider, extra));
+    if let Some(id) = user_id {
+        entry = entry.user(id).resource(id);
+    }
+    audit_fire_and_forget(state.db.clone(), entry).await;
 }
 
 /// Re-validate an OIDC endpoint URL against the outbound-URL SSRF guard
@@ -287,8 +315,10 @@ pub async fn oidc_callback(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(params): Query<OidcCallbackQuery>,
+    headers: HeaderMap,
     base_url: RequestBaseUrl,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. Empty state or
     // code is a malformed callback (400), an IdP error redirect is a 401, not a
     // CSRF failure. See `resolve_oidc_callback` doc comment.
@@ -315,6 +345,7 @@ pub async fn oidc_callback(
         session.nonce,
         session.pkce_code_verifier,
         base_url,
+        client_is_https,
     )
     .await
 }
@@ -328,8 +359,10 @@ pub async fn oidc_callback(
 pub async fn oidc_callback_generic(
     State(state): State<SharedState>,
     Query(params): Query<OidcCallbackQuery>,
+    headers: HeaderMap,
     base_url: RequestBaseUrl,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. See
     // `resolve_oidc_callback` doc comment.
     let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
@@ -343,6 +376,7 @@ pub async fn oidc_callback_generic(
         session.nonce,
         session.pkce_code_verifier,
         base_url,
+        client_is_https,
     )
     .await
 }
@@ -356,6 +390,7 @@ async fn oidc_callback_inner(
     session_nonce: Option<String>,
     pkce_code_verifier: Option<String>,
     base_url: RequestBaseUrl,
+    client_is_https: bool,
 ) -> Result<Response> {
     // 1. Get decrypted OIDC config
     let (row, client_secret) =
@@ -420,6 +455,7 @@ async fn oidc_callback_inner(
         &row.client_id,
         &row.issuer_url,
         session_nonce.as_deref(),
+        row.allow_legacy_rsa_keys,
     )
     .await?;
 
@@ -457,12 +493,12 @@ async fn oidc_callback_inner(
     // 7. Authenticate via federated flow (find/create user + generate tokens)
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let (user, tokens) = auth_service
+    let (user, tokens) = match auth_service
         .authenticate_federated(
             AuthProvider::Oidc,
             FederatedCredentials {
                 external_id: sub,
-                username: preferred_username,
+                username: preferred_username.clone(),
                 email,
                 display_name,
                 groups: groups.clone(),
@@ -472,7 +508,32 @@ async fn oidc_callback_inner(
                 auto_create_users: row.auto_create_users,
             },
         )
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            audit_federated_login(
+                &state,
+                AuditAction::LoginFailed,
+                None,
+                "oidc",
+                serde_json::json!({ "username": preferred_username }),
+            )
+            .await;
+            return Err(e);
+        }
+    };
+
+    // Federated login succeeded — record it with the same fidelity as the
+    // local-password login audit (#1617 Phase 1).
+    audit_federated_login(
+        &state,
+        AuditAction::Login,
+        Some(user.id),
+        "oidc",
+        serde_json::json!({ "username": user.username }),
+    )
+    .await;
 
     // 7a. Issue #1094: when map_groups_to_groups is enabled, reflect the
     //     OIDC group claim values as Artifact Keeper group memberships.
@@ -519,6 +580,7 @@ async fn oidc_callback_inner(
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
+        client_is_https,
     )
 }
 
@@ -551,8 +613,10 @@ pub struct LdapLoginRequest {
 pub async fn ldap_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(req): Json<LdapLoginRequest>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // Get decrypted LDAP config
     let (row, bind_password) = AuthConfigService::get_ldap_decrypted(&state.db, id).await?;
 
@@ -573,12 +637,27 @@ pub async fn ldap_login(
         row.use_starttls,
     );
 
-    // Authenticate against LDAP
-    let ldap_user = ldap_svc.authenticate(&req.username, &req.password).await?;
+    // Authenticate against LDAP. A bind/credential failure is the LDAP
+    // equivalent of a bad password on the local login path, so it emits
+    // LoginFailed for audit parity (#1617 Phase 1).
+    let ldap_user = match ldap_svc.authenticate(&req.username, &req.password).await {
+        Ok(u) => u,
+        Err(e) => {
+            audit_federated_login(
+                &state,
+                AuditAction::LoginFailed,
+                None,
+                "ldap",
+                serde_json::json!({ "username": req.username }),
+            )
+            .await;
+            return Err(e);
+        }
+    };
 
     // Sync user to local DB and generate JWT
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (_user, tokens) = auth_service
+    let (user, tokens) = auth_service
         .authenticate_federated(
             AuthProvider::Ldap,
             FederatedCredentials {
@@ -595,6 +674,15 @@ pub async fn ldap_login(
         )
         .await?;
 
+    audit_federated_login(
+        &state,
+        AuditAction::Login,
+        Some(user.id),
+        "ldap",
+        serde_json::json!({ "username": user.username }),
+    )
+    .await;
+
     let body = serde_json::json!({
         "access_token": tokens.access_token,
         "refresh_token": tokens.refresh_token,
@@ -608,6 +696,7 @@ pub async fn ldap_login(
         &tokens.access_token,
         &tokens.refresh_token,
         3600,
+        client_is_https,
     );
     Ok(response)
 }
@@ -755,8 +844,10 @@ pub struct SamlAcsForm {
 pub async fn saml_acs(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     axum::extract::Form(form): axum::extract::Form<SamlAcsForm>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
@@ -787,12 +878,28 @@ pub async fn saml_acs(
         row.admin_group.as_deref(),
     );
 
-    // Process SAML response
-    let saml_user = saml_svc.authenticate(&form.saml_response).await?;
+    // Process SAML response. A rejected assertion (bad signature, replay,
+    // expired, etc. — the Phase 2 checks from #2040) is a failed login; emit
+    // LoginFailed for audit parity without altering that validation logic
+    // (#1617 Phase 1).
+    let saml_user = match saml_svc.authenticate(&form.saml_response).await {
+        Ok(u) => u,
+        Err(e) => {
+            audit_federated_login(
+                &state,
+                AuditAction::LoginFailed,
+                None,
+                "saml",
+                serde_json::json!({}),
+            )
+            .await;
+            return Err(e);
+        }
+    };
 
     // Sync user and generate tokens
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (_user, tokens) = auth_service
+    let (user, tokens) = auth_service
         .authenticate_federated(
             AuthProvider::Saml,
             FederatedCredentials {
@@ -808,6 +915,15 @@ pub async fn saml_acs(
             },
         )
         .await?;
+
+    audit_federated_login(
+        &state,
+        AuditAction::Login,
+        Some(user.id),
+        "saml",
+        serde_json::json!({ "username": user.username }),
+    )
+    .await;
 
     // Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(
@@ -826,6 +942,7 @@ pub async fn saml_acs(
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
+        client_is_https,
     )
 }
 
@@ -859,8 +976,10 @@ struct ExchangeCodeResponse {
 )]
 pub async fn exchange_code(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(req): Json<ExchangeCodeRequest>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     let (access_token, refresh_token) =
         AuthConfigService::exchange_code(&state.db, &req.code).await?;
 
@@ -872,7 +991,13 @@ pub async fn exchange_code(
 
     // Default expires_in for SSO tokens (1 hour = 3600 seconds)
     let mut response = Json(body).into_response();
-    set_auth_cookies(response.headers_mut(), &access_token, &refresh_token, 3600);
+    set_auth_cookies(
+        response.headers_mut(),
+        &access_token,
+        &refresh_token,
+        3600,
+        client_is_https,
+    );
     Ok(response)
 }
 
@@ -934,6 +1059,7 @@ pub(crate) fn build_sso_callback_redirect(
     access_token: &str,
     refresh_token: &str,
     expires_in: u64,
+    client_is_https: bool,
 ) -> Result<Response> {
     let mut response = Redirect::temporary(frontend_url).into_response();
     set_auth_cookies(
@@ -941,6 +1067,7 @@ pub(crate) fn build_sso_callback_redirect(
         access_token,
         refresh_token,
         expires_in,
+        client_is_https,
     );
     Ok(response)
 }
@@ -1126,26 +1253,206 @@ fn decoding_key_from_jwk(jwk: &serde_json::Value) -> Result<jsonwebtoken::Decodi
 }
 
 /// Select a JWK from the JWKS keys array, matching by `kid` if present,
-/// otherwise falling back to the first usable key.
-fn select_jwk_key(
-    keys: &[serde_json::Value],
-    kid: Option<&str>,
-) -> Result<jsonwebtoken::DecodingKey> {
+/// otherwise falling back to the first usable RSA or EC key. Returns the raw
+/// JWK JSON value so the caller can inspect the modulus length before
+/// deciding between the strict (jsonwebtoken + aws_lc_rs) and the legacy
+/// RSA-1024 (manual `rsa` + `sha2`) verification paths.
+fn select_jwk(keys: &[serde_json::Value], kid: Option<&str>) -> Result<serde_json::Value> {
     if let Some(kid) = kid {
-        let jwk = keys
-            .iter()
+        keys.iter()
             .find(|k| k["kid"].as_str() == Some(kid))
-            .ok_or_else(|| AppError::Authentication("No matching JWK found for kid".into()))?;
-        decoding_key_from_jwk(jwk)
+            .cloned()
+            .ok_or_else(|| AppError::Authentication("No matching JWK found for kid".into()))
     } else {
         keys.iter()
-            .find_map(|k| decoding_key_from_jwk(k).ok())
+            .find(|k| matches!(k["kty"].as_str(), Some("RSA" | "EC")))
+            .cloned()
             .ok_or_else(|| AppError::Internal("No usable JWK found in JWKS".into()))
     }
 }
 
+/// Return the bit length of the RSA modulus encoded in a JWK, or `None` if
+/// the JWK is not RSA or has no decodable `n` parameter.
+///
+/// The bit count strips leading zero bytes and counts the leading zeros in
+/// the high byte so a 2048-bit modulus that happens to encode with a leading
+/// 0x00 still reports as 2048 bits, not 2056.
+fn rsa_modulus_bit_len(jwk: &serde_json::Value) -> Option<usize> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    if jwk["kty"].as_str()? != "RSA" {
+        return None;
+    }
+    let n_b64 = jwk["n"].as_str()?;
+    let n_bytes = URL_SAFE_NO_PAD.decode(n_b64).ok()?;
+    let mut bytes = n_bytes.as_slice();
+    while bytes.first() == Some(&0) {
+        bytes = &bytes[1..];
+    }
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    let leading = bytes[0].leading_zeros() as usize;
+    Some(bytes.len() * 8 - leading)
+}
+
+/// Manually verify the signature of an ID token signed with an RSA key
+/// whose modulus is shorter than the 2048-bit minimum enforced by ring /
+/// aws_lc_rs (`RSA_PKCS1_2048_8192_SHA256` and friends). Restricted to
+/// RS256 / RS384 / RS512 (PKCS#1 v1.5 over SHA-2). The legacy fallback path
+/// never relaxes the rule for PS* (RSA-PSS), ES* (ECDSA), or HS* (HMAC).
+///
+/// Once the signature is verified, the JWT claims are validated through
+/// `jsonwebtoken::decode` with signature verification explicitly disabled
+/// (`Validation::insecure_disable_signature_validation`) — needed because
+/// asking jsonwebtoken to verify the signature here would route back into
+/// aws_lc_rs and re-trigger the 2048-bit reject. The audience, issuer, and
+/// expiry checks are intact; only the signature-verify step is moved into
+/// this function.
+fn verify_id_token_with_legacy_rsa(
+    id_token: &str,
+    jwk: &serde_json::Value,
+    alg: jsonwebtoken::Algorithm,
+    client_id: &str,
+    issuer_url: &str,
+) -> Result<serde_json::Value> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use rsa::{BigUint, RsaPublicKey};
+    use sha2::{Sha256, Sha384, Sha512};
+
+    let parts: Vec<&str> = id_token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AppError::Authentication(
+            "ID token does not have three segments".into(),
+        ));
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let signature_bytes = URL_SAFE_NO_PAD.decode(parts[2]).map_err(|e| {
+        AppError::Authentication(format!("Invalid ID token signature encoding: {e}"))
+    })?;
+
+    let n_b64 = jwk["n"]
+        .as_str()
+        .ok_or_else(|| AppError::Authentication("JWK missing RSA modulus".into()))?;
+    let e_b64 = jwk["e"]
+        .as_str()
+        .ok_or_else(|| AppError::Authentication("JWK missing RSA exponent".into()))?;
+    let n_bytes = URL_SAFE_NO_PAD
+        .decode(n_b64)
+        .map_err(|e| AppError::Authentication(format!("Invalid JWK modulus encoding: {e}")))?;
+    let e_bytes = URL_SAFE_NO_PAD
+        .decode(e_b64)
+        .map_err(|e| AppError::Authentication(format!("Invalid JWK exponent encoding: {e}")))?;
+    let n = BigUint::from_bytes_be(&n_bytes);
+    let e = BigUint::from_bytes_be(&e_bytes);
+    let pubkey = RsaPublicKey::new(n, e).map_err(|e| {
+        AppError::Authentication(format!("Failed to build legacy RSA public key: {e}"))
+    })?;
+
+    let sig = Signature::try_from(signature_bytes.as_slice())
+        .map_err(|e| AppError::Authentication(format!("Invalid ID token signature length: {e}")))?;
+
+    let signing_input_bytes = signing_input.as_bytes();
+    match alg {
+        jsonwebtoken::Algorithm::RS256 => VerifyingKey::<Sha256>::new(pubkey)
+            .verify(signing_input_bytes, &sig)
+            .map_err(|e| {
+                AppError::Authentication(format!("ID token signature verification failed: {e}"))
+            })?,
+        jsonwebtoken::Algorithm::RS384 => VerifyingKey::<Sha384>::new(pubkey)
+            .verify(signing_input_bytes, &sig)
+            .map_err(|e| {
+                AppError::Authentication(format!("ID token signature verification failed: {e}"))
+            })?,
+        jsonwebtoken::Algorithm::RS512 => VerifyingKey::<Sha512>::new(pubkey)
+            .verify(signing_input_bytes, &sig)
+            .map_err(|e| {
+                AppError::Authentication(format!("ID token signature verification failed: {e}"))
+            })?,
+        other => {
+            return Err(AppError::Authentication(format!(
+                "Legacy RSA fallback only accepts RS256 / RS384 / RS512; got {other:?}"
+            )));
+        }
+    }
+
+    // Signature confirmed above. Pull the claims via the zero-validation
+    // `dangerous::insecure_decode` (the previous
+    // `Validation::insecure_disable_signature_validation` route is deprecated
+    // in jsonwebtoken 10.x) and run the standard OIDC claim checks
+    // ourselves: aud, iss, exp, nbf. The strict path's DecodingKey would
+    // still trip the 2048-bit guard, so we cannot ask jsonwebtoken to run
+    // its validator for us. Audience accepts both string and string-array
+    // shapes (RFC 7519 §4.1.3); a 60-second leeway matches the
+    // jsonwebtoken default.
+    let token_data = jsonwebtoken::dangerous::insecure_decode::<serde_json::Value>(id_token)
+        .map_err(|e| AppError::Authentication(format!("ID token decode failed: {e}")))?;
+    let claims = token_data.claims;
+    validate_legacy_rsa_claims(&claims, client_id, issuer_url)?;
+    Ok(claims)
+}
+
+/// Manual aud / iss / exp / nbf check used by the legacy RSA fallback path.
+/// Kept separate so the validation logic is unit-testable in isolation.
+fn validate_legacy_rsa_claims(
+    claims: &serde_json::Value,
+    expected_aud: &str,
+    expected_iss: &str,
+) -> Result<()> {
+    let iss = claims["iss"]
+        .as_str()
+        .ok_or_else(|| AppError::Authentication("ID token missing iss claim".into()))?;
+    if iss != expected_iss {
+        return Err(AppError::Authentication(format!(
+            "ID token iss mismatch: expected {expected_iss}, got {iss}"
+        )));
+    }
+
+    let aud_ok = match &claims["aud"] {
+        serde_json::Value::String(s) => s == expected_aud,
+        serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(expected_aud)),
+        _ => false,
+    };
+    if !aud_ok {
+        return Err(AppError::Authentication(
+            "ID token aud does not include the configured client_id".into(),
+        ));
+    }
+
+    let exp = claims["exp"]
+        .as_i64()
+        .ok_or_else(|| AppError::Authentication("ID token missing exp claim".into()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let leeway: i64 = 60;
+    if exp + leeway < now {
+        return Err(AppError::Authentication("ID token has expired".into()));
+    }
+
+    if let Some(nbf) = claims["nbf"].as_i64() {
+        if nbf > now + leeway {
+            return Err(AppError::Authentication(
+                "ID token not yet valid (nbf in the future)".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate an OIDC ID token by verifying its signature against the provider's
 /// JWKS and checking the `iss`, `aud`, `exp`, and `nonce` claims.
+///
+/// `allow_legacy_rsa_keys` (defaults to `false` at the provider config layer)
+/// toggles whether an RSA key whose modulus is shorter than 2048 bits is
+/// accepted via the manual `rsa` + `sha2` PKCS#1 v1.5 fallback. Strict path
+/// otherwise (jsonwebtoken + aws_lc_rs, which enforces RFC 7518 + OWASP).
 async fn validate_id_token(
     http_client: &reqwest::Client,
     id_token: &str,
@@ -1153,6 +1460,7 @@ async fn validate_id_token(
     client_id: &str,
     issuer_url: &str,
     session_nonce: Option<&str>,
+    allow_legacy_rsa_keys: bool,
 ) -> Result<serde_json::Value> {
     use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
 
@@ -1177,7 +1485,7 @@ async fn validate_id_token(
         .as_array()
         .ok_or_else(|| AppError::Internal("JWKS missing keys array".into()))?;
 
-    let decoding_key = select_jwk_key(keys, header.kid.as_deref())?;
+    let jwk = select_jwk(keys, header.kid.as_deref())?;
 
     let alg = match header.alg {
         jsonwebtoken::Algorithm::RS256 => Algorithm::RS256,
@@ -1195,14 +1503,37 @@ async fn validate_id_token(
         }
     };
 
-    let mut validation = Validation::new(alg);
-    validation.set_audience(&[client_id]);
-    validation.set_issuer(&[issuer_url]);
-
-    let token_data = decode::<serde_json::Value>(id_token, &decoding_key, &validation)
-        .map_err(|e| AppError::Authentication(format!("ID token validation failed: {e}")))?;
-
-    let claims = token_data.claims;
+    // Legacy RSA fallback branch: only engaged for RSA keys whose modulus is
+    // strictly below the 2048-bit OWASP baseline, AND only when the operator
+    // has explicitly enabled the per-provider flag.
+    let claims = if let Some(n_bits) = rsa_modulus_bit_len(&jwk) {
+        if n_bits < 2048 {
+            if !allow_legacy_rsa_keys {
+                return Err(AppError::Authentication(format!(
+                    "ID token RSA key is {n_bits} bits, below the 2048-bit baseline. \
+                     Enable `allow_legacy_rsa_keys` on this OIDC provider only if you \
+                     intend to accept IdPs that publish sub-2048-bit RSA keys."
+                )));
+            }
+            verify_id_token_with_legacy_rsa(id_token, &jwk, alg, client_id, issuer_url)?
+        } else {
+            let decoding_key = decoding_key_from_jwk(&jwk)?;
+            let mut validation = Validation::new(alg);
+            validation.set_audience(&[client_id]);
+            validation.set_issuer(&[issuer_url]);
+            decode::<serde_json::Value>(id_token, &decoding_key, &validation)
+                .map_err(|e| AppError::Authentication(format!("ID token validation failed: {e}")))?
+                .claims
+        }
+    } else {
+        let decoding_key = decoding_key_from_jwk(&jwk)?;
+        let mut validation = Validation::new(alg);
+        validation.set_audience(&[client_id]);
+        validation.set_issuer(&[issuer_url]);
+        decode::<serde_json::Value>(id_token, &decoding_key, &validation)
+            .map_err(|e| AppError::Authentication(format!("ID token validation failed: {e}")))?
+            .claims
+    };
 
     if let Some(expected_nonce) = session_nonce {
         let token_nonce = claims["nonce"]
@@ -1734,6 +2065,7 @@ mod tests {
             "access_token_value",
             "refresh_token_value",
             3600,
+            false,
         )
         .expect("build_sso_callback_redirect must succeed");
         assert_eq!(
@@ -1760,6 +2092,7 @@ mod tests {
             "the_access_token",
             "the_refresh_token",
             7200,
+            false,
         )
         .expect("build_sso_callback_redirect must succeed");
         let cookies: Vec<String> = response
@@ -1812,6 +2145,7 @@ mod tests {
             "at",
             "rt",
             1800, // 30 minutes
+            false,
         )
         .expect("build_sso_callback_redirect must succeed");
         let access_cookie = response
@@ -2236,31 +2570,16 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- select_jwk_key ---
-
-    #[test]
-    fn test_select_jwk_key_no_kid_empty_keys() {
-        let keys: Vec<serde_json::Value> = vec![];
-        let result = super::select_jwk_key(&keys, None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No usable JWK"));
-    }
-
-    #[test]
-    fn test_select_jwk_key_kid_not_found() {
-        let keys = vec![serde_json::json!({"kid": "key1", "kty": "RSA", "n": "x", "e": "y"})];
-        let result = super::select_jwk_key(&keys, Some("nonexistent"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No matching JWK"));
-    }
-
-    #[test]
-    fn test_select_jwk_key_unsupported_type_with_kid() {
-        let keys = vec![serde_json::json!({"kid": "k1", "kty": "OKP"})];
-        let result = super::select_jwk_key(&keys, Some("k1"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unsupported"));
-    }
+    // The previous `select_jwk_key` (which returned a `DecodingKey` and
+    // therefore eagerly rejected unsupported `kty` values like OKP) has been
+    // replaced by `select_jwk` (which returns the raw JWK so the caller can
+    // also inspect the modulus length before choosing the strict /
+    // legacy-RSA path). The new `select_jwk` is covered by the legacy_rsa
+    // submodule's `test_select_jwk_*` tests below; the OKP-rejection case
+    // moved to `decoding_key_from_jwk`'s tests above. The empty-keys and
+    // kid-not-found contracts are pinned by
+    // `test_select_jwk_no_usable_returns_error` and
+    // `test_select_jwk_kid_no_match_returns_auth_error`.
 
     // =======================================================================
     // DB-backed tests for sync_oidc_groups_to_local_groups (issue #1094).
@@ -2739,5 +3058,388 @@ mod tests {
         let off = build_saml_acs_url(false, Some(trusted), id);
         assert!(off.starts_with('/'));
         assert!(!off.contains("pkg.trusted.example"));
+    }
+
+    // -----------------------------------------------------------------------
+    // OIDC legacy RSA-1024 fallback (migration 144)
+    // -----------------------------------------------------------------------
+
+    mod legacy_rsa {
+        use super::*;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::SignatureEncoding;
+        use rsa::signature::Signer;
+        use rsa::traits::PublicKeyParts;
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+        use serde_json::json;
+        use std::sync::OnceLock;
+
+        /// Generate a 1024-bit RSA key once and share it across legacy-fallback
+        /// tests; keygen at this size dominates the test wall clock when done
+        /// per-test (~150ms on a current laptop), so cache it.
+        fn shared_1024_rsa_key() -> &'static RsaPrivateKey {
+            static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
+            KEY.get_or_init(|| {
+                let mut rng = rsa::rand_core::OsRng;
+                RsaPrivateKey::new(&mut rng, 1024).expect("1024-bit RSA keygen")
+            })
+        }
+
+        fn shared_2048_rsa_key() -> &'static RsaPrivateKey {
+            static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
+            KEY.get_or_init(|| {
+                let mut rng = rsa::rand_core::OsRng;
+                RsaPrivateKey::new(&mut rng, 2048).expect("2048-bit RSA keygen")
+            })
+        }
+
+        /// Encode the JWK form (`{"kty":"RSA","n":...,"e":...}`) of a public
+        /// RSA key, with `n` and `e` as RFC 7518-compliant base64url.
+        fn jwk_for(pubkey: &RsaPublicKey) -> serde_json::Value {
+            let n = URL_SAFE_NO_PAD.encode(pubkey.n().to_bytes_be());
+            let e = URL_SAFE_NO_PAD.encode(pubkey.e().to_bytes_be());
+            json!({"kty": "RSA", "n": n, "e": e})
+        }
+
+        /// Build a JWT `header.payload.signature` triple signed by the given
+        /// private key with the requested algorithm. Used to mint fixtures
+        /// for the legacy fallback path; the production path never signs,
+        /// only verifies.
+        fn sign_jwt(
+            priv_key: &RsaPrivateKey,
+            alg: jsonwebtoken::Algorithm,
+            payload: &serde_json::Value,
+        ) -> String {
+            let alg_str = match alg {
+                jsonwebtoken::Algorithm::RS256 => "RS256",
+                jsonwebtoken::Algorithm::RS384 => "RS384",
+                jsonwebtoken::Algorithm::RS512 => "RS512",
+                other => panic!("test fixture only signs RS256/384/512, got {other:?}"),
+            };
+            let header = json!({"alg": alg_str, "typ": "JWT"});
+            let h_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+            let p_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+            let signing_input = format!("{h_b64}.{p_b64}");
+            let sig_bytes = match alg {
+                jsonwebtoken::Algorithm::RS256 => {
+                    let sk = SigningKey::<sha2::Sha256>::new(priv_key.clone());
+                    sk.sign(signing_input.as_bytes()).to_bytes()
+                }
+                jsonwebtoken::Algorithm::RS384 => {
+                    let sk = SigningKey::<sha2::Sha384>::new(priv_key.clone());
+                    sk.sign(signing_input.as_bytes()).to_bytes()
+                }
+                jsonwebtoken::Algorithm::RS512 => {
+                    let sk = SigningKey::<sha2::Sha512>::new(priv_key.clone());
+                    sk.sign(signing_input.as_bytes()).to_bytes()
+                }
+                _ => unreachable!(),
+            };
+            let s_b64 = URL_SAFE_NO_PAD.encode(sig_bytes);
+            format!("{signing_input}.{s_b64}")
+        }
+
+        fn now_secs() -> i64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX epoch")
+                .as_secs() as i64
+        }
+
+        fn well_formed_payload() -> serde_json::Value {
+            let now = now_secs();
+            json!({
+                "iss": "https://idp.example.com",
+                "aud": "client-abc",
+                "sub": "user-1",
+                "exp": now + 3600,
+                "nbf": now - 60,
+                "iat": now,
+            })
+        }
+
+        // ------------------------------------------------------------------
+        // rsa_modulus_bit_len
+        // ------------------------------------------------------------------
+
+        #[test]
+        fn test_rsa_modulus_bit_len_reports_1024_for_1024_key() {
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let bits = super::super::rsa_modulus_bit_len(&jwk).unwrap();
+            assert!(
+                (1020..=1024).contains(&bits),
+                "1024-bit key should report ~1024 bits, got {bits}"
+            );
+        }
+
+        #[test]
+        fn test_rsa_modulus_bit_len_reports_2048_for_2048_key() {
+            let pk = shared_2048_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let bits = super::super::rsa_modulus_bit_len(&jwk).unwrap();
+            assert!(
+                (2044..=2048).contains(&bits),
+                "2048-bit key should report ~2048 bits, got {bits}"
+            );
+        }
+
+        #[test]
+        fn test_rsa_modulus_bit_len_strips_leading_zero_byte() {
+            // base64url-encode a 2048-bit modulus with one leading 0x00 byte
+            // (some encoders include the BER sign byte). The bit length must
+            // still report 2048, not 2056.
+            let pk = shared_2048_rsa_key();
+            let mut n_bytes = RsaPublicKey::from(pk).n().to_bytes_be();
+            n_bytes.insert(0, 0u8);
+            let e_bytes = RsaPublicKey::from(pk).e().to_bytes_be();
+            let jwk = json!({
+                "kty": "RSA",
+                "n": URL_SAFE_NO_PAD.encode(&n_bytes),
+                "e": URL_SAFE_NO_PAD.encode(&e_bytes),
+            });
+            let bits = super::super::rsa_modulus_bit_len(&jwk).unwrap();
+            assert!(
+                (2044..=2048).contains(&bits),
+                "leading-zero-padded 2048-bit key should still report ~2048 bits, got {bits}"
+            );
+        }
+
+        #[test]
+        fn test_rsa_modulus_bit_len_non_rsa_returns_none() {
+            let ec_jwk = json!({"kty": "EC", "crv": "P-256", "x": "AAAA", "y": "AAAA"});
+            assert!(super::super::rsa_modulus_bit_len(&ec_jwk).is_none());
+        }
+
+        #[test]
+        fn test_rsa_modulus_bit_len_missing_n_returns_none() {
+            let bad = json!({"kty": "RSA", "e": "AQAB"});
+            assert!(super::super::rsa_modulus_bit_len(&bad).is_none());
+        }
+
+        // ------------------------------------------------------------------
+        // select_jwk
+        // ------------------------------------------------------------------
+
+        #[test]
+        fn test_select_jwk_by_kid_returns_matching() {
+            let keys = vec![
+                json!({"kty": "RSA", "kid": "A", "n": "x", "e": "y"}),
+                json!({"kty": "RSA", "kid": "B", "n": "x", "e": "y"}),
+            ];
+            let jwk = super::super::select_jwk(&keys, Some("B")).unwrap();
+            assert_eq!(jwk["kid"].as_str(), Some("B"));
+        }
+
+        #[test]
+        fn test_select_jwk_kid_no_match_returns_auth_error() {
+            let keys = vec![json!({"kty": "RSA", "kid": "A", "n": "x", "e": "y"})];
+            let err = super::super::select_jwk(&keys, Some("Z")).unwrap_err();
+            assert!(matches!(err, AppError::Authentication(_)));
+        }
+
+        #[test]
+        fn test_select_jwk_no_kid_picks_first_usable() {
+            let keys = vec![
+                json!({"kty": "oct", "k": "secret"}),
+                json!({"kty": "RSA", "n": "x", "e": "y"}),
+            ];
+            let jwk = super::super::select_jwk(&keys, None).unwrap();
+            assert_eq!(jwk["kty"].as_str(), Some("RSA"));
+        }
+
+        #[test]
+        fn test_select_jwk_no_usable_returns_error() {
+            let keys = vec![json!({"kty": "oct", "k": "secret"})];
+            assert!(super::super::select_jwk(&keys, None).is_err());
+        }
+
+        // ------------------------------------------------------------------
+        // verify_id_token_with_legacy_rsa: the core fallback path. These
+        // tests pin every required behaviour: alg whitelist, signature
+        // verification, audience / issuer / expiry validation.
+        // ------------------------------------------------------------------
+
+        #[test]
+        fn test_legacy_rsa_accepts_rs256_with_1024_bit_key() {
+            let pk = shared_1024_rsa_key();
+            let pubkey = RsaPublicKey::from(pk);
+            let jwk = jwk_for(&pubkey);
+            let payload = well_formed_payload();
+            let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS256, &payload);
+            let result = super::super::verify_id_token_with_legacy_rsa(
+                &token,
+                &jwk,
+                jsonwebtoken::Algorithm::RS256,
+                "client-abc",
+                "https://idp.example.com",
+            );
+            let claims = result.expect("RS256 + 1024-bit RSA must verify when flag is on");
+            assert_eq!(claims["sub"].as_str(), Some("user-1"));
+        }
+
+        #[test]
+        fn test_legacy_rsa_accepts_rs384_with_1024_bit_key() {
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let payload = well_formed_payload();
+            let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS384, &payload);
+            let claims = super::super::verify_id_token_with_legacy_rsa(
+                &token,
+                &jwk,
+                jsonwebtoken::Algorithm::RS384,
+                "client-abc",
+                "https://idp.example.com",
+            )
+            .expect("RS384 + 1024-bit RSA must verify");
+            assert_eq!(claims["sub"].as_str(), Some("user-1"));
+        }
+
+        #[test]
+        fn test_legacy_rsa_accepts_rs512_with_1024_bit_key() {
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let payload = well_formed_payload();
+            let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS512, &payload);
+            let claims = super::super::verify_id_token_with_legacy_rsa(
+                &token,
+                &jwk,
+                jsonwebtoken::Algorithm::RS512,
+                "client-abc",
+                "https://idp.example.com",
+            )
+            .expect("RS512 + 1024-bit RSA must verify");
+            assert_eq!(claims["sub"].as_str(), Some("user-1"));
+        }
+
+        #[test]
+        fn test_legacy_rsa_rejects_es256_even_with_flag_on() {
+            // The legacy path is RSA-PKCS#1-v1.5 only. EC must not engage it.
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS256, &well_formed_payload());
+            let err = super::super::verify_id_token_with_legacy_rsa(
+                &token,
+                &jwk,
+                jsonwebtoken::Algorithm::ES256,
+                "client-abc",
+                "https://idp.example.com",
+            )
+            .unwrap_err();
+            match err {
+                AppError::Authentication(m) => assert!(m.contains("RS256 / RS384 / RS512")),
+                other => panic!("expected Authentication, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_legacy_rsa_rejects_ps256_even_with_flag_on() {
+            // PSS padding is not relaxed by the legacy compat flag.
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS256, &well_formed_payload());
+            let err = super::super::verify_id_token_with_legacy_rsa(
+                &token,
+                &jwk,
+                jsonwebtoken::Algorithm::PS256,
+                "client-abc",
+                "https://idp.example.com",
+            )
+            .unwrap_err();
+            assert!(matches!(err, AppError::Authentication(_)));
+        }
+
+        #[test]
+        fn test_legacy_rsa_rejects_tampered_signature() {
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS256, &well_formed_payload());
+            // Flip a bit in the signature segment.
+            let mut parts: Vec<&str> = token.split('.').collect();
+            let bad_sig = parts[2].chars().rev().collect::<String>();
+            parts[2] = &bad_sig;
+            let bad_token = parts.join(".");
+            let err = super::super::verify_id_token_with_legacy_rsa(
+                &bad_token,
+                &jwk,
+                jsonwebtoken::Algorithm::RS256,
+                "client-abc",
+                "https://idp.example.com",
+            )
+            .unwrap_err();
+            assert!(matches!(err, AppError::Authentication(_)));
+        }
+
+        #[test]
+        fn test_legacy_rsa_rejects_wrong_audience() {
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS256, &well_formed_payload());
+            let err = super::super::verify_id_token_with_legacy_rsa(
+                &token,
+                &jwk,
+                jsonwebtoken::Algorithm::RS256,
+                "different-client",
+                "https://idp.example.com",
+            )
+            .unwrap_err();
+            assert!(matches!(err, AppError::Authentication(_)));
+        }
+
+        #[test]
+        fn test_legacy_rsa_rejects_wrong_issuer() {
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS256, &well_formed_payload());
+            let err = super::super::verify_id_token_with_legacy_rsa(
+                &token,
+                &jwk,
+                jsonwebtoken::Algorithm::RS256,
+                "client-abc",
+                "https://other-idp.example.com",
+            )
+            .unwrap_err();
+            assert!(matches!(err, AppError::Authentication(_)));
+        }
+
+        #[test]
+        fn test_legacy_rsa_rejects_expired_token() {
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let expired_payload = json!({
+                "iss": "https://idp.example.com",
+                "aud": "client-abc",
+                "sub": "user-1",
+                "exp": 1_500_000_000_i64, // well in the past
+                "iat": 1_499_999_000_i64,
+            });
+            let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS256, &expired_payload);
+            let err = super::super::verify_id_token_with_legacy_rsa(
+                &token,
+                &jwk,
+                jsonwebtoken::Algorithm::RS256,
+                "client-abc",
+                "https://idp.example.com",
+            )
+            .unwrap_err();
+            assert!(matches!(err, AppError::Authentication(_)));
+        }
+
+        #[test]
+        fn test_legacy_rsa_rejects_malformed_token() {
+            let pk = shared_1024_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let err = super::super::verify_id_token_with_legacy_rsa(
+                "not.a.valid.jwt.segments",
+                &jwk,
+                jsonwebtoken::Algorithm::RS256,
+                "client-abc",
+                "https://idp.example.com",
+            )
+            .unwrap_err();
+            assert!(matches!(err, AppError::Authentication(_)));
+        }
     }
 }

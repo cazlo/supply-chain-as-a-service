@@ -15,6 +15,10 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
+use crate::services::audit_service::{
+    api_token_audit_entry, audit_fire_and_forget, password_change_audit_entry,
+    sessions_invalidated_audit_entry, AuditAction,
+};
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
 };
@@ -78,7 +82,38 @@ pub fn self_or_admin_router() -> Router<SharedState> {
 /// (default 5 attempts / 15 min) caps that vector below the global
 /// `rate_limit_api_per_window`.
 pub fn self_password_router() -> Router<SharedState> {
-    Router::new().route("/:id/password", post(change_password))
+    Router::new()
+        .route("/:id/password", post(change_password))
+        // Canonical self-service alias (#1313). Registered here so it inherits
+        // the same password-change rate-limit layer (#1026) applied to
+        // `self_password_router` in routes.rs — never place it on the
+        // un-throttled `self_router()` (bcrypt CPU-DoS vector).
+        .route("/me/password", post(change_current_user_password))
+}
+
+/// Canonical self-service routes (#1313): `/users/me/*` aliases that resolve
+/// the subject to `auth.user_id`, so they act on the caller's OWN record with
+/// no `require_self_or_admin` path check needed. These delegate to the same
+/// `*_inner` fns as the `/users/:id/*` self-or-admin routes, so the #1314
+/// guards and #1315 scope-enforcement invariants are preserved unchanged.
+///
+/// Mount under `auth_middleware` (Nest A in routes.rs), NOT `admin_middleware`.
+/// On matchit 0.7.3 the static `/me` segment coexists with the `/:id` param
+/// (static wins), so these aliases do not conflict with the existing routes.
+///
+/// `POST /me/password` is deliberately NOT here — it lives in
+/// [`self_password_router`] so it inherits the password-change rate limit.
+pub fn self_router() -> Router<SharedState> {
+    Router::new()
+        .route("/me", get(get_current_user_record))
+        .route(
+            "/me/tokens",
+            get(list_current_user_tokens).post(create_current_user_api_token),
+        )
+        .route(
+            "/me/tokens/:token_id",
+            delete(revoke_current_user_api_token),
+        )
 }
 
 /// Admin-only password administration routes (reset, force-change).
@@ -379,6 +414,14 @@ pub async fn get_user(
 ) -> Result<Json<AdminUserResponse>> {
     // Self-or-admin: a user may read their own record; anyone else needs admin.
     auth.require_self_or_admin(id, "Cannot view other users' records")?;
+    get_user_inner(&state, id).await
+}
+
+/// Shared record lookup for both `GET /users/:id` (self-or-admin) and
+/// `GET /users/me` (self only). The caller is responsible for authorization;
+/// the `/:id` wrapper enforces `require_self_or_admin`, while the `/me` alias
+/// resolves the subject to `auth.user_id` so it is intrinsically self-only.
+async fn get_user_inner(state: &SharedState, id: Uuid) -> Result<Json<AdminUserResponse>> {
     let user = sqlx::query_as!(
         User,
         r#"
@@ -739,7 +782,7 @@ pub async fn revoke_role(
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateApiTokenRequest {
+pub struct CreateUserApiTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
     pub expires_in_days: Option<i64>,
@@ -790,7 +833,16 @@ pub async fn list_user_tokens(
 ) -> Result<Json<ApiTokenListResponse>> {
     // Users can only view their own tokens unless admin
     auth.require_self_or_admin(id, "Cannot view other users' tokens")?;
+    list_user_tokens_inner(&state, id).await
+}
 
+/// Shared token-listing for both `GET /users/:id/tokens` (self-or-admin) and
+/// `GET /users/me/tokens` (self only). Authorization is the caller's
+/// responsibility; the `/me` alias passes `auth.user_id`.
+async fn list_user_tokens_inner(
+    state: &SharedState,
+    id: Uuid,
+) -> Result<Json<ApiTokenListResponse>> {
     let tokens = sqlx::query!(
         r#"
         SELECT id, name, token_prefix, scopes, expires_at, last_used_at, created_at
@@ -830,7 +882,7 @@ pub async fn list_user_tokens(
     params(
         ("id" = Uuid, Path, description = "User ID"),
     ),
-    request_body = CreateApiTokenRequest,
+    request_body = CreateUserApiTokenRequest,
     responses(
         (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
         (status = 403, description = "Cannot create tokens for other users"),
@@ -841,11 +893,23 @@ pub async fn create_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<CreateApiTokenRequest>,
+    Json(payload): Json<CreateUserApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     // Users can only create tokens for themselves unless admin
     auth.require_self_or_admin(id, "Cannot create tokens for other users")?;
+    create_api_token_inner(&state, &auth, id, payload).await
+}
 
+/// Shared token-mint for both `POST /users/:id/tokens` (self-or-admin) and
+/// `POST /users/me/tokens` (self only). Ownership is enforced by the caller;
+/// the #1315 admin-only-scope enforcement lives HERE so both routes reject a
+/// non-admin minting `*`/`admin`/`delete:*`/`write:users` tokens.
+async fn create_api_token_inner(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+    payload: CreateUserApiTokenRequest,
+) -> Result<Json<ApiTokenCreatedResponse>> {
     // Refuse admin-class scopes from non-admin callers. See
     // `token_service::ADMIN_ONLY_SCOPES` for the policy rationale —
     // mirrors the same enforcement on the sibling endpoint
@@ -859,6 +923,18 @@ pub async fn create_api_token(
     let (token, token_id) = auth_service
         .generate_api_token(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            auth.user_id,
+            token_id,
+            Some(&payload.name),
+            "user",
+        ),
+    )
+    .await;
 
     Ok(Json(ApiTokenCreatedResponse {
         id: token_id,
@@ -891,9 +967,33 @@ pub async fn revoke_api_token(
 ) -> Result<()> {
     // Users can only revoke their own tokens unless admin
     auth.require_self_or_admin(user_id, "Cannot revoke other users' tokens")?;
+    revoke_api_token_inner(&state, &auth, user_id, token_id).await
+}
 
+/// Shared token-revocation for both `DELETE /users/:id/tokens/:token_id`
+/// (self-or-admin) and `DELETE /users/me/tokens/:token_id` (self only).
+/// Ownership is scoped by `user_id`, which the `/me` alias resolves to
+/// `auth.user_id`.
+async fn revoke_api_token_inner(
+    state: &SharedState,
+    auth: &AuthExtension,
+    user_id: Uuid,
+    token_id: Uuid,
+) -> Result<()> {
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     auth_service.revoke_api_token(token_id, user_id).await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenRevoked,
+            auth.user_id,
+            token_id,
+            None,
+            "user",
+        ),
+    )
+    .await;
 
     Ok(())
 }
@@ -929,12 +1029,26 @@ pub async fn change_password(
     Path(id): Path<Uuid>,
     Json(payload): Json<ChangePasswordRequest>,
 ) -> Result<()> {
+    // Non-admin trying to change another user's password
+    auth.require_self_or_admin(id, "Cannot change other users' passwords")?;
+    change_password_inner(&state, &auth, id, payload).await
+}
+
+/// Shared password-change for both `POST /users/:id/password` (self-or-admin)
+/// and `POST /users/me/password` (self only). Ownership is enforced by the
+/// caller; the current-password check (`auth.user_id == id && !auth.is_admin`)
+/// and the configurable password policy are enforced HERE so both routes keep
+/// the #1315/#1026 invariants. Both routes ride the password-change rate-limit
+/// layer (they are registered in `self_password_router`).
+async fn change_password_inner(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+    payload: ChangePasswordRequest,
+) -> Result<()> {
     // Validate new password against configurable policy
     let policy = PasswordPolicyConfig::from_config(&state.config);
     validate_password_with_policy(&payload.new_password, &policy)?;
-
-    // Non-admin trying to change another user's password
-    auth.require_self_or_admin(id, "Cannot change other users' passwords")?;
 
     // Fetch user row once: password_hash + must_change_password
     let user_row = sqlx::query_as::<_, (Option<String>, bool)>(
@@ -1036,6 +1150,22 @@ pub async fn change_password(
         // tokens will eventually expire on their own.
         tracing::warn!(user_id = %id, error = %e, "Failed to revoke refresh-token families after password change");
     }
+
+    // Audit the password change and the session invalidation it triggered
+    // (#386). Fire-and-forget and placed AFTER the transaction has committed
+    // so an audit-table outage can never fail the password change. `by_admin`
+    // is true only when an admin changes a DIFFERENT user's password.
+    let by_admin = auth.is_admin && auth.user_id != id;
+    audit_fire_and_forget(
+        state.db.clone(),
+        password_change_audit_entry(id, auth.user_id, by_admin),
+    )
+    .await;
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(id, auth.user_id, "password_change"),
+    )
+    .await;
 
     // If this user had must_change_password, check if setup mode should be unlocked
     if had_must_change && state.setup_required.load(Ordering::Relaxed) {
@@ -1165,6 +1295,20 @@ pub async fn reset_password(
     if let Err(e) = auth_service.revoke_all_refresh_token_families(id).await {
         tracing::warn!(user_id = %id, error = %e, "Failed to revoke refresh-token families after password reset");
     }
+
+    // Audit the admin-initiated password reset and the session invalidation it
+    // triggered (#386). Subject = target user, actor = acting admin; an admin
+    // reset is by definition `by_admin = true`. Fire-and-forget, POST-commit.
+    audit_fire_and_forget(
+        state.db.clone(),
+        password_change_audit_entry(id, auth.user_id, true),
+    )
+    .await;
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(id, auth.user_id, "password_reset"),
+    )
+    .await;
 
     Ok(Json(ResetPasswordResponse {
         temporary_password: temp_password,
@@ -1345,9 +1489,143 @@ pub async fn force_password_change(
         Some(auth.username.clone()),
     );
 
+    // Forcing a password change does NOT itself change the password (it only
+    // flags `must_change_password`), so only the mass session invalidation is
+    // audited here — emitting PASSWORD_CHANGED would be misleading (#386).
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(id, auth.user_id, "force_password_change"),
+    )
+    .await;
+
     Ok(Json(ForcePasswordChangeResponse {
         message: "User will be required to change password on next login".to_string(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Canonical self-service aliases (#1313): `/users/me/*`
+// ---------------------------------------------------------------------------
+// Each handler resolves the subject as `auth.user_id` (never a path id) and
+// delegates to the same `*_inner` fn as the corresponding `/users/:id/*`
+// self-or-admin route, so all existing invariants are preserved with no SQL
+// duplication and no new `sqlx::query!` macro.
+
+/// Get the authenticated caller's own user record.
+#[utoipa::path(
+    get,
+    path = "/me",
+    context_path = "/api/v1/users",
+    tag = "users",
+    operation_id = "get_current_user_record",
+    responses(
+        (status = 200, description = "The authenticated caller's user record", body = AdminUserResponse),
+        (status = 404, description = "User not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_current_user_record(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<AdminUserResponse>> {
+    get_user_inner(&state, auth.user_id).await
+}
+
+/// List the authenticated caller's own API tokens.
+#[utoipa::path(
+    get,
+    path = "/me/tokens",
+    context_path = "/api/v1/users",
+    tag = "users",
+    operation_id = "list_current_user_tokens",
+    responses(
+        (status = 200, description = "List of the caller's API tokens", body = ApiTokenListResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_current_user_tokens(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<ApiTokenListResponse>> {
+    list_user_tokens_inner(&state, auth.user_id).await
+}
+
+/// Create an API token for the authenticated caller.
+///
+/// The #1315 admin-only-scope enforcement is applied inside
+/// `create_api_token_inner`, so a non-admin cannot mint `*`/`admin`/`delete:*`/
+/// `write:users` tokens via this alias any more than via `/users/:id/tokens`.
+#[utoipa::path(
+    post,
+    path = "/me/tokens",
+    context_path = "/api/v1/users",
+    tag = "users",
+    operation_id = "create_current_user_api_token",
+    request_body = CreateUserApiTokenRequest,
+    responses(
+        (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
+        (status = 403, description = "Requested scopes require administrator privileges"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_current_user_api_token(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<CreateUserApiTokenRequest>,
+) -> Result<Json<ApiTokenCreatedResponse>> {
+    create_api_token_inner(&state, &auth, auth.user_id, payload).await
+}
+
+/// Revoke one of the authenticated caller's own API tokens.
+#[utoipa::path(
+    delete,
+    path = "/me/tokens/{token_id}",
+    context_path = "/api/v1/users",
+    tag = "users",
+    operation_id = "revoke_current_user_api_token",
+    params(
+        ("token_id" = Uuid, Path, description = "API token ID"),
+    ),
+    responses(
+        (status = 200, description = "API token revoked successfully"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn revoke_current_user_api_token(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(token_id): Path<Uuid>,
+) -> Result<()> {
+    revoke_api_token_inner(&state, &auth, auth.user_id, token_id).await
+}
+
+/// Change the authenticated caller's own password.
+///
+/// Resolves the subject to `auth.user_id`, so the shared
+/// `change_password_inner` requires the current password (non-admin self path)
+/// exactly as `POST /users/:id/password` does. Registered in
+/// `self_password_router` so it inherits the password-change rate limit (#1026).
+#[utoipa::path(
+    post,
+    path = "/me/password",
+    context_path = "/api/v1/users",
+    tag = "users",
+    operation_id = "change_current_user_password",
+    request_body = ChangePasswordRequest,
+    responses(
+        (status = 200, description = "Password changed successfully"),
+        (status = 401, description = "Current password is incorrect"),
+        (status = 404, description = "User not found"),
+        (status = 422, description = "Validation error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn change_current_user_password(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> Result<()> {
+    change_password_inner(&state, &auth, auth.user_id, payload).await
 }
 
 #[derive(OpenApi)]
@@ -1367,6 +1645,11 @@ pub async fn force_password_change(
         change_password,
         reset_password,
         force_password_change,
+        get_current_user_record,
+        list_current_user_tokens,
+        create_current_user_api_token,
+        revoke_current_user_api_token,
+        change_current_user_password,
     ),
     components(schemas(
         ListUsersQuery,
@@ -1378,7 +1661,7 @@ pub async fn force_password_change(
         RoleResponse,
         RoleListResponse,
         AssignRoleRequest,
-        CreateApiTokenRequest,
+        CreateUserApiTokenRequest,
         ApiTokenResponse,
         ApiTokenCreatedResponse,
         ApiTokenListResponse,
@@ -1742,7 +2025,7 @@ mod tests {
     #[test]
     fn test_create_api_token_request_deserialize() {
         let json = r#"{"name":"CI token","scopes":["read","deploy"],"expires_in_days":90}"#;
-        let req: CreateApiTokenRequest = serde_json::from_str(json).unwrap();
+        let req: CreateUserApiTokenRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, "CI token");
         assert_eq!(req.scopes, vec!["read", "deploy"]);
         assert_eq!(req.expires_in_days, Some(90));
@@ -1751,7 +2034,7 @@ mod tests {
     #[test]
     fn test_create_api_token_request_no_expiry() {
         let json = r#"{"name":"permanent","scopes":["*"]}"#;
-        let req: CreateApiTokenRequest = serde_json::from_str(json).unwrap();
+        let req: CreateUserApiTokenRequest = serde_json::from_str(json).unwrap();
         assert!(req.expires_in_days.is_none());
     }
 
@@ -2104,6 +2387,78 @@ mod tests {
     }
 
     #[test]
+    fn test_self_password_router_contains_me_password_route() {
+        // #1313: the canonical self alias POST /me/password must live in the
+        // rate-limited self_password_router (#1026), not the un-throttled
+        // self_router, to avoid an un-capped bcrypt CPU-DoS path.
+        let r = self_password_router();
+        let dbg = router_paths(&r);
+        assert!(
+            dbg.contains("/me/password"),
+            "self_password_router must expose POST /me/password (#1313); got {}",
+            dbg
+        );
+    }
+
+    #[test]
+    fn test_self_router_contains_me_routes() {
+        // #1313: the additive self-service aliases must be registered.
+        let r = self_router();
+        let dbg = router_paths(&r);
+        assert!(
+            dbg.contains("/me"),
+            "self_router must expose GET /me (#1313); got {}",
+            dbg
+        );
+        assert!(
+            dbg.contains("/me/tokens"),
+            "self_router must expose /me/tokens (#1313); got {}",
+            dbg
+        );
+        assert!(
+            dbg.contains("/me/tokens/:token_id"),
+            "self_router must expose /me/tokens/:token_id (#1313); got {}",
+            dbg
+        );
+    }
+
+    #[test]
+    fn test_nest_a_routers_merge_without_conflict() {
+        // #1313 routing feasibility: the additive `/me` static routes must
+        // coexist with the existing `/:id` param routes when all three Nest A
+        // sub-routers are merged (as routes.rs does). matchit conflicts panic
+        // at merge/route time, so a successful build + Debug repr proves the
+        // static `/me` segment and the `/:id` param sibling do not collide.
+        let merged = self_password_router()
+            .merge(self_or_admin_router())
+            .merge(self_router());
+        let dbg = router_paths(&merged);
+        assert!(
+            dbg.contains("/me"),
+            "merged Nest A must contain /me; got {}",
+            dbg
+        );
+        assert!(
+            dbg.contains("/:id"),
+            "merged Nest A must retain /:id; got {}",
+            dbg
+        );
+    }
+
+    #[test]
+    fn test_self_router_does_not_contain_password_route() {
+        // The bare /me record/token routes must NOT carry the password route;
+        // /me/password belongs to the rate-limited self_password_router.
+        let r = self_router();
+        let dbg = router_paths(&r);
+        assert!(
+            !dbg.contains("/me/password"),
+            "self_router must NOT carry /me/password (it belongs in self_password_router); got {}",
+            dbg
+        );
+    }
+
+    #[test]
     fn test_self_password_router_does_not_contain_reset_route() {
         // SECURITY: the self-service router must not carry the admin
         // reset/force-change endpoints. If it did, mounting it under
@@ -2220,6 +2575,15 @@ mod router_split_tests {
 
     fn build_password_app(state: SharedState, auth: AuthExtension) -> axum::Router {
         self_password_router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    /// #1313: builds the canonical self-service `/users/me/*` router with the
+    /// caller's auth injected. `/me` handlers resolve the subject to
+    /// `auth.user_id`, so these exercise the self-only alias path.
+    fn build_self_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        self_router()
             .with_state(state)
             .layer(AxumExtension::<AuthExtension>(auth))
     }
@@ -2665,6 +3029,229 @@ mod router_split_tests {
         delete_user_row(&pool, target_id).await;
     }
 
+    // ── #1313: /users/me/* self-service aliases ───────────────────────
+
+    /// GET /me resolves to the CALLER's own record (subject = auth.user_id),
+    /// never a path id.
+    #[tokio::test]
+    async fn me_get_returns_own_record() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/me")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET /me MUST return the caller's own record (#1313); body: {}",
+            String::from_utf8_lossy(&body),
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            json["id"].as_str(),
+            Some(user_id.to_string().as_str()),
+            "GET /me MUST resolve to the caller's id, not any path id"
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    /// GET /me/tokens resolves to the caller's own tokens.
+    #[tokio::test]
+    async fn me_tokens_list_returns_only_own() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/me/tokens")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET /me/tokens MUST succeed for the caller (#1313); body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    /// POST /me/tokens with a benign scope mints a token for the caller.
+    #[tokio::test]
+    async fn me_tokens_create_ok() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_app(state, auth);
+
+        let body = json!({
+            "name": "me-token",
+            "scopes": ["read:artifacts"],
+            "expires_in_days": 30,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/me/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "POST /me/tokens (read scope) MUST mint a token for the caller (#1313); body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    /// #1315 invariant preserved on the alias: a non-admin caller cannot mint
+    /// an admin-scoped token via POST /me/tokens.
+    #[tokio::test]
+    async fn me_tokens_create_rejects_admin_scope() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_app(state, auth);
+
+        let body = json!({
+            "name": "escalate",
+            "scopes": ["admin"],
+            "expires_in_days": 30,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/me/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "POST /me/tokens with admin scope by a non-admin MUST 403 (#1315 preserved on the /me alias)"
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    /// DELETE /me/tokens/:id revokes the caller's own token.
+    #[tokio::test]
+    async fn me_tokens_revoke_own_ok() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let token_id = seed_api_token(&pool, user_id, "me-rev").await;
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_self_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/me/tokens/{}", token_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "DELETE /me/tokens/:id MUST revoke the caller's own token (#1313); body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    /// #1026/self-current-password invariant preserved on the alias: a
+    /// non-admin POSTing /me/password without `current_password` is rejected
+    /// (not applied). Built from `self_password_router` so `/me/password` is in
+    /// the router under test.
+    #[tokio::test]
+    async fn me_password_change_requires_current_pw() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_password_app(state, auth);
+
+        // Omit current_password: the self current-password check must reject.
+        let body = json!({
+            "new_password": "NewPassw0rd!",
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/me/password")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "POST /me/password without current_password MUST NOT succeed for a non-admin (#1313 preserves the self current-password check)"
+        );
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "POST /me/password for self MUST NOT 403 — it is intrinsically self-only (#1313)"
+        );
+
+        delete_user_row(&pool, user_id).await;
+    }
+
+    /// Invariant (c): the existing admin-shaped `/users/:id` path is unchanged
+    /// by the additive #1313 aliases — an admin can still read any user's
+    /// record via `GET /users/:id`.
+    #[tokio::test]
+    async fn admin_can_read_other_user_via_id_route() {
+        let Some((pool, state, admin_id, admin_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let auth = make_admin_auth(admin_id, &admin_name);
+        let app = build_self_or_admin_app(state, auth);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/{}", target_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin GET /users/:id MUST still return another user's record (#1313 is additive); body: {}",
+            String::from_utf8_lossy(&body),
+        );
+
+        delete_user_row(&pool, admin_id).await;
+        delete_user_row(&pool, target_id).await;
+    }
+
     // ── #1821: privilege change invalidates tokens ─────────────────────
 
     /// AuthExtension for an admin caller (the request principal that performs
@@ -3047,5 +3634,139 @@ mod admin_scope_policy_tests {
         );
 
         cleanup(&pool, user_id).await;
+    }
+}
+
+/// DB-backed tests for the auth-event audit trail added in #386 (#1617
+/// Phase 1): a self-service password change and an admin password reset must
+/// emit `PASSWORD_CHANGED` (plus `SESSIONS_INVALIDATED` for the self change),
+/// with `details.by_admin` reflecting who performed it. Each test no-ops when
+/// `DATABASE_URL` is unset (`tdh::try_pool`).
+#[cfg(test)]
+mod password_audit_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Read `details.by_admin` off the single PASSWORD_CHANGED audit row for a
+    /// subject, if present.
+    async fn by_admin_flag(pool: &sqlx::PgPool, subject: Uuid) -> Option<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT (details->>'by_admin')::bool FROM audit_log \
+             WHERE resource_id = $1 AND action = 'PASSWORD_CHANGED' LIMIT 1",
+        )
+        .bind(subject)
+        .fetch_optional(pool)
+        .await
+        .expect("by_admin query")
+    }
+
+    #[tokio::test]
+    async fn self_change_password_emits_password_changed_and_sessions_invalidated() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let current = "OldPass!2026";
+        let hash = bcrypt::hash(current, 4).expect("hash password");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&hash)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed password hash");
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::make_auth(user_id, &username);
+
+        let res = change_password(
+            State(state.clone()),
+            Extension(auth),
+            Path(user_id),
+            Json(ChangePasswordRequest {
+                current_password: Some(current.to_string()),
+                new_password: "NewPass!2026".to_string(),
+            }),
+        )
+        .await;
+
+        let changed = tdh::audit_count(&pool, user_id, "PASSWORD_CHANGED").await;
+        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        let by_admin = by_admin_flag(&pool, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(res.is_ok(), "change_password failed: {:?}", res.err());
+        assert_eq!(
+            changed, 1,
+            "self change_password MUST write one PASSWORD_CHANGED row"
+        );
+        assert_eq!(
+            invalidated, 1,
+            "self change_password MUST write one SESSIONS_INVALIDATED row"
+        );
+        assert_eq!(
+            by_admin,
+            Some(false),
+            "a self change must record details.by_admin = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_reset_password_emits_password_changed_by_admin_on_target() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_id, _target_name) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let mut auth = tdh::make_auth(admin_id, &admin_name);
+        auth.is_admin = true;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let res = reset_password(State(state.clone()), Extension(auth), Path(target_id)).await;
+
+        let changed = tdh::audit_count(&pool, target_id, "PASSWORD_CHANGED").await;
+        let by_admin = by_admin_flag(&pool, target_id).await;
+        tdh::cleanup_user(&pool, target_id).await;
+        tdh::cleanup_user(&pool, admin_id).await;
+
+        assert!(res.is_ok(), "reset_password failed: {:?}", res.err());
+        assert_eq!(
+            changed, 1,
+            "admin reset MUST write one PASSWORD_CHANGED row on the target user"
+        );
+        assert_eq!(
+            by_admin,
+            Some(true),
+            "an admin reset must record details.by_admin = true"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_force_password_change_emits_sessions_invalidated_only() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_id, _target_name) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let mut auth = tdh::make_auth(admin_id, &admin_name);
+        auth.is_admin = true;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let res =
+            force_password_change(State(state.clone()), Extension(auth), Path(target_id)).await;
+
+        let invalidated = tdh::audit_count(&pool, target_id, "SESSIONS_INVALIDATED").await;
+        // No password actually changed, so PASSWORD_CHANGED must NOT be emitted.
+        let changed = tdh::audit_count(&pool, target_id, "PASSWORD_CHANGED").await;
+        tdh::cleanup_user(&pool, target_id).await;
+        tdh::cleanup_user(&pool, admin_id).await;
+
+        assert!(res.is_ok(), "force_password_change failed: {:?}", res.err());
+        assert_eq!(
+            invalidated, 1,
+            "force_password_change MUST write one SESSIONS_INVALIDATED row"
+        );
+        assert_eq!(
+            changed, 0,
+            "force_password_change must NOT emit PASSWORD_CHANGED (no password changed)"
+        );
     }
 }

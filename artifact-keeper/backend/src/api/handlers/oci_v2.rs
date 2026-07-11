@@ -492,6 +492,30 @@ fn enforce_scan_pull_scope(
     }
 }
 
+/// Per-repository access gate for API-token-scoped OCI bearers (#2290).
+///
+/// An API token can declare a repository allow-list (`allowed_repo_ids`); the
+/// `/v2/token` exchange now mints the OCI bearer with that same allow-list on
+/// `Claims.allowed_repo_ids` (via `generate_tokens_with_repo_scope`). This gate
+/// enforces it on the resource handlers, mirroring the REST path's #504 scope
+/// check (`AuthExtension::can_access_repo` -> `AccessScope::grants`, run before
+/// the fine-grained admin bypass in `auth.rs`): the declared scope is a
+/// **ceiling** that applies even to admins.
+///
+/// `None` = unrestricted (a JWT login session or an unscoped API token) — a
+/// no-op, exactly matching `AccessScope::Admin`. `Some(ids)` denies any repo
+/// not in the allow-list. Pure decision fn (no I/O) so it is unit-testable.
+#[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
+fn enforce_token_repo_scope(
+    claims: &crate::services::auth_service::Claims,
+    repo_id: Uuid,
+) -> Result<(), Response> {
+    match &claims.allowed_repo_ids {
+        Some(ids) if !ids.contains(&repo_id) => Err(oci_denied_repo_access()),
+        _ => Ok(()), // None = unrestricted; matches AccessScope::grants
+    }
+}
+
 /// OCI v2 write/delete authorization — parity with the REST artifact-write gate.
 ///
 /// The REST artifact path enforces a private-repository members-only gate
@@ -521,6 +545,11 @@ async fn require_oci_repo_write_access(
     repo_id: Uuid,
     repo_is_public: bool,
 ) -> Result<(), Response> {
+    // An API-token-scoped bearer may only touch repositories in its declared
+    // allow-list — a ceiling that applies even to admins (#2290). This mirrors
+    // the REST #504 gate, which runs `can_access_repo` before the admin
+    // fine-grained bypass. No-op for unscoped tokens / JWT-login sessions.
+    enforce_token_repo_scope(claims, repo_id)?;
     if claims.is_admin || repo_is_public {
         return Ok(());
     }
@@ -539,6 +568,61 @@ async fn require_oci_repo_write_access(
                 "repository authorization temporarily unavailable",
             ))
         }
+    }
+}
+
+/// Fine-grained per-action OCI gate, applied AFTER `require_oci_repo_write_access`
+/// (the tenant-membership gate) on the destructive manifest-delete path.
+///
+/// `require_oci_repo_write_access` admits any member (incl. a read/write-only
+/// grantee) and any authed caller on a public repo, collapsing write/delete —
+/// the OCI half of #2321 (G2). When the repo has fine-grained permission rules,
+/// require the requested `action` (or `admin`, which implies all actions), the
+/// same `has_rules -> check_permission` block the REST path enforces. Admins
+/// bypass; a repo with no rules falls through unchanged. Fails closed (503) if
+/// the rule lookup errors, mirroring `require_oci_repo_write_access`.
+#[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
+async fn require_oci_repo_fine_grained_action(
+    state: &SharedState,
+    claims: &crate::services::auth_service::Claims,
+    repo_id: Uuid,
+    action: &str,
+) -> Result<(), Response> {
+    if claims.is_admin {
+        return Ok(());
+    }
+    let has_rules = match state
+        .permission_service
+        .has_any_rules_for_target("repository", repo_id)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("OCI permission-rule lookup failed: {}", e);
+            return Err(oci_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DENIED",
+                "repository authorization temporarily unavailable",
+            ));
+        }
+    };
+    if !has_rules {
+        return Ok(());
+    }
+    let has_action = state
+        .permission_service
+        .check_permission(claims.sub, "repository", repo_id, action, false)
+        .await
+        .unwrap_or(false);
+    let has_admin = state
+        .permission_service
+        .check_permission(claims.sub, "repository", repo_id, "admin", false)
+        .await
+        .unwrap_or(false);
+    if has_action || has_admin {
+        Ok(())
+    } else {
+        Err(oci_denied_repo_access())
     }
 }
 
@@ -3831,57 +3915,52 @@ async fn token(
     // locks itself out. `validate_api_token` has no failure-counter side
     // effect, so trying it first keeps the lockout counter accurate while
     // still falling through to bcrypt for actual passwords.
-    let (user, tokens, authenticated_via_api_token) =
-        match auth_service.validate_api_token(&credentials.1).await {
-            Ok(validation) => {
-                // TODO: Enforce token scopes and allowed_repo_ids for OCI
-                // token exchange. Currently the generated JWT inherits full
-                // user privileges regardless of token restrictions.
-                if !validation.scopes.is_empty() && !validation.scopes.contains(&"*".to_string()) {
-                    warn!(
-                        user = %validation.user.username,
-                        scopes = ?validation.scopes,
-                        allowed_repo_ids = ?validation.allowed_repo_ids,
-                        "API token has scope/repo restrictions that are not \
-                         enforced during OCI token exchange"
-                    );
-                }
-                let user = validation.user;
-                let tokens = match auth_service.generate_tokens(&user) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        return oci_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "INTERNAL_ERROR",
-                            "failed to generate tokens",
-                        )
-                    }
-                };
-                (user, tokens, true)
-            }
-            Err(_) => match auth_service
-                .authenticate(&credentials.0, &credentials.1)
-                .await
+    let (user, tokens, authenticated_via_api_token) = match auth_service
+        .validate_api_token(&credentials.1)
+        .await
+    {
+        Ok(validation) => {
+            // Carry the API token's declared repository allow-list onto the
+            // minted OCI bearer so the resource handlers enforce it (#2290).
+            // `AccessScope::Admin` (an unscoped token) maps to `None` =
+            // unrestricted, preserving prior behaviour for full-scope tokens.
+            let allowed_repo_ids: Option<Vec<Uuid>> = validation.allowed_repo_ids.clone().into();
+            let user = validation.user;
+            let tokens = match auth_service.generate_tokens_with_repo_scope(&user, allowed_repo_ids)
             {
-                Ok((user, tokens)) => (user, tokens, false),
+                Ok(t) => t,
                 Err(_) => {
-                    // Final fallback: accept a valid AK access token (JWT) as the
-                    // Docker password. This enables the CI/CD keyless push flow:
-                    //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
-                    //   2. docker login -u <ci-user> -p <access_token>  (this path)
-                    //   3. docker push ...
-                    // This mirrors how Artifactory handles its OIDC-issued tokens.
-                    match auth_service
-                        .validate_access_token_async(&credentials.1)
-                        .await
-                    {
-                        Ok(claims) => {
-                            let user = match sqlx::query_as::<_, User>(
-                                "SELECT * FROM users WHERE id = $1",
-                            )
-                            .bind(claims.sub)
-                            .fetch_one(&state.db)
-                            .await
+                    return oci_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "INTERNAL_ERROR",
+                        "failed to generate tokens",
+                    )
+                }
+            };
+            (user, tokens, true)
+        }
+        Err(_) => match auth_service
+            .authenticate(&credentials.0, &credentials.1)
+            .await
+        {
+            Ok((user, tokens)) => (user, tokens, false),
+            Err(_) => {
+                // Final fallback: accept a valid AK access token (JWT) as the
+                // Docker password. This enables the CI/CD keyless push flow:
+                //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
+                //   2. docker login -u <ci-user> -p <access_token>  (this path)
+                //   3. docker push ...
+                // This mirrors how Artifactory handles its OIDC-issued tokens.
+                match auth_service
+                    .validate_access_token_async(&credentials.1)
+                    .await
+                {
+                    Ok(claims) => {
+                        let user =
+                            match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                                .bind(claims.sub)
+                                .fetch_one(&state.db)
+                                .await
                             {
                                 Ok(u) => u,
                                 Err(_) => {
@@ -3892,30 +3971,35 @@ async fn token(
                                     )
                                 }
                             };
-                            let tokens = match auth_service.generate_tokens(&user) {
-                                Ok(t) => t,
-                                Err(_) => {
-                                    return oci_error(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        "INTERNAL_ERROR",
-                                        "failed to generate tokens",
-                                    )
-                                }
-                            };
-                            // Treat like an API token: bypass the TOTP guard below.
-                            (user, tokens, true)
-                        }
-                        Err(_) => {
-                            return oci_error(
-                                StatusCode::UNAUTHORIZED,
-                                "UNAUTHORIZED",
-                                "invalid username or password",
-                            )
-                        }
+                        // Preserve the incoming access token's repository
+                        // scope on the re-minted bearer so this keyless
+                        // fallback cannot re-widen a restricted token (#2290).
+                        let tokens = match auth_service
+                            .generate_tokens_with_repo_scope(&user, claims.allowed_repo_ids.clone())
+                        {
+                            Ok(t) => t,
+                            Err(_) => {
+                                return oci_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL_ERROR",
+                                    "failed to generate tokens",
+                                )
+                            }
+                        };
+                        // Treat like an API token: bypass the TOTP guard below.
+                        (user, tokens, true)
+                    }
+                    Err(_) => {
+                        return oci_error(
+                            StatusCode::UNAUTHORIZED,
+                            "UNAUTHORIZED",
+                            "invalid username or password",
+                        )
                     }
                 }
-            },
-        };
+            }
+        },
+    };
 
     // Block password-based OCI token requests when the user has TOTP 2FA
     // enabled. Docker CLI cannot perform a TOTP challenge, so the user
@@ -4101,6 +4185,12 @@ async fn handle_head_blob(
         if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
             return resp;
         }
+        // Enforce the API-token repository allow-list on pulls (#2290), the
+        // read-side parity of the REST #504 scope gate. No-op for unscoped
+        // tokens (allowed_repo_ids == None).
+        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+            return resp;
+        }
     }
 
     // Check oci_blobs table. Look up by the canonical digest so an upper-case
@@ -4267,6 +4357,12 @@ async fn handle_get_blob(
     // a read of any other repo (#2093). No-op for normal tokens.
     if let Some(claims) = &claims {
         if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
+            return resp;
+        }
+        // Enforce the API-token repository allow-list on pulls (#2290), the
+        // read-side parity of the REST #504 scope gate. No-op for unscoped
+        // tokens (allowed_repo_ids == None).
+        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
             return resp;
         }
     }
@@ -6403,6 +6499,12 @@ async fn handle_head_manifest(
         if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
             return resp;
         }
+        // Enforce the API-token repository allow-list on pulls (#2290), the
+        // read-side parity of the REST #504 scope gate. No-op for unscoped
+        // tokens (allowed_repo_ids == None).
+        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+            return resp;
+        }
     }
 
     // Reference can be a tag or a digest. Resolve locally first: a surviving
@@ -6552,6 +6654,12 @@ async fn handle_get_manifest(
     // a read of any other repo (#2093). No-op for normal tokens.
     if let Some(claims) = &claims {
         if let Err(resp) = enforce_scan_pull_scope(claims, &repo.key) {
+            return resp;
+        }
+        // Enforce the API-token repository allow-list on pulls (#2290), the
+        // read-side parity of the REST #504 scope gate. No-op for unscoped
+        // tokens (allowed_repo_ids == None).
+        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
             return resp;
         }
     }
@@ -7788,6 +7896,14 @@ async fn handle_delete_manifest(
     {
         return resp;
     }
+    // Fine-grained delete gate (#2321 G2): the tenant gate above admits any
+    // member regardless of action, collapsing read/write/delete. Require the
+    // `delete` action when the repo has permission rules, matching the REST
+    // `delete_artifact` path.
+    if let Err(resp) = require_oci_repo_fine_grained_action(state, &claims, repo.id, "delete").await
+    {
+        return resp;
+    }
 
     // Promotion-only release repositories: deleting a manifest is the symmetric
     // mutation to the (already-gated) direct push and would let a plain
@@ -8221,6 +8337,82 @@ mod tests {
         let claims = claims_with_scan_scope(None);
         assert!(enforce_scan_pull_scope(&claims, "repo-a").is_ok());
         assert!(enforce_scan_pull_scope(&claims, "any-other-repo").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_token_repo_scope (#2290)
+    // -----------------------------------------------------------------------
+
+    fn claims_with_repo_scope(
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        is_admin: bool,
+    ) -> crate::services::auth_service::Claims {
+        crate::services::auth_service::Claims {
+            sub: uuid::Uuid::new_v4(),
+            username: "ci-bot".to_string(),
+            email: "ci-bot@artifact-keeper.internal".to_string(),
+            is_admin,
+            allowed_repo_ids,
+            iat: 0,
+            iat_ms: None,
+            exp: i64::MAX,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+        }
+    }
+
+    #[test]
+    fn test_enforce_token_repo_scope_noop_when_unrestricted() {
+        // None = unrestricted (JWT login / unscoped API token): every repo Ok.
+        let claims = claims_with_repo_scope(None, false);
+        assert!(enforce_token_repo_scope(&claims, Uuid::new_v4()).is_ok());
+        assert!(enforce_token_repo_scope(&claims, Uuid::new_v4()).is_ok());
+    }
+
+    #[test]
+    fn test_enforce_token_repo_scope_allows_in_scope_denies_out_of_scope() {
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        let claims = claims_with_repo_scope(Some(vec![repo_a]), false);
+        assert!(enforce_token_repo_scope(&claims, repo_a).is_ok());
+        let err = enforce_token_repo_scope(&claims, repo_b)
+            .expect_err("out-of-scope repo must be denied");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_enforce_token_repo_scope_caps_admin() {
+        // The declared scope is a ceiling that binds even an admin bearer: an
+        // admin token scoped to repo_a still cannot reach repo_b (#2290 parity
+        // with the REST #504 gate, which precedes the admin bypass).
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        let claims = claims_with_repo_scope(Some(vec![repo_a]), true);
+        assert!(enforce_token_repo_scope(&claims, repo_a).is_ok());
+        let err = enforce_token_repo_scope(&claims, repo_b)
+            .expect_err("admin token is still capped by its declared scope");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_access_scope_restricted_mints_repo_allow_list() {
+        // Mint round-trip: a Restricted AccessScope lowers to the same
+        // Option<Vec<Uuid>> claim the bearer carries, which the gate then reads.
+        let repo_a = Uuid::new_v4();
+        let scope = crate::models::access_scope::AccessScope::Restricted(vec![repo_a]);
+        let allowed_repo_ids: Option<Vec<Uuid>> = scope.into();
+        assert_eq!(allowed_repo_ids, Some(vec![repo_a]));
+
+        let claims = claims_with_repo_scope(allowed_repo_ids, false);
+        assert!(enforce_token_repo_scope(&claims, repo_a).is_ok());
+        assert!(enforce_token_repo_scope(&claims, Uuid::new_v4()).is_err());
+
+        // Admin AccessScope lowers to None = unrestricted.
+        let admin_scope = crate::models::access_scope::AccessScope::Admin;
+        let admin_ids: Option<Vec<Uuid>> = admin_scope.into();
+        assert_eq!(admin_ids, None);
     }
 
     // -----------------------------------------------------------------------
@@ -11658,6 +11850,7 @@ mod tests {
     ) -> crate::models::repository::Repository {
         use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
         Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "test-repo".to_string(),
@@ -14564,6 +14757,114 @@ mod oci_blob_upload_streaming_tests {
             normal_status,
             StatusCode::ACCEPTED,
             "delete on a normal (non-promotion_only) repo must be unaffected (202)"
+        );
+    }
+
+    /// #2321 G2 (OCI delete): on a repo that carries fine-grained permission
+    /// rules, a non-admin member holding only read/write (NOT `delete`) is
+    /// rejected 403 DENIED on a manifest DELETE, while a distinct non-admin
+    /// member holding the `delete` action succeeds (202). Mirrors the REST
+    /// `delete_artifact` fine-grained gate — the OCI path must not collapse
+    /// write and delete.
+    #[tokio::test]
+    async fn delete_manifest_gated_on_fine_grained_delete_action() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let digest = format!("sha256:{}", "e".repeat(64));
+        let seed_tag = |tag: &'static str| {
+            let pool = f.inner.pool.clone();
+            let repo_id = f.inner.repo_id;
+            let digest = digest.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+                     VALUES ($1, 'app', $2, $3, 'application/vnd.oci.image.manifest.v1+json')",
+                )
+                .bind(repo_id)
+                .bind(tag)
+                .bind(&digest)
+                .execute(&pool)
+                .await
+                .expect("seed tag");
+            }
+        };
+
+        // The fixture user is a member (role assignment) but is granted only
+        // read/write on this rules-bearing repo.
+        tdh::grant_repo_actions(
+            &f.inner.pool,
+            f.inner.repo_id,
+            f.inner.user_id,
+            &["read", "write"],
+        )
+        .await;
+
+        // A distinct member who DOES hold the `delete` action.
+        let (deleter_id, _deleter_name) = tdh::create_user(&f.inner.pool).await;
+        tdh::grant_repo_access(&f.inner.pool, f.inner.repo_id, deleter_id).await;
+        tdh::grant_repo_actions(
+            &f.inner.pool,
+            f.inner.repo_id,
+            deleter_id,
+            &["read", "write", "delete"],
+        )
+        .await;
+        let deleter_auth = tdh::bearer_for(&f.inner.state, deleter_id).await;
+
+        // (a) write-only member -> DELETE rejected 403 DENIED, tag intact.
+        seed_tag("relwrite").await;
+        let (blocked_status, _h, blocked_body) = send(
+            f.app(),
+            request(
+                Method::DELETE,
+                format!("/{}/app/manifests/relwrite", f.inner.repo_key),
+                &f.authorization,
+                Bytes::new(),
+            ),
+        )
+        .await;
+        let surviving: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1 AND tag = 'relwrite'",
+        )
+        .bind(f.inner.repo_id)
+        .fetch_one(&f.inner.pool)
+        .await
+        .expect("count relwrite tag");
+
+        // (b) delete-granted member -> DELETE proceeds (202).
+        seed_tag("reldelete").await;
+        let (allowed_status, _ah, _ab) = send(
+            f.app(),
+            request(
+                Method::DELETE,
+                format!("/{}/app/manifests/reldelete", f.inner.repo_key),
+                &deleter_auth,
+                Bytes::new(),
+            ),
+        )
+        .await;
+
+        // teardown removes the repo-scoped role_assignments + permissions (by
+        // repo id) and the fixture user/repo; then drop the second user.
+        f.teardown().await;
+        tdh::cleanup_user(&f.inner.pool, deleter_id).await;
+
+        assert_eq!(
+            blocked_status,
+            StatusCode::FORBIDDEN,
+            "write-only member manifest DELETE must return 403"
+        );
+        assert!(
+            String::from_utf8_lossy(&blocked_body).contains("DENIED"),
+            "403 body must carry the OCI DENIED code; got: {}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        assert_eq!(surviving, 1, "a blocked delete must leave the tag intact");
+        assert_eq!(
+            allowed_status,
+            StatusCode::ACCEPTED,
+            "a member holding the delete action must delete the manifest (202)"
         );
     }
 

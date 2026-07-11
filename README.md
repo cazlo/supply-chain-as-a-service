@@ -87,7 +87,9 @@ See [docs/reference-architecture.md](docs/reference-architecture.md) for the
 architecture and trust model, [docs/gitops-deployment-example.md](docs/gitops-deployment-example.md)
 for the sanitized Flux deployment pattern, and
 [docs/runner-options.md](docs/runner-options.md) for Gitea and GitHub ARC runner
-options.
+options. The [package-manager mTLS survey](docs/package-manager-mtls-support.md)
+compares client-certificate support across major ecosystems and describes an
+Artifact Keeper deployment protected by Teleport Application Access.
 
 ## Workflow
 

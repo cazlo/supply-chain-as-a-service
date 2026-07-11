@@ -387,3 +387,66 @@ jobs:
           HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+  # Browser-level web E2E lane: deploys the staging-promoted backend + web
+  # images as an isolated per-run Helm release in ak-smoke and drives the UI
+  # with a Playwright Kubernetes Job (the runners are daemonless, so
+  # upstream's docker-compose Playwright job cannot run here). First
+  # increment runs only the peers interactions spec with one Chromium worker;
+  # broaden once runtime and flake data exist. Publish path only: it consumes
+  # private Harbor images and namespace credentials.
+  web-e2e:
+    needs: [gate, backend-build-smoke, web-build]
+    if: needs.gate.outputs.run == 'true' && needs.gate.outputs.publish == 'true'
+    runs-on: artifact-keeper-builder
+    steps:
+      - name: Check out the vendored sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.gate.outputs.checkout_ref }}
+
+      - name: Build and push the Playwright runner image
+        id: build
+        # Two statements, not `echo "image=$(script)"` -- see
+        # backend-integration-build for the failure this avoids.
+        run: |
+          set -euo pipefail
+          image="$(ci/web-e2e-image-build.sh)"
+          echo "image=${image}" >> "${GITEA_OUTPUT}"
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Set up cosign and trivy
+        run: ci/setup-image-tools.sh
+
+      - name: Verify staged signatures, then run the Playwright suite
+        # Reuses the already-promoted staging images by their reconstructable
+        # source-key tags (ci/source-key.sh) instead of rebuilding, and
+        # refuses to deploy anything the lab did not sign.
+        run: |
+          set -euo pipefail
+          export BACKEND_IMAGE_REPO="${HARBOR_REGISTRY}/artifact-keeper-staging/artifact-keeper-backend"
+          export BACKEND_IMAGE_TAG="$(ci/source-key.sh backend)"
+          export WEB_IMAGE_REPO="${HARBOR_REGISTRY}/artifact-keeper-staging/artifact-keeper-web"
+          export WEB_IMAGE_TAG="$(ci/source-key.sh web)"
+          ci/verify-image.sh \
+            "${BACKEND_IMAGE_REPO}:${BACKEND_IMAGE_TAG}" \
+            "${WEB_IMAGE_REPO}:${WEB_IMAGE_TAG}"
+          make web-e2e-ci
+        env:
+          E2E_RUNNER_IMAGE: ${{ steps.build.outputs.image }}
+          E2E_RESULTS_DIR: /tmp/artifact-keeper-web-e2e
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Retain the Playwright report and logs
+        if: always()
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        with:
+          name: web-e2e-${{ needs.gate.outputs.checkout_ref }}
+          path: /tmp/artifact-keeper-web-e2e/
+          if-no-files-found: warn
+          retention-days: 14

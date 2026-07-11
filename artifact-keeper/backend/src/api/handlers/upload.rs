@@ -800,6 +800,9 @@ fn map_upload_err(e: UploadError) -> Response {
         UploadError::NotFound => (StatusCode::NOT_FOUND, e.to_string()),
         UploadError::Expired => (StatusCode::GONE, e.to_string()),
         UploadError::InvalidChunk(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+        // A duplicate PATCH for a chunk another request is actively uploading:
+        // a transient, retriable condition, not a client error (#2316).
+        UploadError::ChunkInProgress(_) => (StatusCode::CONFLICT, e.to_string()),
         UploadError::InvalidChunkSize => (StatusCode::BAD_REQUEST, e.to_string()),
         UploadError::TooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
         UploadError::PathTooLong { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
@@ -1135,6 +1138,8 @@ fn replication_session_metadata_from_request<'a>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[allow(clippy::io_other_error, clippy::unnecessary_literal_unwrap)]
 mod tests {
     use super::*;
@@ -1175,7 +1180,8 @@ mod tests {
             is_api_token: allowed.is_some(),
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: allowed,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::from(allowed),
+            iat_ms: None,
         }
     }
 

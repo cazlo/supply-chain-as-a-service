@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
+    http::HeaderMap,
     response::{IntoResponse, Response},
     routing::post,
     Extension, Json, Router,
@@ -13,13 +14,16 @@ use serde::{Deserialize, Serialize};
 use totp_rs::{Algorithm, Secret, TOTP};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::api::extractors::request_scheme_is_https;
 use crate::api::handlers::auth::set_auth_cookies;
-use crate::api::middleware::auth::{AuthExtension, TokenIat};
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::auth_service::{
-    invalidate_user_tokens, invalidate_user_tokens_except_caller, AuthService,
+use crate::services::audit_service::{
+    audit_fire_and_forget, sessions_invalidated_audit_entry, totp_audit_entry, AuditAction,
+    AuditEntry, ResourceType,
 };
+use crate::services::auth_service::{invalidate_other_sessions, AuthService};
 
 /// Build a TOTP instance from raw secret bytes and a username label.
 fn build_totp(secret_bytes: Vec<u8>, username: String) -> Result<TOTP> {
@@ -179,7 +183,6 @@ pub struct TotpEnableResponse {
 pub async fn enable_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    token_iat: Option<Extension<TokenIat>>,
     Json(payload): Json<TotpCodeRequest>,
 ) -> Result<Json<TotpEnableResponse>> {
     // Fetch stored secret
@@ -251,7 +254,7 @@ pub async fn enable_totp(
     // When the caller didn't use a JWT (no `iat`), fall back to `NOW()` so
     // the original #1146 semantic still holds for any other JWT sessions
     // this user has.
-    let caller_iat_ms = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
+    let caller_iat_ms = auth.caller_iat_ms();
     let verified_ts: DateTime<Utc> = match caller_iat_ms {
         Some(iat_ms) => DateTime::<Utc>::from_timestamp_millis(iat_ms).ok_or_else(|| {
             AppError::Internal(format!(
@@ -279,10 +282,7 @@ pub async fn enable_totp(
     // Refresh tokens are revoked via the DB on every replica below so the
     // OAuth refresh-grant cannot mint a fresh access token from a stale
     // refresh JWT — that's the original #1146 threat.
-    match caller_iat_ms {
-        Some(iat_ms) => invalidate_user_tokens_except_caller(auth.user_id, iat_ms),
-        None => invalidate_user_tokens(auth.user_id),
-    }
+    invalidate_other_sessions(auth.user_id, caller_iat_ms);
 
     // Refresh-token family revocation (#1146 / #1370): a refresh JWT issued
     // before TOTP was enabled stays valid until natural expiry. Mark every
@@ -303,6 +303,20 @@ pub async fn enable_totp(
             "Failed to revoke refresh-token families after TOTP enable",
         );
     }
+
+    // Audit the credential-posture change and the mass session invalidation
+    // it triggered (#386). Fire-and-forget and placed AFTER the state change
+    // has committed so an audit-table outage can never fail the enable.
+    audit_fire_and_forget(
+        state.db.clone(),
+        totp_audit_entry(AuditAction::TotpEnabled, auth.user_id),
+    )
+    .await;
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(auth.user_id, auth.user_id, "totp_enable"),
+    )
+    .await;
 
     Ok(Json(TotpEnableResponse { backup_codes }))
 }
@@ -329,8 +343,10 @@ pub struct TotpVerifyRequest {
 )]
 pub async fn verify_totp(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(payload): Json<TotpVerifyRequest>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     // Validate the pending token, then atomically consume its `jti` so it is
@@ -351,6 +367,16 @@ pub async fn verify_totp(
     .ok_or_else(|| AppError::Authentication("User not found".to_string()))?;
 
     if !user_row.totp_enabled {
+        // A 2FA login attempt against a user without TOTP enabled is a failed
+        // login; record it (#386). Fire-and-forget, non-gating.
+        audit_fire_and_forget(
+            state.db.clone(),
+            AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                .user(claims.sub)
+                .resource(claims.sub)
+                .details(serde_json::json!({ "reason": "totp_not_enabled" })),
+        )
+        .await;
         return Err(AppError::Authentication(
             "TOTP not enabled for this user".to_string(),
         ));
@@ -365,6 +391,10 @@ pub async fn verify_totp(
     let code_valid = totp
         .check_current(&payload.code)
         .map_err(|e| AppError::Internal(format!("TOTP check error: {}", e)))?;
+
+    // Track which factor authenticated so the success audit event can label
+    // the login method (#386): a primary TOTP code vs a one-time backup code.
+    let mut used_backup_code = false;
 
     if !code_valid {
         // Try backup codes. Consumption must be atomic: a previous read of
@@ -417,8 +447,23 @@ pub async fn verify_totp(
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         if !backup_used {
+            // Neither the primary TOTP code nor a backup code matched: this is
+            // a failed 2FA login and MUST be audited (#386). Fire-and-forget,
+            // non-gating, emitted before returning the error.
+            audit_fire_and_forget(
+                state.db.clone(),
+                AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                    .user(claims.sub)
+                    .resource(claims.sub)
+                    .details(serde_json::json!({
+                        "reason": "invalid_totp_code",
+                        "method": "totp",
+                    })),
+            )
+            .await;
             return Err(AppError::Authentication("Invalid TOTP code".to_string()));
         }
+        used_backup_code = true;
     }
 
     // TOTP verified -- now fetch full user and generate real tokens
@@ -465,6 +510,26 @@ pub async fn verify_totp(
         .persist_refresh_jti_from_pair(&tokens, user.id)
         .await?;
 
+    // A completed TOTP verify IS a login: record it so 2FA users' logins are
+    // no longer invisible in the audit trail (#386). Fire-and-forget,
+    // non-gating, placed after the refresh jti is durably persisted.
+    let method_label = if used_backup_code {
+        "totp_backup_code"
+    } else {
+        "totp"
+    };
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::Login, ResourceType::User)
+            .user(user.id)
+            .resource(user.id)
+            .details(serde_json::json!({
+                "username": user.username,
+                "method": method_label,
+            })),
+    )
+    .await;
+
     let body = super::auth::LoginResponse {
         access_token: tokens.access_token.clone(),
         refresh_token: tokens.refresh_token.clone(),
@@ -481,6 +546,7 @@ pub async fn verify_totp(
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
+        client_is_https,
     );
     Ok(response)
 }
@@ -509,7 +575,6 @@ pub struct TotpDisableRequest {
 pub async fn disable_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    token_iat: Option<Extension<TokenIat>>,
     Json(payload): Json<TotpDisableRequest>,
 ) -> Result<()> {
     // Verify password
@@ -567,11 +632,7 @@ pub async fn disable_totp(
     // Invalidate prior tokens issued under the stricter (TOTP-required)
     // policy while exempting the calling session so the user is not signed
     // out by their own disable action (#1370).
-    let caller_iat_ms = token_iat.as_ref().map(|Extension(TokenIat(iat))| *iat);
-    match caller_iat_ms {
-        Some(iat_ms) => invalidate_user_tokens_except_caller(auth.user_id, iat_ms),
-        None => invalidate_user_tokens(auth.user_id),
-    }
+    invalidate_other_sessions(auth.user_id, auth.caller_iat_ms());
 
     // Refresh-token family revocation (#1146 / #1370): kill every refresh
     // JWT for this user across replicas so the OAuth refresh-grant cannot
@@ -588,6 +649,19 @@ pub async fn disable_totp(
             "Failed to revoke refresh-token families after TOTP disable",
         );
     }
+
+    // Audit the credential-posture change and the mass session invalidation
+    // it triggered (#386). Fire-and-forget, POST-commit, non-gating.
+    audit_fire_and_forget(
+        state.db.clone(),
+        totp_audit_entry(AuditAction::TotpDisabled, auth.user_id),
+    )
+    .await;
+    audit_fire_and_forget(
+        state.db.clone(),
+        sessions_invalidated_audit_entry(auth.user_id, auth.user_id, "totp_disable"),
+    )
+    .await;
 
     Ok(())
 }
@@ -970,7 +1044,9 @@ mod totp_token_invalidation_regression_tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            // Non-JWT caller (API-token / basic-auth): no `iat` to exempt.
+            iat_ms: None,
         };
 
         // Token issued one minute before the change (millisecond issued-at,
@@ -988,7 +1064,6 @@ mod totp_token_invalidation_regression_tests {
         let result = enable_totp(
             State(state),
             Extension(auth),
-            None,
             Json(TotpCodeRequest { code }),
         )
         .await;
@@ -1043,17 +1118,6 @@ mod totp_token_invalidation_regression_tests {
         let totp = build_totp(secret_bytes, format!("test-{user_id}")).expect("build totp");
         let code = totp.generate_current().expect("generate code");
 
-        let auth = AuthExtension {
-            user_id,
-            username: format!("test-{user_id}"),
-            email: format!("test-{user_id}@example.test"),
-            is_admin: false,
-            is_api_token: false,
-            is_service_account: false,
-            scopes: None,
-            allowed_repo_ids: None,
-        };
-
         // The caller's token was issued "now" (millisecond `iat_ms`, as the
         // middleware now supplies via `Claims::effective_iat_ms`); tokens
         // issued before now must be killed; the caller's own token must
@@ -1063,10 +1127,23 @@ mod totp_token_invalidation_regression_tests {
         let pre_caller_iat_ms = caller_iat_ms - 60_000;
         let older_same_second_ms = caller_iat_ms - 1;
 
+        // The calling JWT's issued-at now travels on `AuthExtension::iat_ms`
+        // (folded from the former separate `TokenIat` extension, #1394).
+        let auth = AuthExtension {
+            user_id,
+            username: format!("test-{user_id}"),
+            email: format!("test-{user_id}@example.test"),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: Some(caller_iat_ms),
+        };
+
         let result = enable_totp(
             State(state),
             Extension(auth),
-            Some(Extension(TokenIat(caller_iat_ms))),
             Json(TotpCodeRequest { code }),
         )
         .await;
@@ -1139,7 +1216,8 @@ mod totp_token_invalidation_regression_tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
 
         let pre_change_iat = Utc::now().timestamp_millis() - 60_000;
@@ -1153,7 +1231,6 @@ mod totp_token_invalidation_regression_tests {
         let result = disable_totp(
             State(state),
             Extension(auth),
-            None,
             Json(TotpDisableRequest {
                 password: "real-test-password".to_string(),
                 code,
@@ -1215,6 +1292,12 @@ mod totp_token_invalidation_regression_tests {
         let totp = build_totp(secret_bytes, format!("test-{user_id}")).expect("build totp");
         let code = totp.generate_current().expect("generate code");
 
+        let caller_iat_ms = Utc::now().timestamp_millis();
+        let pre_caller_iat_ms = caller_iat_ms - 60_000;
+        let older_same_second_ms = caller_iat_ms - 1;
+
+        // The calling JWT's issued-at now travels on `AuthExtension::iat_ms`
+        // (folded from the former separate `TokenIat` extension, #1394).
         let auth = AuthExtension {
             user_id,
             username: format!("test-{user_id}"),
@@ -1223,17 +1306,13 @@ mod totp_token_invalidation_regression_tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: Some(caller_iat_ms),
         };
-
-        let caller_iat_ms = Utc::now().timestamp_millis();
-        let pre_caller_iat_ms = caller_iat_ms - 60_000;
-        let older_same_second_ms = caller_iat_ms - 1;
 
         let result = disable_totp(
             State(state),
             Extension(auth),
-            Some(Extension(TokenIat(caller_iat_ms))),
             Json(TotpDisableRequest {
                 password: "real-test-password".to_string(),
                 code,
@@ -1292,8 +1371,7 @@ mod totp_verify_hardening_tests {
     //!    authenticate concurrent sessions.
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
-    use crate::models::user::{AuthProvider, User};
-    use chrono::Utc;
+    use crate::models::user::User;
     use uuid::Uuid;
 
     /// Enrol a fresh user in TOTP with the given backup-code hashes and return
@@ -1304,55 +1382,12 @@ mod totp_verify_hardening_tests {
         pool: &sqlx::PgPool,
         backup_hashes: &[String],
     ) -> (User, SharedState, Vec<u8>, String, std::path::PathBuf) {
-        let (user_id, username) = tdh::create_user(pool).await;
-        let secret = totp_rs::Secret::generate_secret();
-        let secret_b32 = secret.to_encoded().to_string();
-        let secret_bytes = secret.to_bytes().expect("secret bytes");
-        let backup_json = serde_json::to_string(backup_hashes).expect("serialize backup");
-        sqlx::query(
-            "UPDATE users SET totp_secret = $1, totp_enabled = true, totp_backup_codes = $2 \
-             WHERE id = $3",
-        )
-        .bind(&secret_b32)
-        .bind(&backup_json)
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .expect("enable totp");
-
-        let storage_dir = std::env::temp_dir().join(format!("totp-verify-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
-        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
-
-        let user = User {
-            id: user_id,
-            username,
-            email: format!("{user_id}@test.local"),
-            password_hash: Some("unused".to_string()),
-            display_name: None,
-            auth_provider: AuthProvider::Local,
-            external_id: None,
-            is_admin: false,
-            is_active: true,
-            is_service_account: false,
-            must_change_password: false,
-            totp_secret: Some(secret_b32),
-            totp_enabled: true,
-            totp_backup_codes: Some(backup_json),
-            totp_verified_at: None,
-            failed_login_attempts: 0,
-            locked_until: None,
-            last_failed_login_at: None,
-            password_changed_at: Utc::now(),
-            last_login_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let fx = tdh::create_totp_user(pool, backup_hashes).await;
+        let auth_service = AuthService::new(pool.clone(), Arc::new(fx.state.config.clone()));
         let pending = auth_service
-            .generate_totp_pending_token(&user)
+            .generate_totp_pending_token(&fx.user)
             .expect("pending token");
-        (user, state, secret_bytes, pending, storage_dir)
+        (fx.user, fx.state, fx.secret_bytes, pending, fx.storage_dir)
     }
 
     async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid, dir: &std::path::Path) {
@@ -1385,6 +1420,7 @@ mod totp_verify_hardening_tests {
 
         let first = verify_totp(
             State(state.clone()),
+            HeaderMap::new(),
             Json(TotpVerifyRequest {
                 totp_token: pending.clone(),
                 code: code.clone(),
@@ -1397,6 +1433,7 @@ mod totp_verify_hardening_tests {
         let code2 = totp.generate_current().expect("code");
         let replay = verify_totp(
             State(state.clone()),
+            HeaderMap::new(),
             Json(TotpVerifyRequest {
                 totp_token: pending,
                 code: code2,
@@ -1455,6 +1492,7 @@ mod totp_verify_hardening_tests {
             handles.push(tokio::spawn(async move {
                 verify_totp(
                     State(st),
+                    HeaderMap::new(),
                     Json(TotpVerifyRequest {
                         totp_token: token,
                         code: "1YUU-4B8U".to_string(),
@@ -1490,6 +1528,193 @@ mod totp_verify_hardening_tests {
         assert!(
             codes.iter().all(|c| c.is_empty()),
             "the consumed backup-code slot must be cleared"
+        );
+    }
+}
+
+/// DB-backed tests for the auth-event audit trail added in #386 (#1617
+/// Phase 1): TOTP enable, disable and login-verify must each emit the right
+/// audit rows, while a failed 2FA verify emits `LOGIN_FAILED`. Each test
+/// no-ops when `DATABASE_URL` is unset (`tdh::try_pool`).
+#[cfg(test)]
+mod totp_audit_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Pick a 6-digit code guaranteed to differ from the live TOTP code so the
+    /// verify path takes the failure branch deterministically.
+    fn wrong_code(current: &str) -> String {
+        if current == "000000" {
+            "111111".to_string()
+        } else {
+            "000000".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn enable_totp_emits_totp_enabled_and_sessions_invalidated() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let user_id = fx.user.id;
+        let auth = tdh::make_auth(user_id, &fx.user.username);
+        let totp = build_totp(fx.secret_bytes.clone(), fx.user.username.clone()).expect("totp");
+        let code = totp.generate_current().expect("code");
+
+        let res = enable_totp(
+            State(fx.state.clone()),
+            Extension(auth),
+            Json(TotpCodeRequest { code }),
+        )
+        .await;
+
+        let enabled = tdh::audit_count(&pool, user_id, "TOTP_ENABLED").await;
+        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(res.is_ok(), "enable_totp failed: {:?}", res.err());
+        assert_eq!(enabled, 1, "enable_totp MUST write one TOTP_ENABLED row");
+        assert_eq!(
+            invalidated, 1,
+            "enable_totp MUST write one SESSIONS_INVALIDATED row"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_totp_emits_totp_disabled_and_sessions_invalidated() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let user_id = fx.user.id;
+        let password = "Disable!2026pw";
+        let hash = bcrypt::hash(password, 4).expect("hash password");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&hash)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed password hash");
+        let auth = tdh::make_auth(user_id, &fx.user.username);
+        let totp = build_totp(fx.secret_bytes.clone(), fx.user.username.clone()).expect("totp");
+        let code = totp.generate_current().expect("code");
+
+        let res = disable_totp(
+            State(fx.state.clone()),
+            Extension(auth),
+            Json(TotpDisableRequest {
+                password: password.to_string(),
+                code,
+            }),
+        )
+        .await;
+
+        let disabled = tdh::audit_count(&pool, user_id, "TOTP_DISABLED").await;
+        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(res.is_ok(), "disable_totp failed: {:?}", res.err());
+        assert_eq!(disabled, 1, "disable_totp MUST write one TOTP_DISABLED row");
+        assert_eq!(
+            invalidated, 1,
+            "disable_totp MUST write one SESSIONS_INVALIDATED row"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_totp_success_emits_login_and_wrong_code_emits_login_failed() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let user_id = fx.user.id;
+        let svc = AuthService::new(pool.clone(), Arc::new(fx.state.config.clone()));
+        let totp = build_totp(fx.secret_bytes.clone(), fx.user.username.clone()).expect("totp");
+
+        // Wrong-code attempt -> LOGIN_FAILED (fresh single-use pending token).
+        let bad_pending = svc.generate_totp_pending_token(&fx.user).expect("pending");
+        let current = totp.generate_current().expect("code");
+        let bad = verify_totp(
+            State(fx.state.clone()),
+            HeaderMap::new(),
+            Json(TotpVerifyRequest {
+                totp_token: bad_pending,
+                code: wrong_code(&current),
+            }),
+        )
+        .await;
+
+        // Successful verify -> LOGIN (a second fresh pending token + live code).
+        let ok_pending = svc.generate_totp_pending_token(&fx.user).expect("pending");
+        let code = totp.generate_current().expect("code");
+        let ok = verify_totp(
+            State(fx.state.clone()),
+            HeaderMap::new(),
+            Json(TotpVerifyRequest {
+                totp_token: ok_pending,
+                code,
+            }),
+        )
+        .await;
+
+        let logins = tdh::audit_count(&pool, user_id, "LOGIN").await;
+        let failed = tdh::audit_count(&pool, user_id, "LOGIN_FAILED").await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(bad.is_err(), "wrong TOTP code must be rejected");
+        assert!(
+            ok.is_ok(),
+            "verify with live code must succeed: {:?}",
+            ok.err()
+        );
+        assert_eq!(logins, 1, "successful TOTP verify MUST write one LOGIN row");
+        assert_eq!(
+            failed, 1,
+            "a wrong-code TOTP verify MUST write one LOGIN_FAILED row"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_totp_on_non_2fa_user_emits_login_failed() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let user_id = fx.user.id;
+        // Flip the DB row so the handler takes the "TOTP not enabled" branch.
+        sqlx::query("UPDATE users SET totp_enabled = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("clear totp_enabled");
+        let svc = AuthService::new(pool.clone(), Arc::new(fx.state.config.clone()));
+        let pending = svc.generate_totp_pending_token(&fx.user).expect("pending");
+
+        let res = verify_totp(
+            State(fx.state.clone()),
+            HeaderMap::new(),
+            Json(TotpVerifyRequest {
+                totp_token: pending,
+                code: "000000".to_string(),
+            }),
+        )
+        .await;
+
+        let failed = tdh::audit_count(&pool, user_id, "LOGIN_FAILED").await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(
+            res.is_err(),
+            "verify against a non-2FA user must be rejected"
+        );
+        assert_eq!(
+            failed, 1,
+            "a TOTP verify against a user without 2FA MUST write one LOGIN_FAILED row"
         );
     }
 }

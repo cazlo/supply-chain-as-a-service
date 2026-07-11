@@ -474,7 +474,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         let result = require_auth(Some(auth.clone()));
         assert!(result.is_ok());
@@ -496,7 +497,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 

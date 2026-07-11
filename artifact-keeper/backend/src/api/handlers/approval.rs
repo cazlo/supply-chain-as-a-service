@@ -1592,6 +1592,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1615,6 +1617,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1648,6 +1652,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1671,6 +1677,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1703,6 +1711,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1726,6 +1736,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -2163,7 +2175,8 @@ mod tests {
                 is_api_token: false,
                 is_service_account: false,
                 scopes: None,
-                allowed_repo_ids: None,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+                iat_ms: None,
             }
         }
 

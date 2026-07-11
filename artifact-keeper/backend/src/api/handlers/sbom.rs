@@ -12,11 +12,21 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::models::sbom::{
     CveStatus, CveTrends, LicensePolicy, PolicyAction, SbomComponent, SbomDocument, SbomFormat,
 };
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::sbom_service::{DependencyInfo, LicenseCheckResult, SbomService};
+
+/// Not-found message for artifact-scoped analysis endpoints (SBOM generate,
+/// CVE history). A bare "Artifact not found" was confusing for proxy-cached
+/// (Remote) objects: those are listed with a synthetic, SHA-256-derived id and
+/// have no row in the `artifacts` table (#1280/#1278), so SBOM/scan lookups by
+/// `artifacts.id` can never resolve them even though the object is visible in
+/// the listing. This message distinguishes that expected case from a genuine
+/// missing id and tells the caller what actually works. (#2227)
+pub(crate) const ARTIFACT_NOT_ANALYZABLE_MSG: &str = "Artifact not found or not eligible for analysis: SBOM generation and security scanning are available only for artifacts hosted in this registry, not proxy-cached remote artifacts.";
 
 /// Emit an audit log entry for an SBOM action against an artifact. Failures
 /// are logged but never propagated: the mutation/read is already complete and
@@ -352,7 +362,7 @@ async fn generate_sbom(
             .fetch_optional(&state.db)
             .await
             .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
-            .ok_or_else(|| AppError::NotFound("Artifact not found".into()))?;
+            .ok_or_else(|| AppError::NotFound(ARTIFACT_NOT_ANALYZABLE_MSG.into()))?;
 
     // If force_regenerate, delete existing SBOM first
     if body.force_regenerate {
@@ -453,7 +463,7 @@ async fn list_sboms(
         // narrow by repository or artifact. Listing all SBOMs would let
         // a token scoped to repo A enumerate dep trees of every other
         // repo. Force the caller to be explicit about the repo scope.
-        if auth.is_api_token && auth.allowed_repo_ids.is_some() {
+        if auth.is_api_token && matches!(auth.allowed_repo_ids, AccessScope::Restricted(_)) {
             return Err(AppError::Validation(
                 "Scope-restricted tokens must filter by repository_id or artifact_id".into(),
             ));
@@ -891,7 +901,7 @@ async fn get_cve_history(
         }
         CveHistoryPath::Cve(cve_id) => {
             let entries = service
-                .get_cve_history_by_cve_id(&cve_id, auth.allowed_repo_ids.as_deref())
+                .get_cve_history_by_cve_id(&cve_id, auth.access_scope())
                 .await?;
             Ok(Json(entries))
         }
@@ -972,7 +982,7 @@ async fn get_cve_history_by_cve(
     }
     let service = SbomService::new(state.db.clone());
     let entries = service
-        .get_cve_history_by_cve_id(&cve_id, auth.allowed_repo_ids.as_deref())
+        .get_cve_history_by_cve_id(&cve_id, auth.access_scope())
         .await?;
     Ok(Json(entries))
 }
@@ -1020,7 +1030,7 @@ async fn update_cve_status(
             status,
             Some(auth.user_id),
             body.reason.as_deref(),
-            auth.allowed_repo_ids.as_deref(),
+            auth.access_scope(),
         )
         .await
         .map_err(|e| match e {
@@ -1600,7 +1610,7 @@ async fn ensure_artifact_repo_access(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-    require_repo_access(auth, repo_id, "Artifact not found")
+    require_repo_access(auth, repo_id, ARTIFACT_NOT_ANALYZABLE_MSG)
 }
 
 /// Like [`ensure_artifact_repo_access`] but resolves through `sbom_documents`
@@ -2218,7 +2228,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -2329,7 +2340,8 @@ mod tests {
             is_api_token,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: allowed,
+            allowed_repo_ids: AccessScope::from(allowed),
+            iat_ms: None,
         }
     }
 
@@ -2341,6 +2353,27 @@ mod tests {
         let auth = make_auth(None, false);
         let err = require_repo_access(&auth, None, "SBOM not found").unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_artifact_analysis_missing_uses_honest_not_analyzable_message() {
+        // #2227: the artifact-scoped analysis endpoints (SBOM generate, CVE
+        // history) no longer return a bare "Artifact not found". When the id
+        // has no `artifacts` row -- e.g. the synthetic id a Remote repo lists
+        // for a proxy-cached object -- the caller must learn that analysis is
+        // only available for hosted artifacts. Pin the exact wording that
+        // `ensure_artifact_repo_access` (and `generate_sbom`) surface.
+        let auth = make_auth(None, false);
+        let err = require_repo_access(&auth, None, ARTIFACT_NOT_ANALYZABLE_MSG).unwrap_err();
+        match err {
+            AppError::NotFound(msg) => {
+                assert_eq!(msg, ARTIFACT_NOT_ANALYZABLE_MSG);
+                assert!(msg.contains("hosted in this registry"));
+                assert!(msg.contains("proxy-cached remote artifacts"));
+                assert_ne!(msg, "Artifact not found");
+            }
+            other => panic!("expected NotFound with the honest message, got {:?}", other),
+        }
     }
 
     #[test]
@@ -3190,7 +3223,7 @@ mod tests {
         // Build an auth extension whose allowed_repo_ids does NOT include
         // the fixture's repo. Mirror tdh::make_auth then tighten scopes.
         let mut auth = tdh::make_auth(fx.user_id, &fx.username);
-        auth.allowed_repo_ids = Some(vec![Uuid::new_v4()]);
+        auth.allowed_repo_ids = AccessScope::Restricted(vec![Uuid::new_v4()]);
 
         let result = super::update_cve_status_by_artifact_cve(
             axum::extract::State(fx.state.clone()),

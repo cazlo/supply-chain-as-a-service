@@ -52,9 +52,23 @@ spec:
     metadata:
       labels: { app: ${name} }
     spec:
+      # Pin the test DB to the jarvis builders' node. Unpinned, the scheduler
+      # routinely placed it on the skynet nodes while tests ran on jarvis:
+      # every query paid LAN RTT, and worse, DB-clock-stamped watermarks
+      # (DEFAULT NOW()) versus app-clock timestamps raced across NTP skew —
+      # the same-second invalidation flake was exactly that. Same-node keeps
+      # one clock domain for the jarvis runs; skynet runs are deliberately
+      # cross-node (accepted noise; jarvis is the box that matters here).
+      nodeSelector:
+        kubernetes.io/hostname: jarvis-dev
       containers:
         - name: postgres
           image: postgres:16-alpine
+          # 16 test threads roughly double peak connections vs the stock
+          # max_connections=100 ceiling. Prometheus shows peak working set
+          # across the 8-thread soak was ~116MiB, so 1Gi stays ample even at
+          # 300 connections; the limit is deliberately NOT raised.
+          args: ["-c", "max_connections=300", "-c", "shared_buffers=256MB"]
           env:
             - { name: POSTGRES_USER, value: registry }
             - { name: POSTGRES_PASSWORD, value: registry }
@@ -65,7 +79,7 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 30
           resources:
-            requests: { cpu: 250m, memory: 256Mi }
+            requests: { cpu: "1", memory: 256Mi }
             limits: { memory: 1Gi }
 ---
 apiVersion: v1
@@ -101,6 +115,7 @@ build_args=(
   --build-arg "COVERAGE_BASE=${coverage_base}"
   --build-arg "NEW_CODE_MIN=${NEW_CODE_MIN:-70}"
   --build-arg "TOTAL_MIN=${TOTAL_MIN:-50}"
+  --build-arg "COVERAGE_TEST_THREADS=${COVERAGE_TEST_THREADS:-8}"
 )
 if [[ "${mode}" == "integration" ]]; then
   build_args+=(--build-arg "TEST=${test_target}")

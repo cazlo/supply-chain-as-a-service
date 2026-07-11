@@ -1793,6 +1793,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2973,6 +2975,13 @@ mod tests {
             let chunks: Vec<crate::error::Result<Bytes>> = vec![Ok(first), Ok(second)];
             Ok(Box::pin(futures::stream::iter(chunks)))
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     /// A target backend that captures whatever was streamed into it via
@@ -3200,7 +3209,8 @@ mod tests {
                 is_api_token: false,
                 is_service_account: false,
                 scopes: None,
-                allowed_repo_ids: None,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+                iat_ms: None,
             }
         }
 
@@ -3217,7 +3227,8 @@ mod tests {
                 is_api_token: true,
                 is_service_account: true,
                 scopes: Some(scopes.iter().map(|s| s.to_string()).collect()),
-                allowed_repo_ids: None,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+                iat_ms: None,
             }
         }
 

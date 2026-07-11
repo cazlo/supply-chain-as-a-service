@@ -22,8 +22,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -32,6 +30,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::curation_service::version_compare;
 
@@ -402,12 +401,13 @@ async fn registration_index(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await?;
                 return Ok(Response::builder()
@@ -431,12 +431,13 @@ async fn registration_index(
                     let Some(upstream_url) = member.upstream_url.as_deref() else {
                         continue;
                     };
-                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
                         &member.key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await
                     {
@@ -571,12 +572,13 @@ async fn flatcontainer_versions(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
                     &upstream_path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
                 .await?;
                 return Ok(Response::builder()
@@ -600,12 +602,13 @@ async fn flatcontainer_versions(
                     let Some(upstream_url) = member.upstream_url.as_deref() else {
                         continue;
                     };
-                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                    if let Ok((content, content_type)) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
                         &member.key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await
                     {
@@ -678,12 +681,13 @@ async fn flatcontainer_download(
                         "v3/flatcontainer/{}/{}/{}",
                         package_id_lower, version, filename
                     );
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                     )
                     .await?;
                     return Ok(Response::builder()
@@ -773,12 +777,13 @@ async fn flatcontainer_download(
                                 "v3/flatcontainer/{}/{}/{}",
                                 package_id_lower, version, filename
                             );
-                            let (bytes, _content_type) = proxy_helpers::proxy_fetch(
+                            let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped(
                                 proxy,
                                 repo.id,
                                 &repo_key,
                                 upstream_url,
                                 &upstream_path,
+                                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                             )
                             .await?;
                             Ok(bytes)
@@ -844,7 +849,7 @@ async fn push_package(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce write scope before doing anything else.
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
@@ -866,32 +871,87 @@ async fn push_package(
                 ("apikey".to_string(), api_key.to_string())
             };
             let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-            let (user, _) = auth_service
-                .authenticate(&username, &password)
-                .await
-                .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?;
-            user.id
+            if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
+                user.id
+            } else if let Ok(validation) = auth_service.validate_api_token(&password).await {
+                validation.user.id
+            } else if let Ok(claims) = auth_service.validate_access_token_async(&password).await {
+                let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                    .bind(claims.sub)
+                    .fetch_optional(&state.db)
+                    .await
+                    .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?
+                    .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?;
+                user.id
+            } else {
+                return Err((StatusCode::UNAUTHORIZED, "Invalid API key").into_response());
+            }
         }
     };
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // The body may be multipart/form-data or raw binary .nupkg.
-    let nupkg_bytes = extract_nupkg_bytes(&headers, body)?;
+    // Ingest the body as a stream — dotnet sends multipart/form-data, other
+    // clients (curl, older tooling) send the raw .nupkg. Both spool to a bounded
+    // scratch file while computing SHA-256/SHA-1/MD5 incrementally, never
+    // buffering the whole package in memory.
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let (staged, digests) = if content_type.contains("multipart/form-data") {
+        // Streaming-multipart branch: parse the envelope off the body stream
+        // (no full-body buffer) and spool the first file part.
+        let boundary = multer::parse_boundary(content_type)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Missing multipart boundary").into_response())?;
+        let mut multipart = multer::Multipart::new(body.into_data_stream(), boundary);
+        let field = multipart
+            .next_field()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid multipart body: {e}"),
+                )
+                    .into_response()
+            })?
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid multipart body").into_response())?;
+        proxy_helpers::stage_stream_content_addressed(&state, field).await?
+    } else {
+        // Raw-binary branch: the entire body is the .nupkg.
+        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?
+    };
 
-    if nupkg_bytes.is_empty() {
+    if staged.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty package body").into_response());
     }
 
-    // Parse .nuspec from the .nupkg (ZIP archive).
-    let nuspec = parse_nuspec_from_nupkg(&nupkg_bytes).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Failed to read .nuspec from package: {}", e),
-        )
-            .into_response()
-    })?;
+    // Parse .nuspec from the SEEKABLE staged file (the ZIP reader needs
+    // Read + Seek); run the blocking archive read off the async runtime.
+    let nuspec = {
+        let staged_path = staged.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&staged_path)
+                .map_err(|e| format!("Cannot open staged package: {e}"))?;
+            parse_nuspec_from_reader(file)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("nuspec parse task failed: {e}"),
+            )
+                .into_response()
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read .nuspec from package: {e}"),
+            )
+                .into_response()
+        })?
+    };
 
     let package_id = nuspec.id.to_lowercase();
     let version = nuspec.version.clone();
@@ -904,58 +964,38 @@ async fn push_package(
             .into_response());
     }
 
-    // Check for duplicate.
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND LOWER(name) = $2 AND version = $3 AND is_deleted = false",
-        repo.id,
-        package_id,
-        version
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        crate::api::handlers::db_err(e)
-    })?;
-
-    if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Package {}.{} already exists", package_id, version),
-        )
-            .into_response());
-    }
-
-    // Compute SHA256.
-    let mut hasher = Sha256::new();
-    hasher.update(&nupkg_bytes);
-    let checksum = format!("{:x}", hasher.finalize());
-
-    let size_bytes = nupkg_bytes.len() as i64;
+    let size_bytes = staged.size_bytes();
     let filename = format!("{}.{}.nupkg", package_id, version);
     let artifact_path = format!("{}/{}/{}", package_id, version, filename);
-    let storage_key = format!("nuget/{}/{}/{}", package_id, version, filename);
 
-    super::cleanup_soft_deleted_artifact_checked(
-        &state.db,
-        &crate::models::repository::RepositoryFormat::Nuget,
-        repo.id,
-        &artifact_path,
-        &checksum,
-    )
-    .await
-    .map_err(|e| e.into_response())?;
-
-    // Store the file.
+    // Converge onto the shared content-addressed streaming service method:
+    // deduplication, the release-immutability backstop (a duplicate id.version or
+    // a different-bytes swap of a released coordinate -> 409), ON CONFLICT
+    // tombstone resurrection, quarantine hold, and peer sync fan-out. New uploads
+    // store under the content-addressed SHA-256 key; OLD `nuget/...` rows keep
+    // their storage_key (download reads storage_key per-row) — no migration.
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, nupkg_bytes).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
+    let artifact_service = state.create_artifact_service(storage);
+    let content_stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+    let artifact = artifact_service
+        .upload_stream_with_sync_options(
+            repo.id,
+            &artifact_path,
+            &package_id,
+            Some(&version),
+            "application/octet-stream",
+            content_stream,
+            digests,
+            size_bytes,
+            Some(user_id),
+            true,
         )
-            .into_response()
-    })?;
+        .await
+        .map_err(|e| e.into_response())?;
+    // Scratch file no longer needed once the service has consumed the stream.
+    drop(staged);
 
     // Build metadata JSON.
     let metadata = serde_json::json!({
@@ -966,33 +1006,6 @@ async fn push_package(
         "filename": filename,
     });
 
-    // Insert artifact record.
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        package_id,
-        version,
-        size_bytes,
-        checksum,
-        "application/octet-stream",
-        storage_key,
-        user_id,
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(crate::api::handlers::db_err)?;
-
-    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
-        .await;
-
     // Store metadata.
     let _ = sqlx::query!(
         r#"
@@ -1000,7 +1013,7 @@ async fn push_package(
         VALUES ($1, 'nuget', $2)
         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
         "#,
-        artifact_id,
+        artifact.id,
         metadata,
     )
     .execute(&state.db)
@@ -1019,7 +1032,7 @@ async fn push_package(
             &nuspec.id,
             &version,
             size_bytes,
-            &checksum,
+            &artifact.checksum_sha256,
             description,
             Some(serde_json::json!({ "format": "nuget" })),
         )
@@ -1048,80 +1061,6 @@ async fn push_package(
 // .nupkg / .nuspec helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the .nupkg bytes from the request body.
-/// Handles both raw binary upload and multipart/form-data.
-#[allow(clippy::result_large_err)]
-fn extract_nupkg_bytes(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Response> {
-    let content_type = headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if content_type.contains("multipart/form-data") {
-        // For multipart, we need to find the boundary and extract the file part.
-        // The `dotnet nuget push` client sends multipart/form-data with the
-        // .nupkg as the file field. We do a simple boundary-based extraction.
-        extract_nupkg_from_multipart(content_type, &body)
-    } else {
-        // Raw binary body — the entire body is the .nupkg.
-        Ok(body)
-    }
-}
-
-/// Simple multipart extraction: find the file content between boundaries.
-#[allow(clippy::result_large_err)]
-fn extract_nupkg_from_multipart(content_type: &str, body: &[u8]) -> Result<Bytes, Response> {
-    // Extract boundary from content-type header.
-    let boundary = content_type
-        .split(';')
-        .find_map(|part| {
-            let trimmed = part.trim();
-            trimmed
-                .strip_prefix("boundary=")
-                .map(|b| b.trim_matches('"').to_string())
-        })
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing multipart boundary").into_response())?;
-
-    let boundary_marker = format!("--{}", boundary);
-    let boundary_bytes = boundary_marker.as_bytes();
-
-    // Find first boundary.
-    let start = find_subsequence(body, boundary_bytes)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid multipart body").into_response())?;
-
-    // Skip past the boundary line to the part headers.
-    let after_boundary = start + boundary_bytes.len();
-
-    // Find the blank line (\r\n\r\n) that separates headers from content.
-    let header_end = find_subsequence(&body[after_boundary..], b"\r\n\r\n").ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Invalid multipart part headers").into_response()
-    })?;
-
-    let content_start = after_boundary + header_end + 4; // skip \r\n\r\n
-
-    // Find the next boundary.
-    let content_end = find_subsequence(&body[content_start..], boundary_bytes)
-        .map(|pos| content_start + pos)
-        .unwrap_or(body.len());
-
-    // Strip trailing \r\n before the boundary.
-    let end =
-        if content_end >= 2 && body[content_end - 2] == b'\r' && body[content_end - 1] == b'\n' {
-            content_end - 2
-        } else {
-            content_end
-        };
-
-    Ok(Bytes::copy_from_slice(&body[content_start..end]))
-}
-
-/// Find the position of a subsequence within a byte slice.
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 /// Metadata extracted from a .nuspec file.
 struct NuspecInfo {
     id: String,
@@ -1131,11 +1070,15 @@ struct NuspecInfo {
 }
 
 /// Parse the .nuspec XML from inside a .nupkg (ZIP) archive.
-/// Uses simple string matching rather than a full XML parser.
-fn parse_nuspec_from_nupkg(nupkg: &[u8]) -> Result<NuspecInfo, String> {
-    let cursor = std::io::Cursor::new(nupkg);
+///
+/// Reads directly from any `Read + Seek` source — the streaming push path passes
+/// the SEEKABLE staged scratch `File` so the archive is never re-buffered in
+/// memory. Uses simple string matching rather than a full XML parser.
+fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
+    reader: R,
+) -> Result<NuspecInfo, String> {
     let mut archive =
-        zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid ZIP archive: {}", e))?;
+        zip::ZipArchive::new(reader).map_err(|e| format!("Invalid ZIP archive: {}", e))?;
 
     // Find the .nuspec file inside the archive.
     let mut nuspec_xml = String::new();
@@ -1183,17 +1126,143 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     Some(content[..end_pos].trim().to_string())
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
-    use bytes::Bytes;
-
+    use axum::body::to_bytes;
     use axum::http::HeaderValue;
+    use bytes::Bytes;
+    use chrono::Utc;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+
+    fn lazy_pool() -> sqlx::PgPool {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    fn test_state_with_secret(secret: &str) -> SharedState {
+        let config = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
+
+        let storage_root =
+            std::env::temp_dir().join(format!("ak-nuget-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_root).expect("create temp storage dir");
+
+        let storage: Arc<dyn crate::storage::StorageBackend> =
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                storage_root.to_str().expect("utf8 storage path"),
+            ));
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+
+        Arc::new(crate::api::AppState::new(
+            config,
+            lazy_pool(),
+            storage,
+            registry,
+        ))
+    }
+
+    fn mint_access_jwt(secret: &str, username: &str) -> String {
+        let now = Utc::now().timestamp();
+        let claims = crate::services::auth_service::Claims {
+            sub: uuid::Uuid::new_v4(),
+            username: username.to_string(),
+            email: format!("{}@example.test", username),
+            is_admin: false,
+            allowed_repo_ids: None,
+            iat: now,
+            iat_ms: Some(Utc::now().timestamp_millis()),
+            exp: now + 300,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode jwt")
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (test-only)
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_push_package_requires_nuget_api_key_when_unauthenticated() {
+        let state = test_state_with_secret("test-secret-at-least-32-bytes-long-for-testing");
+        let headers = HeaderMap::new();
+
+        let resp = push_package(
+            State(state),
+            Extension(None),
+            Path("nuget-test".to_string()),
+            headers,
+            Body::from("dummy"),
+        )
+        .await
+        .expect_err("missing api key should fail before repo resolution");
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "Authentication required"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_push_package_jwt_api_key_fallback_returns_invalid_key_on_db_error() {
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let state = test_state_with_secret(secret);
+        let jwt = mint_access_jwt(secret, "ci-user");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-NuGet-ApiKey",
+            HeaderValue::from_str(&format!("ci-user:{}", jwt)).expect("api key header"),
+        );
+
+        let resp = push_package(
+            State(state),
+            Extension(None),
+            Path("nuget-test".to_string()),
+            headers,
+            Body::from("dummy"),
+        )
+        .await
+        .expect_err("lazy pool should make JWT user lookup fail as invalid key");
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "Invalid API key");
+    }
 
     /// Build the base URL for NuGet service index resources.
     fn build_nuget_base_url(scheme: &str, host: &str, repo_key: &str) -> String {
@@ -1377,119 +1446,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // find_subsequence
+    // parse_nuspec_from_nupkg (byte-slice wrapper over parse_nuspec_from_reader)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_find_subsequence_found() {
-        let haystack = b"hello world";
-        let needle = b"world";
-        assert_eq!(find_subsequence(haystack, needle), Some(6));
+    /// Test-only convenience over [`parse_nuspec_from_reader`] for the existing
+    /// in-memory `.nupkg` fixtures. Production callers pass the seekable staged
+    /// `File` directly.
+    fn parse_nuspec_from_nupkg(nupkg: &[u8]) -> Result<NuspecInfo, String> {
+        parse_nuspec_from_reader(std::io::Cursor::new(nupkg))
     }
-
-    #[test]
-    fn test_find_subsequence_at_start() {
-        let haystack = b"hello world";
-        let needle = b"hello";
-        assert_eq!(find_subsequence(haystack, needle), Some(0));
-    }
-
-    #[test]
-    fn test_find_subsequence_not_found() {
-        let haystack = b"hello world";
-        let needle = b"xyz";
-        assert_eq!(find_subsequence(haystack, needle), None);
-    }
-
-    // NOTE: find_subsequence panics when needle is empty because
-    // haystack.windows(0) panics. This is a potential bug in production
-    // code if it ever receives an empty needle. Not fixing source code.
-    #[test]
-    #[should_panic(expected = "window size must be non-zero")]
-    fn test_find_subsequence_empty_needle_panics() {
-        let haystack = b"hello";
-        let needle = b"";
-        find_subsequence(haystack, needle);
-    }
-
-    #[test]
-    fn test_find_subsequence_needle_longer_than_haystack() {
-        let haystack = b"hi";
-        let needle = b"hello world";
-        assert_eq!(find_subsequence(haystack, needle), None);
-    }
-
-    #[test]
-    fn test_find_subsequence_crlf() {
-        let haystack = b"header\r\n\r\nbody";
-        let needle = b"\r\n\r\n";
-        assert_eq!(find_subsequence(haystack, needle), Some(6));
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_nupkg_bytes
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_nupkg_bytes_raw_body() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        let body = Bytes::from_static(b"raw nupkg content");
-        let result = extract_nupkg_bytes(&headers, body.clone()).unwrap();
-        assert_eq!(result, body);
-    }
-
-    #[test]
-    fn test_extract_nupkg_bytes_no_content_type() {
-        let headers = HeaderMap::new();
-        let body = Bytes::from_static(b"raw content");
-        let result = extract_nupkg_bytes(&headers, body.clone()).unwrap();
-        assert_eq!(result, body);
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_nupkg_from_multipart
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_nupkg_from_multipart_valid() {
-        let boundary = "----boundary123";
-        let content_type = format!("multipart/form-data; boundary={}", boundary);
-        let body = "------boundary123\r\n\
-             Content-Disposition: form-data; name=\"file\"; filename=\"pkg.nupkg\"\r\n\
-             Content-Type: application/octet-stream\r\n\
-             \r\n\
-             FILE_CONTENT_HERE\r\n\
-             ------boundary123--\r\n"
-            .to_string();
-        let result = extract_nupkg_from_multipart(&content_type, body.as_bytes());
-        assert!(result.is_ok());
-        let bytes = result.unwrap();
-        assert_eq!(bytes.as_ref(), b"FILE_CONTENT_HERE");
-    }
-
-    #[test]
-    fn test_extract_nupkg_from_multipart_missing_boundary() {
-        let content_type = "multipart/form-data";
-        let body = b"some body";
-        let result = extract_nupkg_from_multipart(content_type, body);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_nupkg_from_multipart_quoted_boundary() {
-        let content_type = "multipart/form-data; boundary=\"myboundary\"";
-        let body = b"--myboundary\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nDATA\r\n--myboundary--\r\n";
-        let result = extract_nupkg_from_multipart(content_type, body);
-        assert!(result.is_ok());
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_nuspec_from_nupkg
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_parse_nuspec_from_nupkg_valid() {
@@ -1616,7 +1581,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
@@ -2160,8 +2128,7 @@ mod push_db_tests {
     }
 
     /// Send a PUT to `uri` carrying `nupkg_bytes` as a raw application/octet
-    /// stream body (the path `extract_nupkg_bytes` takes when no multipart
-    /// boundary is present).
+    /// stream body (the raw-binary ingest branch, i.e. no multipart boundary).
     async fn put_nupkg(uri: String, nupkg_bytes: Vec<u8>) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::builder()
             .method("PUT")

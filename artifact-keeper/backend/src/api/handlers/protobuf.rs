@@ -438,6 +438,9 @@ async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
         repo_type: row.get("repo_type"),
         upstream_url: row.get("upstream_url"),
         promotion_only: row.try_get("promotion_only").unwrap_or(false),
+        format: "generic".to_string(),
+        age_gate_enabled: false,
+        age_gate_min_age_days: 7,
     })
 }
 
@@ -1319,12 +1322,18 @@ async fn download(
                     {
                         let digest = commit_digest.as_deref().unwrap_or("latest");
                         let upstream_path = format!("modules/{}/commits/{}", module_name, digest);
-                        let (bundle_data, _content_type) = proxy_helpers::proxy_fetch(
+                        // The protobuf bundle is inspected in full below
+                        // (`extract_files_from_bundle`), so it must be buffered
+                        // rather than streamed. Bound the buffered read at
+                        // 16 MiB (#1608 Phase 4b / #2181) so a hostile/broken
+                        // upstream cannot OOM the pod.
+                        let (bundle_data, _content_type) = proxy_helpers::proxy_fetch_capped(
                             proxy,
                             repo.id,
                             &repo_key,
                             upstream_url,
                             &upstream_path,
+                            proxy_helpers::LARGE_METADATA_MAX_BYTES,
                         )
                         .await?;
 

@@ -145,6 +145,7 @@ mod tests {
             username: "testuser".to_string(),
             email: "test@example.com".to_string(),
             is_admin,
+            allowed_repo_ids: None,
             iat: chrono::Utc::now().timestamp(),
             iat_ms: None,
             exp: chrono::Utc::now().timestamp() + 3600,
@@ -272,6 +273,7 @@ mod tests {
             username: "testuser".to_string(),
             email: "test@example.com".to_string(),
             is_admin: true,
+            allowed_repo_ids: None,
             iat,
             iat_ms: Some(iat.saturating_mul(1000)),
             exp: iat + 3600,
@@ -312,6 +314,7 @@ mod tests {
             username: "forged".to_string(),
             email: "forged@test.local".to_string(),
             is_admin,
+            allowed_repo_ids: None,
             iat: chrono::Utc::now().timestamp(),
             iat_ms: Some(chrono::Utc::now().timestamp_millis()),
             exp: chrono::Utc::now().timestamp() + 3600,
@@ -331,13 +334,17 @@ mod tests {
     async fn insert_user(pool: &PgPool, is_admin: bool) -> Uuid {
         let id = Uuid::new_v4();
         let username = format!("grpc_{}", &id.to_string()[..8]);
+        // `privileges_changed_at` (migration 131, DEFAULT NOW()) is part of
+        // the credential-change watermark; backdate it with the other
+        // credential columns or tokens minted right after this insert race
+        // the watermark and intermittently fail validation under load.
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, auth_provider, \
              is_admin, is_active, failed_login_attempts, password_changed_at, \
-             created_at, updated_at) \
+             privileges_changed_at, created_at, updated_at) \
              VALUES ($1, $2, $3, 'unused', 'local', $4, true, 0, \
              NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
-             NOW() - INTERVAL '60 seconds')",
+             NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds')",
         )
         .bind(id)
         .bind(&username)

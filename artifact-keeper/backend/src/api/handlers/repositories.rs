@@ -28,6 +28,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::formats::maven::MavenHandler;
+use crate::models::access_scope::AccessScope;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::cache_classifier;
@@ -408,6 +409,17 @@ pub struct CreateRepositoryRequest {
     /// the sparse index but `https://crates.io` for tarball downloads).
     /// Stored in `repository_config` under the key `index_upstream_url`.
     pub index_upstream_url: Option<String>,
+    /// Override the PyPI simple-index prefix for upstreams that do not follow
+    /// the standard PEP 503 `/simple/` layout (issue #1546).
+    ///
+    /// - Omit or `"simple"` — standard PEP 503 (pypi.org, devpi, Nexus). Default.
+    /// - `""` (empty) — flat CDN (e.g. `https://download.pytorch.org/whl/cpu`):
+    ///   package files are served directly under the upstream root with no prefix.
+    /// - Any other non-empty string — custom index prefix.
+    ///
+    /// Stored in `repository_config` under `pypi_upstream_index_path`.
+    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    pub pypi_upstream_index_path: Option<String>,
     /// Member repositories to add when creating a virtual repository.
     /// Each entry specifies a repository key and optional priority.
     pub member_repos: Option<Vec<CreateVirtualMemberInput>>,
@@ -460,6 +472,11 @@ pub struct UpdateRepositoryRequest {
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
+    /// Update the PyPI simple-index prefix (stored in `repository_config` under
+    /// `pypi_upstream_index_path`). Pass `""` for flat CDN layout, `"simple"` to
+    /// restore the PEP 503 default, or any other non-empty string for a custom prefix.
+    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    pub pypi_upstream_index_path: Option<String>,
     /// Enable or disable quarantine period for this repository.
     /// When enabled, newly uploaded artifacts are held until scanned.
     /// Stored in `repository_config` under `quarantine_enabled`.
@@ -1211,9 +1228,12 @@ pub async fn list_repositories(
         // allowed repositories, not every repo the owning user can reach.
         // Checked before the general `User` arm. Admin tokens are handled
         // above and bypass scope restrictions.
-        Some(a) if a.allowed_repo_ids.is_some() => {
-            RepoVisibility::Ids(a.allowed_repo_ids.clone().unwrap_or_default())
-        }
+        Some(a) if matches!(a.allowed_repo_ids, AccessScope::Restricted(_)) => RepoVisibility::Ids(
+            a.allowed_repo_ids
+                .as_allowed_repo_ids()
+                .unwrap_or_default()
+                .to_vec(),
+        ),
         Some(a) => RepoVisibility::User(a.user_id),
     };
     let service = RepositoryService::new(state.db.clone());
@@ -1406,6 +1426,10 @@ pub async fn create_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
+    if let Some(ref index_path) = payload.pypi_upstream_index_path {
+        upsert_repo_config(&state.db, repo.id, "pypi_upstream_index_path", index_path).await?;
+    }
+
     // Add virtual repository members. Post-#1444, the validator accepts
     // `member_repos == None` (deferred-population pattern: caller will
     // POST /members later) and only rejects `Some(empty_vec)`. Treat the
@@ -1593,17 +1617,12 @@ pub async fn update_repository(
         )
         .await?;
 
-    // Invalidate the in-memory repo cache so that visibility changes take
-    // effect immediately instead of waiting for the TTL to expire. Remove
-    // both the old key and the new key (in case the key was renamed).
-    {
-        let mut cache = state.repo_cache.write().await;
-        cache.remove(&key);
-        cache.remove(&repo.key);
-    }
-
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
+    }
+
+    if let Some(ref index_path) = payload.pypi_upstream_index_path {
+        upsert_repo_config(&state.db, repo.id, "pypi_upstream_index_path", index_path).await?;
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
@@ -1671,6 +1690,19 @@ pub async fn update_repository(
         }
     }
 
+    // Invalidate the in-memory repo cache so that visibility changes take
+    // effect immediately instead of waiting for the TTL to expire. Remove
+    // both the old key and the new key (in case the key was renamed). This
+    // must run AFTER every repository/config write above: evicting before
+    // the repository_config upserts let a concurrent request repopulate the
+    // entry with the old index_upstream_url mid-update. Cross-replica
+    // eviction is handled by the migration-142 repository_changed trigger.
+    {
+        let mut cache = state.repo_cache.write().await;
+        cache.remove(&key);
+        cache.remove(&repo.key);
+    }
+
     let storage_used = service.get_storage_usage(repo.id).await?;
 
     state.event_bus.emit_repository_event(
@@ -1685,51 +1717,103 @@ pub async fn update_repository(
     Ok(Json(response))
 }
 
-/// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
-/// objects from storage before the repository row is deleted.
+/// Batch size for [`collect_repo_oci_upload_temp_keys`]: the union of a
+/// repository's cleanup-key/session/part storage keys is drained in bounded
+/// chunks of this size instead of one unbounded query, so a repository with a
+/// very large cleanup-key backlog cannot force a single pathological SELECT
+/// (#1533 F2).
+const OCI_UPLOAD_TEMP_KEY_BATCH: i64 = 1000;
+
+/// Collect the storage keys of a repository's in-flight / abandoned OCI upload
+/// temp objects: the `oci_upload_cleanup_keys` journal plus (belt-and-braces)
+/// the session `storage_temp_key`s and per-part `storage_key`s, in case a
+/// storage write predated its journal row.
 ///
-/// `oci_upload_cleanup_keys`, `oci_upload_sessions`, and `oci_upload_parts` all
-/// `ON DELETE CASCADE` with `repositories`, so once the repo row is gone their
-/// storage objects lose their only discoverable owner and become permanent
-/// orphans that storage-GC can never reclaim. We delete them up front. Failures
-/// are logged but never block repository deletion.
-async fn purge_repo_oci_upload_temp_objects(
+/// This MUST run BEFORE the repository row is deleted. `oci_upload_cleanup_keys`
+/// and `oci_upload_sessions` both `ON DELETE CASCADE` with `repositories` (and
+/// `oci_upload_parts` cascades from the session), so once the repo row is gone
+/// these rows are too and the storage keys are no longer discoverable. The
+/// caller purges the returned keys from storage only AFTER a successful delete
+/// (see [`purge_oci_upload_temp_objects`]), so a delete that fails leaves the
+/// temp objects in place to be retried (#1533 GC-LOW-2).
+///
+/// The (deduplicated) union is drained with keyset pagination in bounded
+/// batches of [`OCI_UPLOAD_TEMP_KEY_BATCH`] so a repository with a very large
+/// backlog never issues one unbounded query (#1533 F2). A DB error is logged
+/// and ends collection.
+async fn collect_repo_oci_upload_temp_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    // Keyset cursor over storage_key (unique within the union set); "" precedes
+    // every real key ("oci-uploads/…"), so the first page starts at the top.
+    let mut after = String::new();
+    loop {
+        let batch: Vec<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM ( \
+                 SELECT storage_key FROM oci_upload_cleanup_keys WHERE repository_id = $1 \
+                 UNION SELECT storage_temp_key FROM oci_upload_sessions WHERE repository_id = $1 \
+                 UNION SELECT p.storage_key FROM oci_upload_parts p \
+                   JOIN oci_upload_sessions s ON s.id = p.upload_session_id \
+                  WHERE s.repository_id = $1 \
+             ) AS temp_keys \
+             WHERE storage_key > $2 \
+             ORDER BY storage_key \
+             LIMIT $3",
+        )
+        .bind(repo_id)
+        .bind(&after)
+        .bind(OCI_UPLOAD_TEMP_KEY_BATCH)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                repo_id = %repo_id,
+                error = %e,
+                "Failed to list OCI upload temp keys to purge for repository delete"
+            );
+            Vec::new()
+        });
+        let full_page = batch.len() as i64 == OCI_UPLOAD_TEMP_KEY_BATCH;
+        if let Some(last) = batch.last() {
+            after = last.clone();
+        }
+        keys.extend(batch);
+        // A short (or empty) page means the backlog is drained.
+        if !full_page {
+            break;
+        }
+    }
+    keys
+}
+
+/// Best-effort purge of a repository's in-flight / abandoned OCI upload temp
+/// objects from storage, given the keys previously gathered by
+/// [`collect_repo_oci_upload_temp_keys`].
+///
+/// Called AFTER a successful `service.delete(repo.id)`: purging only once the
+/// delete has committed means a delete that fails does not prematurely destroy
+/// an in-flight upload's temp objects while the repository survives (#1533
+/// GC-LOW-2). Failures (storage resolution and per-object deletes) are logged
+/// but never propagated — the repository is already gone.
+async fn purge_oci_upload_temp_objects(
     state: &SharedState,
     repo_id: Uuid,
     location: &crate::storage::StorageLocation,
+    keys: Vec<String>,
 ) {
+    if keys.is_empty() {
+        return;
+    }
     let storage = match state.storage_for_repo(location) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
                 repo_id = %repo_id,
                 error = %e,
-                "Could not resolve storage to purge OCI upload temp objects before repository delete"
+                "Could not resolve storage to purge OCI upload temp objects after repository delete"
             );
             return;
         }
     };
-    // The cleanup-key journal records every temp/part/completion storage key
-    // written for this repo's uploads; union in the session/part keys as
-    // belt-and-suspenders in case a write predated its journal row.
-    let keys: Vec<String> = sqlx::query_scalar(
-        "SELECT storage_key FROM oci_upload_cleanup_keys WHERE repository_id = $1 \
-         UNION SELECT storage_temp_key FROM oci_upload_sessions WHERE repository_id = $1 \
-         UNION SELECT p.storage_key FROM oci_upload_parts p \
-           JOIN oci_upload_sessions s ON s.id = p.upload_session_id \
-          WHERE s.repository_id = $1",
-    )
-    .bind(repo_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(
-            repo_id = %repo_id,
-            error = %e,
-            "Failed to list OCI upload temp keys to purge before repository delete"
-        );
-        Vec::new()
-    });
     for key in keys {
         match storage.delete(&key).await {
             Ok(()) | Err(AppError::NotFound(_)) => {}
@@ -1737,7 +1821,7 @@ async fn purge_repo_oci_upload_temp_objects(
                 repo_id = %repo_id,
                 storage_key = %key,
                 error = %e,
-                "Failed to purge OCI upload temp object before repository delete"
+                "Failed to purge OCI upload temp object after repository delete"
             ),
         }
     }
@@ -1877,10 +1961,13 @@ pub async fn delete_repository(
         }
     }
 
-    // Purge this repo's in-flight / abandoned OCI upload temp objects from
-    // storage BEFORE the repository row is deleted (see the helper). Best-effort:
-    // never blocks the delete.
-    purge_repo_oci_upload_temp_objects(&state, repo.id, &repo.storage_location()).await;
+    // Gather this repo's in-flight / abandoned OCI upload temp storage keys
+    // BEFORE the repository row is deleted — the journal/session/part rows
+    // CASCADE away with it, so the keys must be captured up front. The actual
+    // storage purge is deferred until AFTER a successful delete (below) so a
+    // failed delete does not prematurely destroy temp objects the surviving
+    // repository may still retry (#1533 GC-LOW-2). Best-effort throughout.
+    let oci_upload_temp_keys = collect_repo_oci_upload_temp_keys(&state, repo.id).await;
 
     // Purge this repo's committed artifact objects from storage BEFORE the
     // repository row is deleted (the artifacts rows CASCADE away with it). The
@@ -1913,6 +2000,18 @@ pub async fn delete_repository(
     }
 
     service.delete(repo.id).await?;
+
+    // The repository row is now gone (and its OCI upload journal/session/part
+    // rows CASCADED away). Only now purge the temp objects gathered above from
+    // storage: had the delete failed, this is skipped and the objects survive
+    // to be retried (#1533 GC-LOW-2). Best-effort: never blocks.
+    purge_oci_upload_temp_objects(
+        &state,
+        repo.id,
+        &repo.storage_location(),
+        oci_upload_temp_keys,
+    )
+    .await;
 
     // Remove the deleted repo from the in-memory cache.
     {
@@ -1963,6 +2062,17 @@ pub struct ArtifactResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
+    /// Whether this artifact can have an SBOM generated or a security scan
+    /// run against it. `false` for proxy-cached (Remote) objects: those are
+    /// listed with a synthetic, SHA-256-derived id (see
+    /// [`cached_artifact_id`]) and have no row in the `artifacts` table
+    /// (#1280/#1278), so SBOM/scan lookups by `artifacts.id` cannot resolve
+    /// them and `sbom_documents`/`scan_results` cannot reference them.
+    /// `true` for hosted artifacts, which carry a real DB id. The web UI
+    /// uses this to hide/disable the "Generate SBOM" / "Scan" actions where
+    /// they cannot work; clients that predate the field should treat an
+    /// absent value as `true` so hosted artifacts are never hidden. (#2227)
+    pub analyzable: bool,
     /// When the proxy cache entry for this artifact was last written.
     /// Only populated for Remote (proxy) repositories whose proxy service is
     /// configured AND that have a cache-metadata blob for this path. None
@@ -2436,6 +2546,9 @@ fn build_cached_artifact_response(
         download_count: 0,
         created_at: entry.cached_at,
         metadata: None,
+        // Proxy-cached objects have no `artifacts` row (#1280/#1278) and a
+        // synthetic id, so SBOM/scan cannot resolve them: not analyzable.
+        analyzable: false,
         // This is a proxy-cache entry, so surface the cache timestamp.
         // CachedArtifactEntry carries no expiry, so cache_expires_at is None.
         cache_cached_at: Some(entry.cached_at),
@@ -2547,6 +2660,39 @@ async fn lookup_artifact_by_paths(
     Ok(None)
 }
 
+/// Resolve a request path to the artifact's stored path for the generic
+/// download/delete handlers.
+///
+/// npm publish stores tarballs under the version-segmented layout
+/// (`<name>/<version>/<file>.tgz`, see `npm::store_npm_version`), while the Web
+/// UI's Download/Delete buttons emit the canonical npm download-URL shape
+/// (`<name>/-/<file>.tgz`). An exact-match `WHERE path = $2` lookup against the
+/// URL shape therefore never finds the version-segmented row. This mirrors the
+/// resolution `get_artifact_metadata` already performs: try the literal path
+/// first, then the normalised stored shape for npm-family repos.
+///
+/// The extra DB roundtrip is taken only when a normalised candidate actually
+/// exists (npm-family repo + the `/-/` URL shape): for non-npm formats and
+/// already-stored npm paths `lookup_path_candidates` returns a single element,
+/// so the guard short-circuits and behaviour is byte-identical to today. On a
+/// true local miss the original `path` is returned unchanged, so Remote/Virtual
+/// proxy fallback still fires against the original URL shape.
+async fn resolve_stored_path(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    path: String,
+) -> Result<String> {
+    let candidates = lookup_path_candidates(&path, &repo.format);
+    if candidates.len() > 1 {
+        Ok(lookup_artifact_by_paths(&state.db, repo.id, &candidates)
+            .await?
+            .map(|a| a.path)
+            .unwrap_or(path))
+    } else {
+        Ok(path)
+    }
+}
+
 /// Rewrite an npm-family artifact listing row's `path` from the
 /// version-segmented storage layout (`<name>/<version>/<file>.tgz`) to
 /// the canonical npm download-URL shape (`<name>/-/<file>.tgz`).
@@ -2579,6 +2725,8 @@ fn build_artifact_response(
         download_count,
         created_at: artifact.created_at,
         metadata: None,
+        // Hosted artifact backed by a real `artifacts` row: SBOM/scan resolve.
+        analyzable: true,
         // Cache metadata is surfaced only by the per-artifact metadata
         // endpoint to avoid fanning out a storage GET per artifact in
         // listings (#1541). Helpers used by listings leave these as None;
@@ -2630,6 +2778,9 @@ fn expand_maven_secondary_files(
             download_count: 0,
             created_at: artifact.created_at,
             metadata: None,
+            // Secondary Maven files are recorded under a real primary
+            // artifact row (its id), so they are analyzable like the primary.
+            analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
         });
@@ -3469,6 +3620,9 @@ pub async fn get_artifact_metadata(
             download_count: downloads,
             created_at: artifact.created_at,
             metadata: metadata.map(|m| m.metadata),
+            // This handler resolves a real `artifacts` row by id, so it is
+            // always a hosted artifact (analyzable), even inside a Remote repo.
+            analyzable: true,
             cache_cached_at: cache_meta.as_ref().map(|m| m.cached_at),
             cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
         })
@@ -3559,7 +3713,10 @@ pub async fn get_artifact_metadata(
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "Artifact uploaded", body = ArtifactResponse),
+        // 201, not 200: the handler has always returned StatusCode::CREATED
+        // (package-manager clients depend on it); the spec must say so or
+        // strict generated SDKs treat every successful upload as an error.
+        (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found"),
     )
@@ -3715,6 +3872,8 @@ pub async fn upload_artifact(
             download_count: downloads,
             created_at: artifact.created_at,
             metadata: metadata_json,
+            // Freshly-uploaded hosted artifact with a real DB id: analyzable.
+            analyzable: true,
             // Just-uploaded artifacts have no proxy cache state yet -- the
             // cache is populated lazily on the first proxy fetch.
             cache_cached_at: None,
@@ -3840,6 +3999,8 @@ async fn extract_multipart_file(mut multipart: Multipart) -> Result<(Bytes, Stri
         // Accept any field that has a filename (i.e. a file upload)
         let filename = field.file_name().map(|s| s.to_string());
         if let Some(filename) = filename {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
             let data: Bytes = field
                 .bytes()
                 .await
@@ -3875,6 +4036,8 @@ async fn extract_multipart_file_and_path(
         if let Some(filename) = filename {
             // File upload field
             if file.is_none() {
+                #[allow(clippy::disallowed_methods)]
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 let data: Bytes = field
                     .bytes()
                     .await
@@ -3910,6 +4073,44 @@ fn download_filename(path: &str) -> &str {
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(path)
+}
+
+/// Best-effort download-statistics recording for the presigned/redirect
+/// download path (S3/CloudFront).
+///
+/// Writes to `download_statistics` — the same table (and column set) the
+/// streaming path's `ArtifactService::finish_download` uses, so redirect
+/// downloads show up in the same analytics as proxied ones. `downloaded_at`
+/// takes the column's `NOW()` default.
+///
+/// Stats recording must never block or fail the download itself, so errors
+/// are logged at `warn` and swallowed rather than propagated.
+async fn record_redirect_download(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+    user_id: Option<Uuid>,
+    ip_address: &str,
+    user_agent: Option<&str>,
+) {
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(user_id)
+    .bind(ip_address)
+    .bind(user_agent)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            %artifact_id,
+            error = %e,
+            "failed to record download statistics for redirect download"
+        );
+    }
 }
 
 /// Outcome of parsing an HTTP `Range` request header against a known total
@@ -4134,6 +4335,14 @@ pub async fn download_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
 
+    // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
+    // version-segmented path the tarball is actually stored under (#2269),
+    // mirroring `get_artifact_metadata`. No-op for non-npm formats and for
+    // paths that are already stored literally; on a local miss `path` is left
+    // unchanged so the Remote/Virtual proxy fallback below still fires against
+    // the original URL shape.
+    let path = resolve_stored_path(&state, &repo, path).await?;
+
     // Check quarantine status before serving the artifact.
     // If the artifact is quarantined or rejected, return 409 Conflict.
     {
@@ -4209,18 +4418,18 @@ pub async fn download_artifact(
                 .get_presigned_url(&artifact.storage_key, expiry)
                 .await?
             {
-                // Record download analytics
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO download_events (artifact_id, user_id, ip_address, user_agent, downloaded_at)
-                    VALUES ($1, $2, $3, $4, NOW())
-                    "#,
+                // Record download analytics (best-effort; must not block the
+                // redirect). This previously inserted into an events table
+                // that does not exist in the schema — and discarded the
+                // error — so every presigned/redirect download was silently
+                // missing from download statistics (#2260, bug 1).
+                record_redirect_download(
+                    &state.db,
+                    artifact.id,
+                    auth.as_ref().map(|a| a.user_id),
+                    &ip_addr.to_string(),
+                    user_agent.as_deref(),
                 )
-                .bind(artifact.id)
-                .bind(auth.as_ref().map(|a| a.user_id))
-                .bind(ip_addr.to_string())
-                .bind(user_agent.as_deref())
-                .execute(&state.db)
                 .await;
 
                 tracing::info!(
@@ -4455,6 +4664,31 @@ pub async fn delete_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
 
+    // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
+    // version-segmented path the tarball is actually stored under (#2269),
+    // mirroring `get_artifact_metadata`. Done before the promotion-only /
+    // immutability gates below so every gate, the delete query, and the
+    // cache-invalidation all operate on one consistent, real artifact path.
+    // No-op for non-npm formats and already-literal paths.
+    let path = resolve_stored_path(&state, &repo, path).await?;
+
+    // Promotion-only release repositories: a direct DELETE is the symmetric
+    // mutation to the (already-gated) direct upload and would let a principal
+    // with plain repo-write permanently destroy a released artifact, bypassing
+    // the promotion/approval controls. Reject it for non-approvers. Admins are
+    // the release-approvers (approve_promotion requires is_admin) and keep the
+    // retraction escape hatch; trusted service accounts (e.g. peer replication)
+    // are exempt too, mirroring the immutability guard's exemptions below. The
+    // promotion service writes via its own RAW SQL path and is unaffected.
+    if crate::api::handlers::proxy_helpers::promotion_only_blocks_direct_delete(
+        repo.promotion_only,
+        auth.is_admin || auth.is_service_account,
+    ) {
+        return Err(AppError::Authorization(
+            "Direct deletes are disabled for this release repository; retract via an approver/promotion workflow".to_string(),
+        ));
+    }
+
     // Release immutability: a versioned (immutable) artifact must never be
     // mutated after publication. Deleting one would re-open its coordinates for
     // a different-bytes re-upload (the upload path already rejects an existing
@@ -4505,6 +4739,20 @@ pub async fn delete_artifact(
                 repo.id,
                 &coords.group_id,
                 &coords.artifact_id,
+            )
+            .await;
+        }
+    }
+
+    // Deleting an npm artifact changes the packument, so drop the computed
+    // packument cache for its package — including in every virtual repo that
+    // serves this one; otherwise a warm virtual-repo GET keeps listing the
+    // just-removed version for the whole fresh window (#2162).
+    if repo.format == RepositoryFormat::Npm {
+        if let Some(package) = crate::api::handlers::npm::npm_package_name_from_artifact_path(&path)
+        {
+            crate::api::handlers::npm::invalidate_packument_caches(
+                &state, repo.id, &repo.key, package,
             )
             .await;
         }
@@ -5408,6 +5656,8 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
     format!("{:?}", repo_type).to_lowercase()
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5436,6 +5686,144 @@ mod tests {
         // A trailing slash would otherwise yield an empty basename; fall back
         // to the full path rather than emitting an empty filename.
         assert_eq!(download_filename("a/b/"), "a/b/");
+    }
+
+    // -----------------------------------------------------------------------
+    // Presigned/redirect download statistics (#2260, bug 1)
+    //
+    // The redirect path used to INSERT into an events table that does not
+    // exist in the schema and discard the error, so every presigned
+    // (S3/CloudFront) download was silently missing from analytics. It must
+    // record into `download_statistics`, the table the streaming path's
+    // `ArtifactService::finish_download` uses.
+    //
+    // The DB-backed tests run only when DATABASE_URL points at a migrated
+    // Postgres (as in CI); they skip cleanly otherwise.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn presigned_download_path_does_not_reference_legacy_events_table() {
+        // Source-level regression guard: the non-existent table name must not
+        // reappear in this handler module. Built with concat! so this test's
+        // own literal does not match itself.
+        let legacy_table = concat!("download_", "events");
+        let src = include_str!("repositories.rs");
+        assert_eq!(
+            src.matches(legacy_table).count(),
+            0,
+            "repositories.rs must not reference the non-existent `{legacy_table}` table; \
+             download recording goes to `download_statistics` (#2260, bug 1)"
+        );
+    }
+
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    async fn seed_artifact(pool: &sqlx::PgPool) -> Uuid {
+        let key = format!("redirect-stats-test-{}", Uuid::new_v4().as_simple());
+        let repo_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'generic', 'local', '/tmp/test') RETURNING id",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test repository");
+
+        sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, '1.0.0', 100, $4, 'application/octet-stream', $5) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{key}/artifact.bin"))
+        .bind(&key)
+        .bind(format!("{:0>64}", "ab"))
+        .bind(format!("{key}/storage.bin"))
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test artifact")
+    }
+
+    #[tokio::test]
+    async fn record_redirect_download_writes_download_statistics() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        // The table the old code wrote to must not exist — writing there was
+        // pure data loss, never a fallback.
+        let legacy: Option<String> =
+            sqlx::query_scalar(concat!("SELECT to_regclass('download_", "events')::text"))
+                .fetch_one(&pool)
+                .await
+                .expect("to_regclass query failed");
+        assert!(
+            legacy.is_none(),
+            "the legacy table unexpectedly exists; this regression test assumes it does not"
+        );
+
+        let artifact_id = seed_artifact(&pool).await;
+
+        record_redirect_download(
+            &pool,
+            artifact_id,
+            None,
+            "203.0.113.7",
+            Some("redirect-stats-test-agent/1.0"),
+        )
+        .await;
+
+        let row: Option<(Option<String>, Option<String>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT ip_address, user_agent, user_id FROM download_statistics \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("failed to query download_statistics");
+
+        let (ip, ua, user_id) =
+            row.expect("redirect download was not recorded in download_statistics");
+        assert_eq!(ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(ua.as_deref(), Some("redirect-stats-test-agent/1.0"));
+        assert_eq!(user_id, None);
+
+        // Cleanup (FK cascade removes the download_statistics row).
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn record_redirect_download_swallows_stats_errors() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        // A non-existent artifact violates the FK; recording must stay
+        // best-effort (log + swallow) so a stats failure never fails the
+        // download. Reaching the assertion at all proves no panic/propagation.
+        let bogus_artifact = Uuid::new_v4();
+        record_redirect_download(&pool, bogus_artifact, None, "203.0.113.8", None).await;
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
+                .bind(bogus_artifact)
+                .fetch_one(&pool)
+                .await
+                .expect("failed to query download_statistics");
+        assert_eq!(count, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -5782,6 +6170,10 @@ mod tests {
         assert_eq!(resp.checksum_sha256, "deadbeef");
         assert_eq!(resp.download_count, 0);
         assert!(resp.version.is_none());
+        // Proxy-cached objects have no `artifacts` row and a synthetic id,
+        // so they cannot be SBOM'd or scanned: the listing marks them
+        // non-analyzable so the UI hides those actions (#2227).
+        assert!(!resp.analyzable);
         // A cached-listing entry is a live proxy-cache object, so its
         // freshness timestamp is exactly when it was cached; the sidecar
         // projection carries no expiry. (Asserting these guards the
@@ -5835,6 +6227,8 @@ mod tests {
         assert_eq!(resp.size_bytes, 500);
         assert_eq!(resp.checksum_sha256, "primary-sha");
         assert_eq!(resp.download_count, 42);
+        // Hosted artifacts have a real DB id, so SBOM/scan resolve: analyzable.
+        assert!(resp.analyzable);
     }
 
     // -----------------------------------------------------------------------
@@ -6482,7 +6876,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(require_auth(Some(auth)).is_ok());
     }
@@ -7200,12 +7595,16 @@ mod tests {
             download_count: 42,
             created_at: chrono::Utc::now(),
             metadata: None,
+            analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
         assert!(json.contains("\"size_bytes\":1024"));
+        // `analyzable` is always serialized (no serde skip) so clients can
+        // gate the SBOM/Scan actions on it (#2227).
+        assert!(json.contains("\"analyzable\":true"));
         // Cache fields are omitted when None so the wire shape stays the
         // same for non-Remote repos and for Remote repos without cache
         // metadata (#1541).
@@ -7239,6 +7638,7 @@ mod tests {
             download_count: 0,
             created_at: cached,
             metadata: None,
+            analyzable: false,
             cache_cached_at: Some(cached),
             cache_expires_at: Some(expires),
         };
@@ -7818,6 +8218,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: now,
             updated_at: now,
         };
@@ -7895,6 +8297,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: now,
             updated_at: now,
         };
@@ -7937,6 +8341,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: now,
             updated_at: now,
         };
@@ -7972,6 +8378,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: now,
             updated_at: now,
         };
@@ -7996,7 +8404,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: repo_ids,
+            allowed_repo_ids: AccessScope::from(repo_ids),
+            iat_ms: None,
         }
     }
 
@@ -8084,6 +8493,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: now,
             updated_at: now,
         }
@@ -8392,6 +8803,118 @@ mod tests {
             remaining.as_deref(),
             Some(original_sha.as_str()),
             "the released content must be unchanged after a blocked swap"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2237: a direct DELETE on a `promotion_only` release repository is
+    /// rejected for a non-admin (non-approver) with 403 FORBIDDEN, while an
+    /// admin (release-approver) retains the retraction escape hatch, and a
+    /// normal (non-promotion_only) repo is unaffected for the same non-admin.
+    #[tokio::test]
+    async fn delete_artifact_gated_on_promotion_only_repo_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = Some(tdh::make_auth(user_id, &username));
+        let mut admin_ext = tdh::make_auth(user_id, &username);
+        admin_ext.is_admin = true;
+        let admin = Some(admin_ext);
+
+        let set_promotion_only = |value: bool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE repositories SET promotion_only = $1 WHERE id = $2")
+                    .bind(value)
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await
+                    .expect("set promotion_only");
+            }
+        };
+
+        // Publish a release artifact (generic classifies this coordinate mutable,
+        // so the immutability guard is a no-op — the promotion gate is the only
+        // control under test).
+        let path = "app/1.0.0/app-1.0.0.bin".to_string();
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"RELEASE-BYTES"),
+        )
+        .await
+        .expect("initial publish must succeed");
+
+        // (1) promotion_only=true, non-admin -> 403 FORBIDDEN, artifact intact.
+        set_promotion_only(true).await;
+        let blocked = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(blocked, Err(AppError::Authorization(_))),
+            "non-admin DELETE on a promotion_only repo must be rejected 403, got: {blocked:?}"
+        );
+        let surviving: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            surviving, 1,
+            "a blocked delete must leave the release intact"
+        );
+
+        // (2) promotion_only=true, admin -> retraction escape hatch: proceeds.
+        let admin_del = delete_artifact(
+            State(state.clone()),
+            Extension(admin.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            admin_del.is_ok(),
+            "an admin (release-approver) must retain the retraction path, got: {admin_del:?}"
+        );
+
+        // (3) promotion_only=false, non-admin -> unaffected: proceeds.
+        set_promotion_only(false).await;
+        let path2 = "app/2.0.0/app-2.0.0.bin".to_string();
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path2.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"NORMAL-REPO-BYTES"),
+        )
+        .await
+        .expect("publish to normal repo must succeed");
+        let normal_del = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path2.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            normal_del.is_ok(),
+            "delete on a normal (non-promotion_only) repo must be unaffected, got: {normal_del:?}"
         );
 
         tdh::cleanup(&pool, repo_id, user_id).await;
@@ -8877,6 +9400,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 3600,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: now,
             updated_at: now,
         }
@@ -9842,7 +10367,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -10322,12 +10848,12 @@ mod tests {
             assert!(
                 validate_virtual_repo_member_count("my-repo", &rt, None).is_ok(),
                 "{:?} with no members must be Ok",
-                &rt
+                rt
             );
             assert!(
                 validate_virtual_repo_member_count("my-repo", &rt, Some(&[])).is_ok(),
                 "{:?} with empty members must be Ok",
-                &rt
+                rt
             );
         }
     }
@@ -10911,10 +11437,11 @@ mod tests {
             );
         }
 
-        // The repo-delete purge must remove the journaled temp/session/part
-        // objects up front (once the repo row is deleted their owner rows CASCADE
-        // away), but must leave the committed blob untouched.
-        purge_repo_oci_upload_temp_objects(&state, fx.repo_id, &location).await;
+        // The repo-delete flow collects the journaled temp/session/part keys
+        // (while the owner rows still exist) and then purges them from storage;
+        // it must remove those objects but leave the committed blob untouched.
+        let keys = collect_repo_oci_upload_temp_keys(&state, fx.repo_id).await;
+        purge_oci_upload_temp_objects(&state, fx.repo_id, &location, keys).await;
 
         for k in [&temp_key, &session_temp_key, &part_key] {
             assert!(
@@ -10928,6 +11455,193 @@ mod tests {
                 .await
                 .expect("blob exists after purge"),
             "purge must NOT delete the committed content-addressed blob {blob_key}"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// Seed one in-flight OCI upload temp object into `storage` and register its
+    /// `oci_upload_cleanup_keys` journal row for `repo_id`; returns the key.
+    /// Shared by the ordering tests below so the seeding boilerplate lives in
+    /// one place.
+    async fn seed_oci_upload_temp_object(
+        pool: &sqlx::PgPool,
+        storage: &std::sync::Arc<dyn crate::storage::StorageBackend>,
+        repo_id: Uuid,
+    ) -> String {
+        let key = format!("oci-uploads/{}", Uuid::new_v4());
+        storage
+            .put(&key, bytes::Bytes::from_static(b"in-flight upload bytes"))
+            .await
+            .expect("write temp object");
+        sqlx::query(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, storage_write_completed_at) \
+             VALUES ($1, $2, NOW())",
+        )
+        .bind(repo_id)
+        .bind(&key)
+        .execute(pool)
+        .await
+        .expect("register cleanup key");
+        key
+    }
+
+    /// GC-LOW-2 (ordering, success path): a SUCCESSFUL `delete_repository`
+    /// purges the repo's in-flight OCI upload temp objects from storage — even
+    /// though the journal rows CASCADE away with the repo row, because the keys
+    /// are collected *before* the delete and purged *after* it commits.
+    #[tokio::test]
+    async fn delete_repository_success_purges_oci_upload_temp_objects() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&location)
+            .expect("resolve storage");
+        let temp_key = seed_oci_upload_temp_object(&fx.pool, &storage, fx.repo_id).await;
+        assert!(
+            storage.exists(&temp_key).await.expect("exists"),
+            "precondition: temp object present"
+        );
+
+        // Admin auth so the delete-authorization gates pass without a per-repo
+        // admin grant.
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = true;
+
+        delete_repository(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path(fx.repo_key.clone()),
+        )
+        .await
+        .expect("repository delete must succeed");
+
+        assert!(
+            !storage
+                .exists(&temp_key)
+                .await
+                .expect("exists after delete"),
+            "a successful repository delete must purge the OCI upload temp object"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// GC-LOW-2 (ordering, failure path): a `delete_repository` whose underlying
+    /// `service.delete` FAILS must NOT purge the repo's in-flight OCI upload temp
+    /// objects — they survive to be retried. The row delete is forced to fail by
+    /// a `BEFORE DELETE` trigger scoped (via its `WHEN` clause) to this one repo,
+    /// so `DELETE FROM repositories` raises and the handler returns before the
+    /// (post-delete) purge step.
+    #[tokio::test]
+    async fn delete_repository_failed_delete_keeps_oci_upload_temp_objects() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&location)
+            .expect("resolve storage");
+        let temp_key = seed_oci_upload_temp_object(&fx.pool, &storage, fx.repo_id).await;
+
+        // A trigger name/function unique to this repo so concurrent DB tests
+        // sharing the `repositories` table never collide.
+        let fn_name = format!("ph_block_repo_delete_{}", fx.repo_id.simple());
+        let trg_name = format!("ph_block_repo_delete_trg_{}", fx.repo_id.simple());
+        sqlx::query(&format!(
+            "CREATE FUNCTION {fn_name}() RETURNS trigger AS \
+             $$ BEGIN RAISE EXCEPTION 'ph blocked repo delete'; END; $$ LANGUAGE plpgsql"
+        ))
+        .execute(&fx.pool)
+        .await
+        .expect("create blocking trigger function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trg_name} BEFORE DELETE ON repositories \
+             FOR EACH ROW WHEN (OLD.id = '{}'::uuid) EXECUTE FUNCTION {fn_name}()",
+            fx.repo_id
+        ))
+        .execute(&fx.pool)
+        .await
+        .expect("create blocking trigger");
+
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = true;
+
+        let res = delete_repository(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path(fx.repo_key.clone()),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "the repository delete must fail (blocking trigger present)"
+        );
+
+        assert!(
+            storage
+                .exists(&temp_key)
+                .await
+                .expect("exists after failed delete"),
+            "a FAILED repository delete must NOT purge the OCI upload temp object"
+        );
+
+        // Drop the trigger (and function) so the fixture can tear down cleanly.
+        sqlx::query(&format!("DROP TRIGGER {trg_name} ON repositories"))
+            .execute(&fx.pool)
+            .await
+            .expect("drop blocking trigger");
+        sqlx::query(&format!("DROP FUNCTION {fn_name}()"))
+            .execute(&fx.pool)
+            .await
+            .expect("drop blocking trigger function");
+        let _ = storage.delete(&temp_key).await;
+        fx.teardown().await;
+    }
+
+    /// F2 (batching): a cleanup-key backlog larger than one batch must be fully
+    /// collected — the batched keyset query loops until the backlog is drained
+    /// rather than issuing a single unbounded SELECT.
+    #[tokio::test]
+    async fn collect_repo_oci_upload_temp_keys_drains_large_backlog() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        // One more than the batch size guarantees at least two query pages, so a
+        // non-looping implementation would miss the overflow key.
+        let total = (OCI_UPLOAD_TEMP_KEY_BATCH + 1) as usize;
+        let mut expected: Vec<String> = Vec::with_capacity(total);
+        for _ in 0..total {
+            let key = format!("oci-uploads/{}", Uuid::new_v4());
+            sqlx::query(
+                "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key, storage_write_completed_at) \
+                 VALUES ($1, $2, NOW())",
+            )
+            .bind(fx.repo_id)
+            .bind(&key)
+            .execute(&fx.pool)
+            .await
+            .expect("register cleanup key");
+            expected.push(key);
+        }
+
+        let mut got = collect_repo_oci_upload_temp_keys(&fx.state, fx.repo_id).await;
+        got.sort();
+        got.dedup();
+        expected.sort();
+        assert_eq!(
+            got, expected,
+            "the batched collector must return every key in a large backlog"
         );
 
         fx.teardown().await;
@@ -11062,7 +11776,7 @@ mod tests {
                      VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 )
                 .bind(repo_id)
-                .bind(format!("app/{}", &key))
+                .bind(format!("app/{}", key))
                 .bind("manifest")
                 .bind(16_i64)
                 .bind("f".repeat(64))
@@ -11887,7 +12601,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -12094,7 +12809,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -12471,10 +13187,12 @@ mod tests {
         );
     }
 
-    /// PEP 708 (#1600): a PyPI virtual isolates a locally-owned project name by
-    /// default (so an unrelated public package of the same name is never served
-    /// through the virtual), and only unblocks the cross-member union when an
-    /// operator `tracks` declaration exists on the owning member.
+    /// PEP 708 (#1600, priority-aware per #2311): a PyPI virtual isolates a
+    /// locally-owned project name by default (so an unrelated public package
+    /// of the same name is never served through the virtual), reporting the
+    /// owning local member's priority so callers suppress only the remote
+    /// members the owner outranks, and only unblocks the cross-member union
+    /// when an operator `tracks` declaration exists on the owning member.
     #[tokio::test]
     async fn pypi_virtual_isolates_locally_owned_name_until_tracks_declared() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -12516,20 +13234,24 @@ mod tests {
         .await
         .expect("seed local artifact");
 
-        // Default: owned locally, no tracks -> ISOLATE (do not merge upstream).
+        // Default: owned locally, no tracks -> ISOLATE (do not merge upstream),
+        // reporting the owning local member's priority (1) so the caller can
+        // suppress exactly the remote members the owner outranks — here the
+        // priority-2 remote (the genuine dependency-confusion case).
         assert!(
             matches!(
                 proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
-                Ok(true)
+                Ok(Some(1))
             ),
-            "a locally-owned name with no tracks declaration must be isolated"
+            "a locally-owned name with no tracks declaration must be isolated \
+             at the owning member's priority"
         );
 
         // A name the local member does not own -> proxy normally (no isolation).
         assert!(
             matches!(
                 proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "six").await,
-                Ok(false)
+                Ok(None)
             ),
             "a name no local member owns must not be isolated"
         );
@@ -12549,7 +13271,7 @@ mod tests {
         assert!(
             matches!(
                 proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
-                Ok(false)
+                Ok(None)
             ),
             "a tracks declaration must re-enable the cross-member union"
         );
@@ -12562,5 +13284,356 @@ mod tests {
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&virtual_dir);
+    }
+
+    /// #2311: the PEP 708 isolation decision must respect member priority. A
+    /// local member that owns a name but sits at LOWER priority (higher
+    /// `priority` value) than a remote member must not hide that remote: the
+    /// guard reports the owning member's priority and the priority map lets
+    /// callers serve every remote at equal or higher priority, while a remote
+    /// the local owner outranks stays suppressed (the genuine
+    /// dependency-confusion case).
+    #[tokio::test]
+    async fn pypi_virtual_isolation_respects_member_priority() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (local_id, _lk, local_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (remote_hi_id, _rhk, remote_hi_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (remote_lo_id, _rlk, remote_lo_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (virtual_id, _vk, virtual_dir) = tdh::create_repo(&pool, "virtual", "pypi").await;
+
+        // Priority inversion: the remote at priority 1 outranks the owning
+        // local at priority 2; a second remote at priority 3 is outranked.
+        for (member, priority) in [
+            (remote_hi_id, 1_i32),
+            (local_id, 2_i32),
+            (remote_lo_id, 3_i32),
+        ] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&pool)
+            .await
+            .expect("insert virtual member");
+        }
+
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(local_id)
+        .bind("mypackage/1.0.0/mypackage-1.0.0-py3-none-any.whl")
+        .bind("mypackage")
+        .bind(1_i64)
+        .bind("0".repeat(64))
+        .bind("application/octet-stream")
+        .bind("pypi/mypackage/1")
+        .execute(&pool)
+        .await
+        .expect("seed local artifact");
+
+        // The guard reports the owning local member's priority (2), NOT a
+        // blanket "suppress all remotes".
+        let owning = proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "mypackage")
+            .await
+            .expect("isolation query");
+        assert_eq!(
+            owning,
+            Some(2),
+            "the guard must report the owning local member's priority"
+        );
+
+        // The per-member decision the handlers apply: a remote is suppressed
+        // only when the owning local strictly outranks it.
+        let priorities = proxy_helpers::fetch_virtual_member_priorities(&pool, virtual_id)
+            .await
+            .expect("fetch member priorities");
+        let local_min = owning.expect("owned");
+        let hi_suppressed = local_min < priorities[&remote_hi_id];
+        let lo_suppressed = local_min < priorities[&remote_lo_id];
+        assert!(
+            !hi_suppressed,
+            "a remote member at HIGHER priority (1) than the owning local (2) \
+             must survive isolation so its versions stay visible to pip (#2311)"
+        );
+        assert!(
+            lo_suppressed,
+            "a remote member at LOWER priority (3) than the owning local (2) \
+             must stay suppressed (dependency-confusion protection)"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![local_id, remote_hi_id, remote_lo_id, virtual_id])
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_hi_dir);
+        let _ = std::fs::remove_dir_all(&remote_lo_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2269: the generic download/delete handlers must resolve the canonical
+    // npm `/-/` URL shape the Web UI emits to the version-segmented path a
+    // tarball is actually stored under. `lookup_path_candidates` is the guard
+    // predicate: it yields `[url, stored]` (len 2) for an npm `/-/` tarball URL
+    // and `[literal]` (len 1) for everything else, so the resolver only takes
+    // the extra DB roundtrip when a normalized candidate can exist.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lookup_path_candidates_pairs_npm_url_and_stored_shapes() {
+        // Unscoped `/-/` URL -> [url, version-segmented stored].
+        let unscoped =
+            lookup_path_candidates("npm-test/-/npm-test-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            unscoped,
+            vec![
+                "npm-test/-/npm-test-1.0.0.tgz".to_string(),
+                "npm-test/1.0.0/npm-test-1.0.0.tgz".to_string(),
+            ],
+            "an npm `/-/` tarball URL must expand to [url, stored] so the guard resolves it"
+        );
+
+        // Scoped `/-/` URL -> [url, version-segmented stored].
+        let scoped = lookup_path_candidates("@scope/pkg/-/pkg-2.1.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            scoped,
+            vec![
+                "@scope/pkg/-/pkg-2.1.0.tgz".to_string(),
+                "@scope/pkg/2.1.0/pkg-2.1.0.tgz".to_string(),
+            ],
+        );
+
+        // yarn is npm-family too.
+        assert_eq!(
+            lookup_path_candidates("npm-test/-/npm-test-1.0.0.tgz", &RepositoryFormat::Yarn).len(),
+            2,
+        );
+
+        // An already-stored version-segmented npm path has no distinct
+        // normalized shape -> single candidate, guard short-circuits.
+        assert_eq!(
+            lookup_path_candidates("npm-test/1.0.0/npm-test-1.0.0.tgz", &RepositoryFormat::Npm)
+                .len(),
+            1,
+        );
+
+        // Non-npm formats never expand -> single candidate, byte-identical path.
+        assert_eq!(
+            lookup_path_candidates("com/acme/app/1.0.0/app-1.0.0.jar", &RepositoryFormat::Maven)
+                .len(),
+            1,
+        );
+        assert_eq!(
+            lookup_path_candidates("some/raw/file.bin", &RepositoryFormat::Generic).len(),
+            1,
+        );
+    }
+
+    /// Build a bodyless GET request for `download_artifact`.
+    #[cfg(test)]
+    fn get_request() -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("request")
+    }
+
+    /// #2269: an npm tarball stored under the version-segmented layout must be
+    /// downloadable AND deletable from the canonical `/-/` URL shape the Web UI
+    /// emits, while the literal stored path and a bogus path behave as before.
+    #[tokio::test]
+    async fn npm_generic_download_delete_resolve_canonical_url_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "npm").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = Some(tdh::make_auth(user_id, &username));
+
+        // Publish tarballs under the exact version-segmented layout
+        // `npm::store_npm_version` writes.
+        let unscoped_stored = "npm-test/1.0.0/npm-test-1.0.0.tgz".to_string();
+        let scoped_stored = "@scope/pkg/2.1.0/pkg-2.1.0.tgz".to_string();
+        for p in [&unscoped_stored, &scoped_stored] {
+            upload_artifact(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path((key.clone(), p.clone())),
+                HeaderMap::new(),
+                Bytes::from_static(b"TARBALL-BYTES"),
+            )
+            .await
+            .expect("publish must succeed");
+        }
+
+        // (1) Download via the canonical `/-/` URL shape -> 200 (was 404).
+        let dl = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
+            get_request(),
+        )
+        .await;
+        assert_eq!(
+            dl.expect("download via /-/ shape must resolve")
+                .into_response()
+                .status(),
+            StatusCode::OK,
+            "generic download of a version-segmented npm tarball via /-/ must be 200 (#2269)"
+        );
+
+        // (2) Download via the literal stored path still resolves (literal-first).
+        let dl_literal = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), unscoped_stored.clone())),
+            get_request(),
+        )
+        .await;
+        assert_eq!(
+            dl_literal
+                .expect("download via literal path must resolve")
+                .into_response()
+                .status(),
+            StatusCode::OK,
+        );
+
+        // (3) A bogus `/-/` path (no matching row) must still 404 — the resolver
+        // leaves the path unchanged on a miss so downstream lookup fails cleanly.
+        let dl_bogus = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "nope/-/nope-9.9.9.tgz".to_string())),
+            get_request(),
+        )
+        .await;
+        assert!(
+            matches!(dl_bogus, Err(AppError::NotFound(_))),
+            "an unknown npm tarball must still 404 (resolver leaves a miss path unchanged)"
+        );
+
+        // (4) Scoped delete via the canonical `/-/` URL shape -> Ok (was 404),
+        // and the row is soft-deleted. npm tarballs classify Mutable (no `/-/`
+        // in the resolved stored path) so the immutability gate permits this.
+        let del_scoped = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "@scope/pkg/-/pkg-2.1.0.tgz".to_string())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            del_scoped.is_ok(),
+            "scoped npm delete via /-/ shape must succeed (#2269), got: {del_scoped:?}"
+        );
+        let scoped_live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&scoped_stored)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scoped_live, 0, "the scoped tarball must be soft-deleted");
+
+        // (5) Unscoped delete via the canonical `/-/` URL shape -> Ok, row gone.
+        let del_unscoped = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            del_unscoped.is_ok(),
+            "unscoped npm delete via /-/ shape must succeed (#2269), got: {del_unscoped:?}"
+        );
+        let unscoped_live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(&unscoped_stored)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unscoped_live, 0,
+            "the unscoped tarball must be soft-deleted"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2269 short-circuit guard: a non-npm (generic) repo must be completely
+    /// unaffected — an exact-path download still 200 and a bogus path still 404,
+    /// with no path rewriting (the `candidates.len() > 1` guard skips the
+    /// resolver for formats that have no `/-/` normalization).
+    #[tokio::test]
+    async fn generic_non_npm_download_unchanged_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = Some(tdh::make_auth(user_id, &username));
+
+        let path = "tools/build-1.0.0.bin".to_string();
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"GENERIC-BYTES"),
+        )
+        .await
+        .expect("publish must succeed");
+
+        let dl = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            get_request(),
+        )
+        .await;
+        assert_eq!(
+            dl.expect("exact-path download must resolve")
+                .into_response()
+                .status(),
+            StatusCode::OK,
+        );
+
+        let dl_bogus = download_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), "tools/does-not-exist.bin".to_string())),
+            get_request(),
+        )
+        .await;
+        assert!(
+            matches!(dl_bogus, Err(AppError::NotFound(_))),
+            "an unknown generic path must still 404 (guard short-circuits for non-npm)"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

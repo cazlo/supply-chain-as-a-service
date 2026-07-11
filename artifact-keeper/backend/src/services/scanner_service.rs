@@ -1038,7 +1038,7 @@ pub(crate) async fn fail_scan(
     let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
     warn!("{}", msg);
     ScanWorkspace::cleanup(workspace_base, workspace_prefix, artifact).await;
-    AppError::Internal(msg)
+    preserve_engine_unavailable(error, msg)
 }
 
 /// Variant of [`fail_scan`] that cleans up an explicit workspace path rather
@@ -1053,7 +1053,23 @@ pub(crate) async fn fail_scan_path(
     let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
     warn!("{}", msg);
     ScanWorkspace::cleanup_path(workspace).await;
-    AppError::Internal(msg)
+    preserve_engine_unavailable(error, msg)
+}
+
+/// Map a wrapped scanner error to the [`AppError`] the orchestrator should act
+/// on. A `ScannerEngineUnavailable` (the trivy CLI is intentionally absent,
+/// #2059, so both server + standalone modes spawn-fail with NotFound) is kept
+/// as `ScannerEngineUnavailable` — with its clean inner reason — so the
+/// orchestrator records `not_applicable` instead of failing the scan closed to
+/// grade F. Every other error stays `Internal` -> `failed` (fail-closed). The
+/// verbose `msg` was already logged by the caller for operators.
+fn preserve_engine_unavailable(error: &AppError, msg: String) -> AppError {
+    match error {
+        AppError::ScannerEngineUnavailable(reason) => {
+            AppError::ScannerEngineUnavailable(reason.clone())
+        }
+        _ => AppError::Internal(msg),
+    }
 }
 
 /// Convert a Trivy report into `RawFinding` values. Shared by all scanners
@@ -1861,6 +1877,45 @@ pub(crate) async fn cached_trivy_cli_version(cell: &VersionCache) -> Option<Stri
         format_trivy_version(&raw)
     })
     .await
+}
+
+/// Classify a spawn failure from the `trivy` CLI into an [`AppError`].
+///
+/// Twin of `classify_grype_spawn_error` (grype_scanner.rs), but the
+/// binary-missing case is routed differently. The hardened runtime image
+/// deliberately ships **no** `trivy` CLI: container-image scans go through the
+/// Harbor scanner-adapter over HTTP (`TRIVY_ADAPTER_URL`), and dropping the
+/// binary removed its CVE surface and ~180 MB. The filesystem and incus
+/// scanners, however, invoke `trivy filesystem` locally — even in `--server`
+/// mode the trivy *client* walks the on-disk workspace and only forwards the
+/// discovered package set to `TRIVY_URL`; a remote server cannot scan a
+/// workspace that lives on the backend, so there is no HTTP fallback for them.
+///
+/// A missing `trivy` binary is therefore an availability state, not a scan
+/// error: the kernel returns `io::ErrorKind::NotFound` from the spawn when
+/// `execve()` cannot resolve `trivy` on `PATH`. We surface that as
+/// [`AppError::ScannerEngineUnavailable`] so the orchestrator records a
+/// terminal `not_applicable` row (the bundled grype still scans the same
+/// artifacts via `dir:` mode) instead of `failed`, which would floor the
+/// repository to grade F under fail-closed scoring. Any OTHER spawn failure
+/// (permission denied, fork failure) is a real problem and stays a hard
+/// `Internal` error, keeping the fail-closed contract for genuine breakage.
+///
+/// Pure helper so the classification is unit-testable without depending on
+/// whether `trivy` happens to be installed on the test host.
+pub(crate) fn classify_trivy_spawn_error(err: &std::io::Error) -> AppError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        AppError::ScannerEngineUnavailable(
+            "Trivy CLI not available (the `trivy` executable was not found on \
+             PATH). The runtime image scans container images through the \
+             scanner-adapter over HTTP and does not bundle the trivy CLI, so \
+             the filesystem/incus scanners cannot run here; grype covers these \
+             artifacts instead."
+                .to_string(),
+        )
+    } else {
+        AppError::Internal(format!("Failed to execute Trivy CLI: {}", err))
+    }
 }
 
 /// Parse a Trivy `--version` first stdout line into a `trivy-X.Y.Z` token.
@@ -2789,7 +2844,12 @@ impl ScannerService {
             )));
         }
 
-        // Grype scanner (CLI-based, degrades gracefully if binary not available)
+        // Grype scanner (CLI-based). Unlike the trivy filesystem/incus scanners
+        // — whose engine is optional and, when absent, yields `not_applicable`
+        // via `classify_trivy_spawn_error` — grype is bundled in the runtime
+        // image and intentionally stays fail-closed: a missing grype binary is
+        // `classify_grype_spawn_error` -> hard error -> `failed`, the safety net
+        // for an image that somehow ships no scanner engine at all.
         info!("Grype scanner enabled");
         let mut grype_scanner = GrypeScanner::new(scan_workspace_path.clone());
         // Wire the per-repo token minter so grype's registry pull is
@@ -3439,6 +3499,39 @@ impl ScannerService {
 
                     // Update quarantine status
                     self.update_quarantine_status(artifact_id, total).await?;
+                }
+                Err(AppError::ScannerEngineUnavailable(reason)) => {
+                    // #2059 dropped the trivy CLI from the runtime image (image
+                    // scans moved to the Harbor scanner-adapter over HTTP), but
+                    // the filesystem/incus scanners spawn `trivy` directly and
+                    // there is no HTTP equivalent for a workspace that lives on
+                    // the backend, so on this image they cannot run at all.
+                    // `classify_trivy_spawn_error` surfaced the missing binary as
+                    // `ScannerEngineUnavailable`: an intentionally-absent optional
+                    // engine is an availability state, not a scan error. Record
+                    // the same terminal `not_applicable` row the format gate uses
+                    // (the bundled grype still scans these artifacts via `dir:`
+                    // mode) so the artifact stays scanned-OK (#1648) and the repo
+                    // is not floored to grade F by fail-closed scoring
+                    // (#2167/#2240). Genuine scan failures (unreachable server,
+                    // malformed output) are NOT `NotFound` and fall through to the
+                    // fail-closed arm below.
+                    info!(
+                        "Scanner {} engine unavailable for artifact {}: {}; recording not_applicable",
+                        scanner.name(),
+                        artifact_id,
+                        reason,
+                    );
+                    if let Err(mark_err) = self
+                        .scan_result_service
+                        .mark_not_applicable(scan_result.id, &reason, started_at)
+                        .await
+                    {
+                        warn!(
+                            "Failed to mark scan {} not_applicable (engine unavailable): {}",
+                            scan_result.id, mark_err
+                        );
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -5251,6 +5344,62 @@ mod tests {
         }
         let s = DummyScanner;
         assert_eq!(s.version().await, None);
+    }
+
+    /// A missing `trivy` binary (the hardened image ships none) surfaces
+    /// from the spawn as `io::ErrorKind::NotFound`, which must classify as
+    /// `ScannerEngineUnavailable` so the orchestrator records `not_applicable`
+    /// (grype covers the artifact) rather than failing the scan closed. Pure —
+    /// no dependency on whether `trivy` is installed on the test host.
+    #[test]
+    fn test_classify_trivy_spawn_error_notfound_is_engine_unavailable() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        match classify_trivy_spawn_error(&io_err) {
+            AppError::ScannerEngineUnavailable(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("trivy"),
+                    "message should name the trivy CLI: {msg}"
+                );
+            }
+            other => panic!("NotFound must map to ScannerEngineUnavailable, got {other:?}"),
+        }
+    }
+
+    /// Any OTHER spawn failure (e.g. permission denied) is a genuine
+    /// problem and must stay a hard `Internal` error -> `failed`, preserving
+    /// the fail-closed contract for real breakage.
+    #[test]
+    fn test_classify_trivy_spawn_error_other_stays_hard_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        match classify_trivy_spawn_error(&io_err) {
+            AppError::Internal(_) => {}
+            other => panic!("non-NotFound spawn failure must stay Internal, got {other:?}"),
+        }
+    }
+
+    /// The `fail_scan` / `fail_scan_path` wrappers must NOT flatten a
+    /// `ScannerEngineUnavailable` to `Internal` — otherwise the trivy CLI
+    /// absence surfaces as `failed` (grade F) instead of `not_applicable`.
+    /// (The live path wraps the error through these helpers after both server
+    /// and standalone modes spawn-fail with NotFound.)
+    #[test]
+    fn test_preserve_engine_unavailable_keeps_variant() {
+        let eu = AppError::ScannerEngineUnavailable("trivy CLI not available".into());
+        match preserve_engine_unavailable(&eu, "Trivy filesystem scan failed for app: x".into()) {
+            AppError::ScannerEngineUnavailable(reason) => {
+                assert_eq!(
+                    reason, "trivy CLI not available",
+                    "keeps the clean inner reason"
+                );
+            }
+            other => panic!("engine-unavailable must be preserved, got {other:?}"),
+        }
+        // A genuine error still flattens to Internal -> failed (fail-closed).
+        let boom = AppError::Internal("connection refused".into());
+        assert!(matches!(
+            preserve_engine_unavailable(&boom, "wrapped".into()),
+            AppError::Internal(_)
+        ));
     }
 
     /// Exercise the success path of `capture_cli_version_with_timeout`:
@@ -11931,6 +12080,136 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// A scanner that IS applicable but whose backing engine is absent: its
+    /// `scan` returns `ScannerEngineUnavailable`, exactly as
+    /// `classify_trivy_spawn_error` does when the `trivy` CLI is missing from
+    /// the hardened runtime image. Drives the dispatch branch that records
+    /// a terminal `not_applicable` row (grype still covers the artifact) rather
+    /// than `failed`.
+    struct EngineUnavailableScanner;
+
+    #[async_trait]
+    impl Scanner for EngineUnavailableScanner {
+        fn name(&self) -> &str {
+            "engine-unavailable"
+        }
+
+        fn scan_type(&self) -> &str {
+            // Allowed by scan_results_scan_type_check; the orchestrator persists
+            // a row with this scan_type.
+            "grype"
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+
+        fn is_applicable_for_target(&self, _target: &ScanTarget<'_>) -> bool {
+            true
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            Err(AppError::ScannerEngineUnavailable(
+                "Trivy CLI not available (the `trivy` executable was not found on PATH)"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Regression: when an *applicable* scanner's engine is missing (the
+    /// hardened image ships no trivy CLI, so the filesystem/incus scanners
+    /// spawn `trivy` -> `NotFound`), the orchestration must record a terminal
+    /// `not_applicable` row -- NOT `failed`. A `failed` row would set
+    /// has_failed_scan=true and floor the whole repository to grade F under
+    /// fail-closed scoring (#2167/#2240), even though grype scanned the same
+    /// artifact successfully.
+    #[tokio::test]
+    async fn test_scan_artifact_inner_engine_unavailable_records_not_applicable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return; // skip cleanly when no DATABASE_URL
+        };
+
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("engine-unavailable/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, path, size_bytes, checksum_sha256,
+                content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, 'pkg.jar', 'pkg.jar', 4, $3,
+                    'application/java-archive', $4, false)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+
+        // prepared=None -> InsertFresh path; the row is created, scan() returns
+        // ScannerEngineUnavailable, and the orchestrator marks it not_applicable.
+        let scanner = ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![Arc::new(EngineUnavailableScanner)],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        };
+
+        scanner
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration must succeed when the engine is unavailable");
+
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, error_message FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_all(&fx.pool)
+                .await
+                .expect("read scan rows");
+
+        assert_eq!(rows.len(), 1, "exactly one scan row expected");
+        assert_eq!(
+            rows[0].0, "not_applicable",
+            "engine-unavailable must persist not_applicable, never failed"
+        );
+        assert!(
+            rows[0]
+                .1
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not available"),
+            "reason text must be preserved for display"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
     /// #1470 regression (Reuse path): when the trigger handler pre-allocated a
     /// `running` scan_results row and the scanner turns out not to apply, the
     /// orchestration must UPDATE that row to `not_applicable` in place -- never
@@ -12493,5 +12772,851 @@ mod tests {
             .await;
 
         fx.teardown().await;
+    }
+
+    // =======================================================================
+    // #1706: end-to-end scan -> SBOM orchestration matrix.
+    //
+    // Covers the full `ScannerService::scan_artifact_*` pipeline
+    // (scan_target -> create_findings/create_packages -> complete_scan /
+    // fail_scan -> recalculate_score -> optional Dependency-Track submit)
+    // across the 3x4 matrix of {Grype, OpenSCAP, Dependency-Track} x
+    // {happy, egress-restricted, zero-finding, wrong-format}.
+    //
+    // The Grype/OpenSCAP cells inject a `FakeScanner` (an `Arc<dyn Scanner>`)
+    // via direct `ScannerService { .. }` construction, reusing the exact
+    // seam the `NeverApplicableScanner` tests use above. The Dependency-Track
+    // cells point a real `DependencyTrackService` at a `wiremock` server.
+    // No cell shells out to a live scanner, so all 12 run deterministically
+    // in the CI unit + coverage jobs (Postgres + wiremock only).
+    //
+    // SECURITY-CRITICAL ASYMMETRY (do NOT "fix" it): a Grype/OpenSCAP scan
+    // error must FAIL CLOSED (scan_results.status = 'failed'), because an
+    // unreachable vuln DB must never present as a clean row. Dependency-Track
+    // submission is best-effort/fire-and-forget (see
+    // `submit_sbom_to_dependency_track`): a DT outage must NOT fail the scan.
+    // =======================================================================
+    mod e2e_scan_sbom_matrix {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::sbom::SbomFormat;
+        use crate::services::dependency_track_service::{
+            DependencyTrackConfig, DependencyTrackService,
+        };
+        use crate::services::sbom_service::SbomService;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // ---- Fake scanner (Grype / OpenSCAP shape) ------------------------
+
+        /// What a [`FakeScanner`] emits when the orchestrator invokes it.
+        enum FakeOutcome {
+            /// Scanner ran successfully and returned this finding + package set.
+            Complete {
+                findings: Vec<RawFinding>,
+                packages: Vec<RawPackage>,
+            },
+            /// Scanner errored (e.g. could not reach its vuln DB, or produced
+            /// an unparseable report). Drives the fail-closed orchestration
+            /// path (`fail_scan` -> status='failed').
+            Fail(String),
+        }
+
+        /// An in-process `Arc<dyn Scanner>` that drives the real orchestration
+        /// with zero external processes. `scan_type` is set to `"grype"` or
+        /// `"openscap"` so the persisted `scan_results.scan_type` matches the
+        /// production branching. Applicability defaults to `true`.
+        struct FakeScanner {
+            scanner_name: String,
+            scan_type: &'static str,
+            outcome: FakeOutcome,
+        }
+
+        impl FakeScanner {
+            fn completed(
+                scan_type: &'static str,
+                findings: Vec<RawFinding>,
+                packages: Vec<RawPackage>,
+            ) -> Arc<dyn Scanner> {
+                Arc::new(FakeScanner {
+                    scanner_name: format!("fake-{scan_type}"),
+                    scan_type,
+                    outcome: FakeOutcome::Complete { findings, packages },
+                })
+            }
+
+            fn failing(scan_type: &'static str, reason: &str) -> Arc<dyn Scanner> {
+                Arc::new(FakeScanner {
+                    scanner_name: format!("fake-{scan_type}"),
+                    scan_type,
+                    outcome: FakeOutcome::Fail(reason.to_string()),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl Scanner for FakeScanner {
+            fn name(&self) -> &str {
+                &self.scanner_name
+            }
+
+            fn scan_type(&self) -> &str {
+                self.scan_type
+            }
+
+            async fn scan(
+                &self,
+                _artifact: &Artifact,
+                _metadata: Option<&ArtifactMetadata>,
+                _content: &Bytes,
+            ) -> Result<ScanOutput> {
+                match &self.outcome {
+                    FakeOutcome::Complete { findings, packages } => Ok(ScanOutput {
+                        findings: findings.clone(),
+                        packages: packages.clone(),
+                        scan_completeness: ScanCompleteness::Complete,
+                    }),
+                    // Displays as "Internal error: <reason>" so the reason is
+                    // preserved in scan_results.error_message via fail_scan.
+                    FakeOutcome::Fail(reason) => Err(AppError::Internal(reason.clone())),
+                }
+            }
+        }
+
+        // ---- Builders (shared to keep jscpd duplication low) --------------
+
+        fn cve_finding(severity: Severity, cve: &str, component: &str) -> RawFinding {
+            RawFinding {
+                severity,
+                title: format!("{cve} in {component}"),
+                description: Some("injected by #1706 matrix e2e test".to_string()),
+                cve_id: Some(cve.to_string()),
+                affected_component: Some(component.to_string()),
+                affected_version: Some("1.0.0".to_string()),
+                fixed_version: Some("1.0.1".to_string()),
+                source: Some("test".to_string()),
+                source_url: None,
+            }
+        }
+
+        fn raw_package(name: &str, version: &str) -> RawPackage {
+            RawPackage {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+                purl: Some(format!("pkg:generic/{name}@{version}")),
+                license: Some("MIT".to_string()),
+                source_target: Some("package-lock.json".to_string()),
+            }
+        }
+
+        /// One Critical + one High CVE — the standard "vulnerable artifact"
+        /// finding set shared by the happy-path cells.
+        fn two_cve_findings() -> Vec<RawFinding> {
+            vec![
+                cve_finding(Severity::Critical, "CVE-2024-0001", "body-parser"),
+                cve_finding(Severity::High, "CVE-2024-0002", "lodash"),
+            ]
+        }
+
+        /// Two inventory packages — drives scan_packages persistence and a
+        /// non-empty SBOM component list.
+        fn two_packages() -> Vec<RawPackage> {
+            vec![
+                raw_package("body-parser", "1.19.0"),
+                raw_package("lodash", "4.17.19"),
+            ]
+        }
+
+        /// A `grype`-shaped fake scanner that completes with the standard
+        /// finding+package set — the common driver for the DT / SBOM cells.
+        fn grype_completed() -> Arc<dyn Scanner> {
+            FakeScanner::completed("grype", two_cve_findings(), two_packages())
+        }
+
+        // ---- Service + artifact construction ------------------------------
+
+        /// Build a `ScannerService` wired to the fixture's DB/storage with the
+        /// supplied fake scanners and optional Dependency-Track service.
+        /// Wrapped as a helper so the private struct literal is written once
+        /// rather than copy-pasted across every matrix cell (jscpd <3%).
+        fn make_scanner_service_with(
+            fx: &tdh::Fixture,
+            scanners: Vec<Arc<dyn Scanner>>,
+            dependency_track: Option<Arc<DependencyTrackService>>,
+        ) -> ScannerService {
+            ScannerService {
+                db: fx.pool.clone(),
+                scanners,
+                scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+                scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+                storage: fx.state.storage.clone(),
+                storage_registry: fx.state.storage_registry.clone(),
+                storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+                scan_workspace_path: fx
+                    .storage_dir
+                    .join("scan-workspace")
+                    .to_string_lossy()
+                    .into_owned(),
+                dependency_track,
+            }
+        }
+
+        /// Insert a non-deleted artifact AND store its bytes so the
+        /// orchestrator's `fetch_artifact_content_from_storage` read succeeds
+        /// before the (fake) scanner runs. Returns the artifact id.
+        async fn seed_scannable_artifact(fx: &tdh::Fixture, prefix: &str) -> Uuid {
+            let artifact_id = Uuid::new_v4();
+            let checksum = fresh_checksum();
+            let storage_key = format!("{prefix}/{artifact_id}.bin");
+            fx.state
+                .storage
+                .put(&storage_key, Bytes::from_static(b"scan-me"))
+                .await
+                .expect("store artifact bytes");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    id, repository_id, name, path, size_bytes, checksum_sha256,
+                    content_type, storage_key, is_deleted
+                )
+                VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 7, $3,
+                        'application/octet-stream', $4, false)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .bind(&checksum)
+            .bind(&storage_key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert scannable artifact");
+            artifact_id
+        }
+
+        /// One-shot matrix-cell setup: fixture + seeded artifact + a scan run
+        /// with the given fakes/DT. Returns `None` (skip the test) when
+        /// `DATABASE_URL` is unset. The orchestration always returns `Ok(())` —
+        /// scanner failures are recorded on the row, not propagated — so the
+        /// `expect` here is valid for the fail-closed cells too. Factored out
+        /// so the ~6-line preamble is not copy-pasted across 15 cells (jscpd).
+        async fn setup_and_scan(
+            prefix: &str,
+            scanners: Vec<Arc<dyn Scanner>>,
+            dependency_track: Option<Arc<DependencyTrackService>>,
+        ) -> Option<(tdh::Fixture, Uuid)> {
+            let fx = tdh::Fixture::setup("local", "generic").await?;
+            let artifact_id = seed_scannable_artifact(&fx, prefix).await;
+            let scanner = make_scanner_service_with(&fx, scanners, dependency_track);
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok (failures land on the row)");
+            Some((fx, artifact_id))
+        }
+
+        /// Cascade-clean the scan state and drop the fixture. Shared postamble.
+        async fn finish(fx: tdh::Fixture) {
+            cleanup_scan_state(&fx.pool, fx.repo_id).await;
+            fx.teardown().await;
+        }
+
+        // ---- Read-back helpers --------------------------------------------
+
+        #[derive(Debug)]
+        struct ScanRow {
+            status: String,
+            findings_count: i32,
+            critical_count: i32,
+            high_count: i32,
+            inventory_status: String,
+            error_message: Option<String>,
+        }
+
+        /// Read the latest `scan_results` row for an (artifact, scan_type).
+        async fn latest_scan_row(pool: &PgPool, artifact_id: Uuid, scan_type: &str) -> ScanRow {
+            let row: (String, i32, i32, i32, String, Option<String>) = sqlx::query_as(
+                r#"
+                SELECT status, findings_count, critical_count, high_count,
+                       inventory_status, error_message
+                FROM scan_results
+                WHERE artifact_id = $1 AND scan_type = $2
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(scan_type)
+            .fetch_one(pool)
+            .await
+            .expect("scan_results row must exist for this scan_type");
+            ScanRow {
+                status: row.0,
+                findings_count: row.1,
+                critical_count: row.2,
+                high_count: row.3,
+                inventory_status: row.4,
+                error_message: row.5,
+            }
+        }
+
+        async fn latest_scan_id(pool: &PgPool, artifact_id: Uuid, scan_type: &str) -> Uuid {
+            sqlx::query_scalar(
+                "SELECT id FROM scan_results WHERE artifact_id = $1 AND scan_type = $2 \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(artifact_id)
+            .bind(scan_type)
+            .fetch_one(pool)
+            .await
+            .expect("scan id")
+        }
+
+        async fn scan_package_count(pool: &PgPool, scan_id: Uuid) -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_packages WHERE scan_result_id = $1")
+                .bind(scan_id)
+                .fetch_one(pool)
+                .await
+                .expect("count packages")
+        }
+
+        /// Assert the row carries a fail-closed error whose message preserves
+        /// `reason`. Shared by every egress/wrong-format cell.
+        fn assert_failed_closed(row: &ScanRow, reason: &str) {
+            assert_eq!(
+                row.status, "failed",
+                "scanner error must FAIL CLOSED, never present as clean/completed"
+            );
+            assert_ne!(row.status, "completed");
+            assert_ne!(row.status, "not_applicable");
+            assert_eq!(row.inventory_status, "failed");
+            assert!(
+                row.error_message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(reason),
+                "error_message must preserve the failure reason ({reason}), got: {:?}",
+                row.error_message
+            );
+        }
+
+        /// Generate a CycloneDX SBOM from the packages the scan persisted into
+        /// `scan_packages`, exercising the same inventory-derived path the DT
+        /// submit uses. Returns the persisted SBOM document.
+        async fn sbom_from_persisted_inventory(
+            fx: &tdh::Fixture,
+            artifact_id: Uuid,
+        ) -> crate::models::sbom::SbomDocument {
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> =
+                sqlx::query_as(
+                    r#"
+                    SELECT sp.name, sp.version, sp.purl, sp.license
+                    FROM scan_packages sp
+                    JOIN scan_results sr ON sr.id = sp.scan_result_id
+                    WHERE sr.artifact_id = $1
+                    "#,
+                )
+                .bind(artifact_id)
+                .fetch_all(&fx.pool)
+                .await
+                .expect("read persisted scan_packages");
+            let deps = build_dependency_info_from_packages(rows, "generic");
+            SbomService::new(fx.pool.clone())
+                .generate_sbom(artifact_id, fx.repo_id, SbomFormat::CycloneDX, deps)
+                .await
+                .expect("SBOM generation must succeed")
+        }
+
+        fn dt_service_at(base_url: &str) -> Arc<DependencyTrackService> {
+            let dt = DependencyTrackService::new(DependencyTrackConfig {
+                base_url: base_url.to_string(),
+                api_key: "matrix-test-key".to_string(),
+                enabled: true,
+            })
+            .expect("construct DT service");
+            Arc::new(dt)
+        }
+
+        // ===================================================================
+        // Grype-shape cells (findings + package inventory)
+        // ===================================================================
+
+        /// happy: scanner runs, findings + packages persist, status=completed,
+        /// counts correct, findings retrievable via the read path.
+        #[tokio::test]
+        async fn test_grype_happy_path_completes_and_persists() {
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "grype-happy",
+                vec![FakeScanner::completed(
+                    "grype",
+                    two_cve_findings(),
+                    two_packages(),
+                )],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed", "happy scan must complete");
+            assert_eq!(row.findings_count, 2);
+            assert_eq!(row.critical_count, 1);
+            assert_eq!(row.high_count, 1);
+            assert_eq!(
+                row.inventory_status, "complete",
+                "package inventory persisted -> inventory_status=complete"
+            );
+
+            // scan_packages persisted.
+            let scan_id = latest_scan_id(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(
+                scan_package_count(&fx.pool, scan_id).await,
+                2,
+                "both inventory packages must be persisted"
+            );
+
+            // Findings retrievable via the same read path the API uses.
+            let (findings, total) = ScanResultService::new(fx.pool.clone())
+                .list_findings(scan_id, 0, 50)
+                .await
+                .expect("list findings");
+            assert_eq!(total, 2);
+            let cves: Vec<String> = findings.iter().filter_map(|f| f.cve_id.clone()).collect();
+            assert!(cves.contains(&"CVE-2024-0001".to_string()));
+            assert!(cves.contains(&"CVE-2024-0002".to_string()));
+
+            finish(fx).await;
+        }
+
+        /// egress-restricted (SECURITY-CRITICAL): scanner cannot reach its vuln
+        /// DB -> Err -> the row must FAIL CLOSED (status='failed',
+        /// inventory_status='failed', error preserved). It must NEVER land as a
+        /// clean/completed zero-findings row. The repo score also fails closed
+        /// (has_failed_scan=true, #2167).
+        #[tokio::test]
+        async fn test_grype_egress_restricted_fails_closed() {
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "grype-egress",
+                vec![FakeScanner::failing("grype", "grype vuln DB unreachable")],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_failed_closed(&row, "grype vuln DB unreachable");
+
+            // Repo-level gate also fails closed.
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            assert!(
+                score.has_failed_scan,
+                "a failed scan must flag the repo has_failed_scan=true (fail-closed gate)"
+            );
+
+            finish(fx).await;
+        }
+
+        /// zero-finding: scanner RAN and found nothing (0 findings, packages
+        /// present). Must land as status='completed' with findings_count=0 —
+        /// distinct from not_applicable (scanner did not run, #1693) and from
+        /// failed. SBOM stays non-empty because the inventory persisted.
+        #[tokio::test]
+        async fn test_grype_zero_finding_completes_not_not_applicable() {
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "grype-zero",
+                vec![FakeScanner::completed("grype", vec![], two_packages())],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(
+                row.status, "completed",
+                "a clean scan that RAN must be completed, not not_applicable/failed"
+            );
+            assert_eq!(row.findings_count, 0);
+            assert_eq!(row.critical_count, 0);
+            assert_eq!(row.high_count, 0);
+
+            // Inventory still persisted -> SBOM non-empty even with zero CVEs.
+            let sbom = sbom_from_persisted_inventory(&fx, artifact_id).await;
+            assert!(
+                sbom.component_count >= 2,
+                "zero-CVE scan must still yield a non-empty SBOM (components={})",
+                sbom.component_count
+            );
+
+            finish(fx).await;
+        }
+
+        /// wrong-format: scanner produced an unparseable report -> Err. The
+        /// orchestration must gracefully mark the row failed and return Ok(())
+        /// (no panic, no 5xx propagation).
+        #[tokio::test]
+        async fn test_grype_wrong_format_fails_gracefully() {
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "grype-badfmt",
+                vec![FakeScanner::failing(
+                    "grype",
+                    "grype failed: malformed report (unexpected end of JSON)",
+                )],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_failed_closed(&row, "malformed report");
+
+            finish(fx).await;
+        }
+
+        // ===================================================================
+        // OpenSCAP-shape cells (policy findings only, no package inventory)
+        // ===================================================================
+
+        /// happy: OpenSCAP-shape scanner returns findings-only (no inventory).
+        /// status=completed, findings persisted; SBOM falls back to
+        /// scan_findings for the component list.
+        #[tokio::test]
+        async fn test_openscap_happy_path_findings_only_completes() {
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "openscap-happy",
+                vec![FakeScanner::completed(
+                    "openscap",
+                    vec![cve_finding(Severity::High, "CVE-2024-9001", "openssl")],
+                    vec![],
+                )],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "openscap").await;
+            assert_eq!(row.status, "completed");
+            assert_eq!(row.findings_count, 1);
+            assert_eq!(row.high_count, 1);
+
+            // No package inventory was emitted -> no scan_packages rows.
+            let scan_id = latest_scan_id(&fx.pool, artifact_id, "openscap").await;
+            assert_eq!(
+                scan_package_count(&fx.pool, scan_id).await,
+                0,
+                "findings_only shape persists no inventory"
+            );
+
+            finish(fx).await;
+        }
+
+        /// egress-restricted (SECURITY-CRITICAL): OpenSCAP sidecar unreachable
+        /// -> Err -> fail closed at the orchestration level.
+        #[tokio::test]
+        async fn test_openscap_egress_restricted_fails_closed() {
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "openscap-egress",
+                vec![FakeScanner::failing(
+                    "openscap",
+                    "openscap sidecar unreachable",
+                )],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "openscap").await;
+            assert_failed_closed(&row, "openscap sidecar unreachable");
+
+            finish(fx).await;
+        }
+
+        /// zero-finding: OpenSCAP ran and found no policy violations ->
+        /// completed with findings_count=0 (not not_applicable/failed).
+        #[tokio::test]
+        async fn test_openscap_zero_finding_completes() {
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "openscap-zero",
+                vec![FakeScanner::completed("openscap", vec![], vec![])],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "openscap").await;
+            assert_eq!(row.status, "completed");
+            assert_ne!(row.status, "not_applicable");
+            assert_eq!(row.findings_count, 0);
+
+            finish(fx).await;
+        }
+
+        /// wrong-format: OpenSCAP returned an unparseable document -> Err ->
+        /// graceful failure (status=failed, no panic).
+        #[tokio::test]
+        async fn test_openscap_wrong_format_fails_gracefully() {
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "openscap-badfmt",
+                vec![FakeScanner::failing(
+                    "openscap",
+                    "openscap failed: could not parse ARF result",
+                )],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "openscap").await;
+            assert_failed_closed(&row, "could not parse ARF result");
+
+            finish(fx).await;
+        }
+
+        // ===================================================================
+        // Dependency-Track cells (best-effort SBOM submit via wiremock)
+        //
+        // A grype-shape fake drives the scan to `completed` so the post-scan
+        // DT submit path has an inventory to forward. The assertions focus on
+        // the DT-specific behavior: a submit happens on happy/zero-finding,
+        // and a DT outage/garbage response is SWALLOWED (scan still completes).
+        // ===================================================================
+
+        /// Mount the DT project-lookup + BOM-upload endpoints for a healthy DT.
+        async fn mount_healthy_dt(server: &MockServer) {
+            // Lookup returns an existing project (skips the create PUT).
+            Mock::given(method("GET"))
+                .and(path("/api/v1/project/lookup"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "uuid": "11111111-1111-1111-1111-111111111111",
+                    "name": "pkg.bin",
+                    "version": null
+                })))
+                .mount(server)
+                .await;
+            // DT's BOM ingest endpoint is a PUT (see `upload_sbom`).
+            Mock::given(method("PUT"))
+                .and(path("/api/v1/bom"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"token": "bom-token-1706"})),
+                )
+                .mount(server)
+                .await;
+        }
+
+        async fn dt_received_bom_upload(server: &MockServer) -> bool {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.method == wiremock::http::Method::PUT && r.url.path() == "/api/v1/bom")
+        }
+
+        /// happy: after a completed scan with inventory, the orchestrator PUTs
+        /// the generated CycloneDX SBOM to DT's /api/v1/bom.
+        #[tokio::test]
+        async fn test_dt_happy_path_submits_sbom_after_completed_scan() {
+            let server = MockServer::start().await;
+            mount_healthy_dt(&server).await;
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "dt-happy",
+                vec![grype_completed()],
+                Some(dt_service_at(&server.uri())),
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed");
+            assert!(
+                dt_received_bom_upload(&server).await,
+                "DT must receive the SBOM upload after a completed scan"
+            );
+
+            finish(fx).await;
+        }
+
+        /// zero-finding: a clean scan (0 CVEs, packages present) must STILL
+        /// submit its SBOM to DT so DT can run independent correlation (#965).
+        #[tokio::test]
+        async fn test_dt_zero_finding_still_submits_sbom() {
+            let server = MockServer::start().await;
+            mount_healthy_dt(&server).await;
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "dt-zero",
+                vec![FakeScanner::completed("grype", vec![], two_packages())],
+                Some(dt_service_at(&server.uri())),
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed");
+            assert_eq!(row.findings_count, 0);
+            assert!(
+                dt_received_bom_upload(&server).await,
+                "even a zero-CVE scan must forward its inventory SBOM to DT"
+            );
+
+            finish(fx).await;
+        }
+
+        /// egress-restricted (DT is DIFFERENT — best-effort): DT unreachable
+        /// must NOT fail the scan. Point DT at a dead port; the scan still
+        /// completes and the orchestrator swallows the transport error.
+        /// This asymmetry vs Grype/OpenSCAP is correct behavior, not a bug.
+        #[tokio::test]
+        async fn test_dt_egress_restricted_scan_still_completes() {
+            // 127.0.0.1:0 is a private, always-refused address.
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "dt-egress",
+                vec![grype_completed()],
+                Some(dt_service_at("http://127.0.0.1:0")),
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(
+                row.status, "completed",
+                "DT is best-effort: an unreachable DT must not flip the scan to failed"
+            );
+            assert_eq!(row.findings_count, 2);
+
+            finish(fx).await;
+        }
+
+        /// wrong-format: DT returns a malformed JSON body. The parse error is
+        /// swallowed (best-effort) and the scan still completes.
+        #[tokio::test]
+        async fn test_dt_wrong_format_response_swallowed() {
+            let server = MockServer::start().await;
+            // Lookup returns 200 but with an unparseable body -> DT service
+            // maps it to a parse error, which the orchestrator swallows.
+            Mock::given(method("GET"))
+                .and(path("/api/v1/project/lookup"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("{ not-json"))
+                .mount(&server)
+                .await;
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "dt-badfmt",
+                vec![grype_completed()],
+                Some(dt_service_at(&server.uri())),
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(
+                row.status, "completed",
+                "a garbage DT response must be swallowed; scan still completes"
+            );
+
+            finish(fx).await;
+        }
+
+        // ===================================================================
+        // SBOM-generation cross-checks + gate contrast
+        // ===================================================================
+
+        /// SBOM contains the scanned components on a happy (with-CVE) scan.
+        #[tokio::test]
+        async fn test_sbom_components_present_for_happy_scan() {
+            let Some((fx, artifact_id)) =
+                setup_and_scan("sbom-happy", vec![grype_completed()], None).await
+            else {
+                return;
+            };
+
+            let sbom = sbom_from_persisted_inventory(&fx, artifact_id).await;
+            assert_eq!(sbom.format, "cyclonedx");
+            assert!(
+                sbom.component_count >= 2,
+                "SBOM must include the scanned components (got {})",
+                sbom.component_count
+            );
+
+            finish(fx).await;
+        }
+
+        /// SBOM is still non-empty when the scan found zero CVEs (inventory
+        /// drives the component list, not the finding list).
+        #[tokio::test]
+        async fn test_sbom_components_present_for_zero_finding_scan() {
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "sbom-zero",
+                vec![FakeScanner::completed("grype", vec![], two_packages())],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let sbom = sbom_from_persisted_inventory(&fx, artifact_id).await;
+            assert!(
+                sbom.component_count >= 2,
+                "a zero-CVE SBOM must still enumerate the dependency tree (got {})",
+                sbom.component_count
+            );
+
+            finish(fx).await;
+        }
+
+        /// gate contrast: a COMPLETED scan must NOT flag the repo failed-closed
+        /// (has_failed_scan=false), i.e. a scanned-clean artifact is not
+        /// blocked — the positive counterpart to the egress fail-closed cells.
+        #[tokio::test]
+        async fn test_completed_scan_does_not_flag_repo_failed() {
+            let Some((fx, _artifact_id)) = setup_and_scan(
+                "gate-clean",
+                vec![FakeScanner::completed("grype", vec![], two_packages())],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row exists");
+            assert!(
+                !score.has_failed_scan,
+                "a completed scan must NOT flag the repo has_failed_scan (not blocked)"
+            );
+
+            finish(fx).await;
+        }
     }
 }

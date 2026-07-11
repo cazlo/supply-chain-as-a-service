@@ -842,7 +842,8 @@ mod tests {
             is_api_token: true,
             is_service_account: true,
             scopes: Some(vec!["read".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -855,7 +856,8 @@ mod tests {
             is_api_token: true,
             is_service_account: true,
             scopes: Some(vec!["write".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -931,7 +933,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         // JWT sessions pass the scope check (they are not scope-restricted),
         // so the next gate, require_admin, must catch them.
@@ -955,7 +958,8 @@ mod tests {
             is_api_token: true,
             is_service_account: true,
             scopes: Some(vec!["read".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(
             ext.require_scope("write").is_err(),

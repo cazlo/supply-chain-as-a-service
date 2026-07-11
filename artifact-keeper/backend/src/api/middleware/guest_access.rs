@@ -21,11 +21,19 @@
 //! The guard is registered as an outer (global) layer in `routes::create_router`,
 //! which means it runs **before** the inner `auth_middleware` /
 //! `optional_auth_middleware` / `repo_visibility_middleware` layers populate
-//! request extensions. To make the gating decision we therefore call
-//! `try_resolve_auth` directly (the same helper the optional and visibility
-//! middlewares use) and short-circuit with 401 if no principal is found and
-//! the path is not allowlisted. Inner middlewares run again on requests that
-//! pass the guard and populate the extensions used by handlers.
+//! request extensions. To make the gating decision we therefore resolve auth
+//! directly (the same path the optional and visibility middlewares use) and
+//! short-circuit if the path is not allowlisted. Inner middlewares run again on
+//! requests that pass the guard and populate the extensions used by handlers.
+//!
+//! We resolve via [`try_resolve_auth_outcome`] and match on the full
+//! [`AuthOutcome`] rather than a boolean "is there a principal?" check, so a
+//! transient [`AuthOutcome::Overloaded`] shed (the bcrypt-capacity cap
+//! saturating) becomes a retryable **503**, not a 401. Flattening `Overloaded`
+//! into an "unauthenticated" 401 would fail requests carrying valid credentials
+//! under load — the exact regression `AuthOutcome::Overloaded` exists to prevent
+//! (a saturated auth cap is retryable; non-retrying clients such as twine abort
+//! on 401). The guard therefore returns the same 503 the inner middlewares do.
 
 use std::sync::Arc;
 
@@ -38,7 +46,9 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::api::middleware::auth::{extract_token, try_resolve_auth};
+use crate::api::middleware::auth::{
+    extract_token, service_unavailable_response, try_resolve_auth_outcome, AuthOutcome,
+};
 use crate::services::auth_service::AuthService;
 
 /// Shared state for the guest-access guard.
@@ -112,6 +122,25 @@ fn unauthorized_response() -> Response {
     response
 }
 
+/// Map a resolved [`AuthOutcome`] to the guard's short-circuit response, or
+/// `None` when the request should be allowed through to the inner layers.
+///
+/// This is the load-bearing distinction: an `Overloaded` shed must yield a
+/// retryable **503**, NOT a 401. Collapsing it into the "unauthenticated" 401
+/// would make valid credentials fail under transient auth-cap saturation. Kept
+/// as a pure function so the mapping is unit-testable without a live auth backend.
+fn guard_short_circuit(outcome: &AuthOutcome) -> Option<Response> {
+    match outcome {
+        // A principal resolved — let the request through; inner middlewares
+        // re-resolve and populate request extensions for handlers.
+        AuthOutcome::Resolved(_) => None,
+        // Transient bcrypt-capacity shed: retryable 503, never a 401.
+        AuthOutcome::Overloaded => Some(service_unavailable_response()),
+        // No/invalid credential presented: guest access is disabled → 401.
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => Some(unauthorized_response()),
+    }
+}
+
 /// Middleware that blocks unauthenticated requests when guest access is
 /// disabled server-wide. See module docs for behaviour and allowlist.
 pub async fn guest_access_guard(
@@ -128,19 +157,17 @@ pub async fn guest_access_guard(
         return next.run(request).await;
     }
 
-    // Resolve auth from the request headers. We only need to know whether
-    // some valid principal exists; the inner auth middleware will populate
-    // the request extensions for handlers if the guard lets the request
-    // through.
+    // Resolve auth from the request headers via `try_resolve_auth_outcome` and
+    // match the full outcome so a transient `AuthOutcome::Overloaded` shed
+    // becomes a retryable 503 rather than a spurious 401 — see module docs.
+    // Inner middlewares re-resolve and populate request extensions for handlers
+    // on requests that pass the guard.
     let extracted = extract_token(&request);
-    if try_resolve_auth(&state.auth_service, extracted)
-        .await
-        .is_some()
-    {
-        return next.run(request).await;
+    let outcome = try_resolve_auth_outcome(&state.auth_service, extracted).await;
+    match guard_short_circuit(&outcome) {
+        Some(response) => response,
+        None => next.run(request).await,
     }
-
-    unauthorized_response()
 }
 
 #[cfg(test)]
@@ -207,6 +234,37 @@ mod tests {
         assert!(!is_allowlisted("/foo/api/v1/auth"));
         assert!(!is_allowlisted("/proxy/v2/library"));
         assert!(!is_allowlisted("/api/v1/authentication"));
+    }
+
+    // -- guard_short_circuit (Overloaded must be 503, never 401) --
+
+    #[test]
+    fn short_circuit_overloaded_is_503_not_401() {
+        // Regression: a transient bcrypt-capacity shed must surface as a
+        // retryable 503 through the guard. Collapsing it into the
+        // GUEST_ACCESS_DISABLED 401 is what broke preemptive-auth clients
+        // (twine, uv/pip token-in-url, CI X-API-Key) under concurrent load.
+        let resp =
+            guard_short_circuit(&AuthOutcome::Overloaded).expect("Overloaded must short-circuit");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "503 shed should carry a Retry-After hint"
+        );
+    }
+
+    #[test]
+    fn short_circuit_no_credential_is_401() {
+        let resp = guard_short_circuit(&AuthOutcome::NoCredential)
+            .expect("NoCredential must short-circuit");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn short_circuit_invalid_credential_is_401() {
+        let resp = guard_short_circuit(&AuthOutcome::InvalidCredential)
+            .expect("InvalidCredential must short-circuit");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // -- unauthorized_response --
@@ -292,6 +350,11 @@ mod tests {
     fn lazy_pool() -> sqlx::PgPool {
         PgPoolOptions::new()
             .max_connections(1)
+            // This pool can only ever fail (the DB does not exist); a short
+            // acquire deadline makes that failure prompt. sqlx's default 30s
+            // otherwise stalls every guard test that touches the API-token
+            // path for the full timeout under parallel coverage runs.
+            .acquire_timeout(std::time::Duration::from_secs(1))
             .connect_lazy("postgresql://localhost/__guest_access_unit_test__")
             .expect("lazy connect should succeed without contacting the DB")
     }
@@ -462,24 +525,30 @@ mod tests {
         let auth_service = Arc::new(AuthService::new(pool.clone(), cfg.clone()));
 
         // Insert a real user so the DB watermark check has a row to consult.
-        // Backdate the credential-bearing columns so the token's `iat` is
-        // strictly after them and the async validator accepts.
+        // Backdate ALL credential-bearing columns so the token's `iat` is
+        // strictly after them and the async validator accepts. This must
+        // include `privileges_changed_at` (migration 131, DEFAULT NOW()): it
+        // is folded into the credential-change watermark GREATEST(...), so
+        // omitting it pins the watermark to insert time and the token minted
+        // microseconds later intermittently 401s under parallel test load.
+        // Runtime `sqlx::query` (not `query!`) keeps SQLX_OFFLINE builds
+        // working without regenerating .sqlx metadata for a test-only insert.
         let user_id = uuid::Uuid::new_v4();
         let username = format!("guest_jwt_{}", &user_id.to_string()[..8]);
-        sqlx::query!(
-            r#"
-            INSERT INTO users (id, username, email, password_hash, auth_provider,
-                               is_active, is_admin, password_changed_at,
-                               failed_login_attempts, created_at, updated_at)
-            VALUES ($1, $2, $3, 'unused', 'local', true, false,
-                    NOW() - INTERVAL '60 seconds', 0,
-                    NOW() - INTERVAL '60 seconds',
-                    NOW() - INTERVAL '60 seconds')
-            "#,
-            user_id,
-            username,
-            format!("{username}@test.com"),
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+                                is_active, is_admin, password_changed_at, \
+                                privileges_changed_at, failed_login_attempts, \
+                                created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, false, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds', 0, \
+                     NOW() - INTERVAL '60 seconds', \
+                     NOW() - INTERVAL '60 seconds')",
         )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.com"))
         .execute(&pool)
         .await
         .expect("insert test user");
@@ -544,7 +613,35 @@ mod tests {
 
     #[tokio::test]
     async fn guard_rejects_request_with_invalid_bearer_when_disabled() {
-        let app = make_app(make_state(false));
+        // An unknown bearer falls through JWT validation to the API-token
+        // lookup, which hits Postgres. With the guard now surfacing
+        // `AuthOutcome::Overloaded` as 503, an *unreachable* pool is
+        // (correctly) classified as a transient pool-timeout shed rather
+        // than an invalid credential — so this test needs a real DB to
+        // deterministically observe the 401. Skip when `DATABASE_URL` is
+        // unset, mirroring `guard_allows_request_with_valid_jwt_when_disabled`;
+        // CI runs it against the real postgres service. The DB-free mapping
+        // (`InvalidCredential` -> 401, `Overloaded` -> 503) is pinned by the
+        // `guard_short_circuit` unit tests above.
+        //
+        // Reuse the shared `test_db_helpers::try_pool()` scaffold (same skip
+        // semantics) instead of open-coding the DATABASE_URL/connect dance —
+        // that copy keeps the guard/DB setup a single source of truth and
+        // avoids a jscpd clone of the sibling test's connect block.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mut config = Config::test_config();
+        config.guest_access_enabled = false;
+        let auth_service = Arc::new(AuthService::new(pool, Arc::new(config)));
+        let state = GuestAccessState {
+            guest_access_enabled: false,
+            auth_service,
+        };
+
+        let app = make_app(state);
         let resp = app
             .oneshot(
                 Request::builder()

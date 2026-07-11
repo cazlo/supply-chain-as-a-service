@@ -47,6 +47,7 @@ use artifact_keeper_backend::{
     },
     services::{
         auth_service::AuthService,
+        cache_invalidation,
         dependency_track_service::DependencyTrackService,
         metrics_service,
         opensearch_service::OpenSearchService,
@@ -655,6 +656,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
+    let age_gate_service = Arc::new(
+        artifact_keeper_backend::services::age_gate_service::AgeGateService::new(
+            db_pool.clone(),
+            app_state.event_bus.clone(),
+        ),
+    );
+    app_state.set_age_gate_service(age_gate_service);
+
     // Initialize SMTP service (optional, graceful no-op when SMTP_HOST is absent)
     match SmtpService::new(&config) {
         Ok(smtp) => {
@@ -742,6 +751,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
     let state = Arc::new(app_state);
 
+    // Fan out authorization-cache invalidations from other replicas via
+    // Postgres LISTEN/NOTIFY (migration 142 triggers +
+    // services/cache_invalidation.rs). Awaited so the initial LISTEN and the
+    // conservative startup flush complete before requests are served; if the
+    // connection fails the spawned task retries with backoff while requests
+    // proceed under TTL-bound staleness.
+    // Detached deliberately: lifecycle is governed by the shutdown token.
+    let _cache_invalidation_task = cache_invalidation::start_cache_invalidation_listener(
+        db_pool.clone(),
+        cache_invalidation::CacheInvalidationHandles {
+            repo_cache: state.repo_cache.clone(),
+            permission_service: state.permission_service.clone(),
+        },
+        runtime_shutdown_token.clone(),
+    )
+    .await;
+
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
         db_pool.clone(),
@@ -749,6 +775,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         scheduler_storage,
         storage_registry.clone(),
         state.smtp_service.clone(),
+        state.event_bus.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
@@ -898,14 +925,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         Some(grpc_db_pool),
     );
 
-    // Include file descriptor for gRPC reflection
-    let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/sbom_descriptor.bin"
-        )))
-        .build_v1()
-        .expect("Failed to build reflection service");
+    // Info-disclosure hardening (#2226): gRPC server reflection lets an
+    // unauthenticated peer enumerate the entire service catalog + message
+    // schemas, so it is registered only when explicitly enabled
+    // (GRPC_REFLECTION_ENABLED). Data-plane RPCs stay protected by the auth
+    // interceptor either way.
+    let grpc_reflection_enabled = config.grpc_reflection_enabled;
 
     let grpc_auth_sbom = grpc_auth.clone();
     let grpc_auth_cve = grpc_auth.clone();
@@ -919,8 +944,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         let cve_interceptor = move |req| grpc_auth_cve.intercept(req);
         #[allow(clippy::result_large_err)]
         let policy_interceptor = move |req| grpc_auth_policy.intercept(req);
-        if let Err(e) = TonicServer::builder()
-            .add_service(reflection_service)
+        let mut server = TonicServer::builder()
             .add_service(SbomServiceServer::with_interceptor(
                 sbom_server,
                 sbom_interceptor,
@@ -932,7 +956,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             .add_service(SecurityPolicyServiceServer::with_interceptor(
                 security_policy_server,
                 policy_interceptor,
-            ))
+            ));
+        if grpc_reflection_enabled {
+            // Include file descriptor for gRPC reflection
+            let reflection_service = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/sbom_descriptor.bin"
+                )))
+                .build_v1()
+                .expect("Failed to build reflection service");
+            server = server.add_service(reflection_service);
+            tracing::info!("gRPC server reflection enabled");
+        }
+        if let Err(e) = server
             .serve_with_shutdown(grpc_addr, grpc_shutdown_token.cancelled())
             .await
         {
@@ -1073,6 +1110,8 @@ async fn assert_connect_info_wired(app: Router) {
         "ConnectInfo<SocketAddr> wiring is not active: boot probe returned {status} \
          (expected the serve path's connect_info_make_service to inject the peer)"
     );
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: 64-byte boot self-probe body; not an artifact path (#1608)
     let body = axum::body::to_bytes(response.into_body(), 64)
         .await
         .expect("probe body");
@@ -1396,6 +1435,7 @@ fn build_oidc_request_from_values(
         auto_create_users: Some(true),
         pkce_enabled: None,
         map_groups_to_groups: None,
+        allow_legacy_rsa_keys: None,
     })
 }
 

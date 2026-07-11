@@ -23,26 +23,45 @@ RUN ARCH="$(uname -m)" \
  && unzip -q /tmp/protoc.zip -d /usr/local \
  && rm /tmp/protoc.zip
 
-# All three binstall targets pinned to exact versions confirmed working
-# against this toolchain (rustc 1.93.1): sqlx-cli matches the backend's
-# `sqlx = "0.8"` (locked at 0.8.6 in Cargo.lock); cargo-nextest/cargo-llvm-cov
-# pinned to the last versions observed installing cleanly via prebuilt
-# GitHub release binaries. This RUN line had been cache-hit (never actually
-# re-executed) for long enough that unpinned `sqlx-cli` drifted onto a
-# 0.9.0 release requiring rustc 1.94+ before anyone noticed. The moment
-# pinning it changed this line's text and forced a real rebuild, binstall's
-# GitHub-API-based release lookup started intermittently falling back to
-# `cargo install` from source for cargo-nextest too (which then failed to
-# compile) -- almost certainly GitHub's unauthenticated 60 req/hour rate
-# limit after repeated same-day rebuilds, not a real incompatibility. Pinning
-# every version reduces "latest silently changed" risk; the retry loop below
-# is the actual fix for the rate-limit flakiness, giving a transient GitHub
-# API failure a few chances to clear before failing the whole build.
+# All toolchain installers pinned to exact versions confirmed working against
+# this toolchain (rustc 1.93.1): sqlx-cli matches the backend's `sqlx = "0.8"`
+# (locked at 0.8.6 in Cargo.lock); cargo-nextest/cargo-llvm-cov pinned to the
+# last versions observed installing cleanly from prebuilt release binaries.
+# This RUN line had been cache-hit (never actually re-executed) for long enough
+# that unpinned `sqlx-cli` drifted onto a 0.9.0 release requiring rustc 1.94+
+# before anyone noticed. The moment pinning it changed this line's text and
+# forced a real rebuild, binstall's GitHub-API-based release lookup started
+# intermittently falling back to `cargo install` from source for cargo-nextest
+# (which then hard-failed) -- GitHub's unauthenticated 60 req/hour rate limit
+# after repeated same-day rebuilds, not a real incompatibility. cargo-nextest
+# is therefore now installed directly from its pinned get.nexte.st release
+# (see the RUN below), off the GitHub-API path entirely; the two remaining
+# binstall targets keep the retry loop for transient rate limits.
+# get.nexte.st platform token: x86_64 -> "linux", aarch64 -> "linux-arm" (gnu).
+# `cargo nextest --version` right after extraction fails the build loudly if the
+# pinned tarball ever stops shipping the expected binary, instead of surfacing as
+# a confusing "command not found" mid-test-run.
 RUN rustup component add llvm-tools-preview \
+ && ARCH="$(uname -m)" \
+ && case "$ARCH" in \
+      x86_64)  NEXTEST_PLATFORM="linux" ;; \
+      aarch64) NEXTEST_PLATFORM="linux-arm" ;; \
+      *)       echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac \
+ && for attempt in 1 2 3 4 5; do \
+      curl --proto '=https' --tlsv1.2 -sSfL \
+        "https://get.nexte.st/0.9.138/${NEXTEST_PLATFORM}" -o /tmp/nextest.tar.gz \
+      && tar -xzf /tmp/nextest.tar.gz -C "${CARGO_HOME:-/usr/local/cargo}/bin" \
+      && rm -f /tmp/nextest.tar.gz && break; \
+      echo "nextest download attempt ${attempt} failed" >&2; \
+      [ "${attempt}" -eq 5 ] && exit 1; \
+      sleep $((attempt * 10)); \
+    done \
+ && cargo nextest --version \
  && curl -L --proto '=https' --tlsv1.2 -sSf \
       https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
  && for attempt in 1 2 3 4 5; do \
-      cargo binstall -y cargo-nextest@0.9.138 cargo-llvm-cov@0.8.7 sqlx-cli@0.8.6 && break; \
+      cargo binstall -y cargo-llvm-cov@0.8.7 sqlx-cli@0.8.6 && break; \
       echo "cargo binstall attempt ${attempt} failed" >&2; \
       [ "${attempt}" -eq 5 ] && exit 1; \
       sleep $((attempt * 20)); \
@@ -55,6 +74,10 @@ ARG DATABASE_URL
 ARG COVERAGE_BASE
 ARG NEW_CODE_MIN=70
 ARG TOTAL_MIN=50
+# Workflow env can't reach inside BuildKit; the thread count must arrive as a
+# build-arg (ci/backend-quality-k8s.sh forwards it). Default matches the
+# proven 8-thread soak configuration.
+ARG COVERAGE_TEST_THREADS=8
 ENV DATABASE_URL=${DATABASE_URL} \
     COVERAGE_BASE=${COVERAGE_BASE} \
     NEW_CODE_MIN=${NEW_CODE_MIN} \
@@ -68,7 +91,7 @@ ENV DATABASE_URL=${DATABASE_URL} \
     CARGO_PROFILE_DEV_DEBUG=0 \
     CARGO_PROFILE_TEST_DEBUG=0 \
     CARGO_TERM_COLOR=always \
-    COVERAGE_TEST_THREADS=8 \
+    COVERAGE_TEST_THREADS=${COVERAGE_TEST_THREADS} \
     COVERAGE_NO_CLEAN=1
 
 # These pre-existing tests are environment-sensitive in BuildKit: the OTLP

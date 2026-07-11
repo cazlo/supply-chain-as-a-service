@@ -23,7 +23,6 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::future::Future;
 use tracing::{debug, info, warn};
@@ -36,6 +35,9 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::RepositoryType;
+use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::upstream_metadata::metadata_http_client;
+use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -118,23 +120,59 @@ pub(crate) fn normalize_pep503(name: &str) -> String {
 /// `flask/`, `flask/Flask-3.0.0-py3-none-any.whl`). Callers must NOT include
 /// the leading `simple/` themselves.
 ///
+/// `index_path` controls how the prefix is built (issue #1546):
+/// - `"simple"` (default) — standard PEP 503 layout: prepends `simple/` to `tail`.
+/// - `""` (empty) — flat CDN layout (e.g. PyTorch wheel CDN): emits `tail` with
+///   no prefix, so `torch/` maps directly to `{upstream}/torch/`.
+/// - any other non-empty value — custom prefix: emits `{index_path}/{tail}`.
+///
+/// The `/simple`-dedup logic (#1130) is only applied when `index_path` is
+/// `"simple"` — for flat or custom indexes the upstream URL is used verbatim.
+///
 /// Returns `(adjusted_upstream_url, upstream_path)`. The URL has any trailing
 /// `/simple` or `/simple/` stripped so [`crate::services::proxy_service::ProxyService::build_upstream_url`]
 /// (which trims one trailing slash on the base and joins with `/`) produces
 /// a single `simple/` segment in the final outbound URL.
-fn pypi_upstream_url_and_path(upstream_url: &str, tail: &str) -> (String, String) {
+fn pypi_upstream_url_and_path(
+    upstream_url: &str,
+    tail: &str,
+    index_path: &str,
+) -> (String, String) {
     let trimmed_url = upstream_url.trim_end_matches('/');
     let tail = tail.trim_start_matches('/');
-    if let Some(base) = trimmed_url.strip_suffix("/simple") {
-        let normalized = if base.is_empty() {
-            "/".to_string()
-        } else {
-            base.to_string()
-        };
-        (normalized, format!("simple/{}", tail))
-    } else {
-        (upstream_url.to_string(), format!("simple/{}", tail))
+    if index_path == "simple" {
+        if let Some(base) = trimmed_url.strip_suffix("/simple") {
+            let normalized = if base.is_empty() {
+                "/".to_string()
+            } else {
+                base.to_string()
+            };
+            return (normalized, format!("simple/{}", tail));
+        }
     }
+    if index_path.is_empty() {
+        (upstream_url.to_string(), tail.to_string())
+    } else {
+        (upstream_url.to_string(), format!("{}/{}", index_path, tail))
+    }
+}
+
+/// Fetch the `pypi_upstream_index_path` config value for a repository.
+///
+/// Returns `"simple"` (the PEP 503 default) when no override is configured.
+/// An empty string signals a flat CDN layout (no `simple/` prefix); any other
+/// non-empty string is used as-is as the index path prefix.
+async fn fetch_pypi_upstream_index_path(db: &PgPool, repo_id: uuid::Uuid) -> String {
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind("pypi_upstream_index_path")
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "simple".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -294,13 +332,15 @@ async fn fetch_remote_simple_root(
     let upstream = upstream_url.as_ref()?;
     let proxy = state.proxy_service.as_ref()?;
 
-    let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "");
-    let (content, _content_type) = match proxy_helpers::proxy_fetch(
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "", &index_path);
+    let (content, _content_type) = match proxy_helpers::proxy_fetch_capped(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
         &upstream_path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
     )
     .await
     {
@@ -602,13 +642,17 @@ async fn simple_project(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (effective_upstream, upstream_path) =
-                    pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
+                let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
+                let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(
+                    upstream_url,
+                    &format!("{}/", normalized),
+                    &index_path,
+                );
 
                 let (content, content_type) = if wants_json {
                     // Request the PEP 691 JSON form from upstream, cached under a
                     // format-qualified key so it never collides with the HTML index.
-                    proxy_helpers::proxy_fetch_with_cache_key_and_accept(
+                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -616,15 +660,17 @@ async fn simple_project(
                         &upstream_path,
                         &format!("{}index.v1+json", upstream_path),
                         Some(PEP691_JSON_CONTENT_TYPE),
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await?
                 } else {
-                    proxy_helpers::proxy_fetch(
+                    proxy_helpers::proxy_fetch_capped(
                         proxy,
                         repo.id,
                         &repo_key,
                         &effective_upstream,
                         &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await?
                 };
@@ -639,6 +685,14 @@ async fn simple_project(
                     if let Some(json) =
                         rewrite_upstream_simple_json(&content, &repo_key, &normalized)
                     {
+                        let json = filter_pypi_simple_json_response(
+                            &state,
+                            &repo,
+                            &effective_upstream,
+                            &project,
+                            json,
+                        )
+                        .await;
                         return Ok(Response::builder()
                             .status(StatusCode::OK)
                             .header(CONTENT_TYPE, PEP691_JSON_CONTENT_TYPE)
@@ -651,6 +705,14 @@ async fn simple_project(
                 let body = if ct.contains("text/html") {
                     let html = String::from_utf8_lossy(&content);
                     let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                    let rewritten = filter_pypi_simple_html_response(
+                        &state,
+                        &repo,
+                        &effective_upstream,
+                        &project,
+                        rewritten,
+                    )
+                    .await;
                     Body::from(rewritten)
                 } else {
                     Body::from(content)
@@ -677,13 +739,22 @@ async fn simple_project(
                 );
             }
 
-            // PEP 708 (#1600): when a local member owns this name and no
-            // operator `tracks` declaration permits merging, isolate the name to
-            // its local owner. We then skip every Remote member below, so the
-            // index lists only the local distributions (and the download path
-            // makes the same decision, keeping index and download consistent).
-            let isolate =
+            // PEP 708 (#1600, priority-aware per #2311): when a local member
+            // owns this name and no operator `tracks` declaration permits
+            // merging, isolate the name to its local owner — but only against
+            // Remote members the owning local outranks. A Remote member the
+            // operator configured at equal or higher priority than the owning
+            // local still surfaces below, so a lower-priority local owner
+            // cannot hide a higher-priority upstream's versions from pip.
+            // The download path makes the same per-member decision, keeping
+            // index and download consistent.
+            let owning_local_min_priority =
                 proxy_helpers::pypi_virtual_isolates_name(&state.db, repo.id, &normalized).await?;
+            let member_priorities = if owning_local_min_priority.is_some() {
+                proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?
+            } else {
+                Default::default()
+            };
 
             let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
             let mut remote_response: Option<(Bytes, Option<String>)> = None;
@@ -730,23 +801,38 @@ async fn simple_project(
             // Ownership / dependency-confusion guard (#1600), superseding the
             // name-only suppression from #1738. When a local member owns this
             // PEP 503 name and no operator `tracks` declaration permits merging,
-            // `isolate` is true and the virtual serves ONLY that member's
-            // distributions for the name — in both the simple index and the
-            // download — rather than unioning the remote's versions for it.
-            // Unioning an unrelated public package that merely shares the name
-            // is a supply-chain hole (`pip` prefers the higher public version)
-            // AND makes the index inconsistent with the download path, which is
-            // also tracks-aware and 404s for any version only the remote has.
-            // Local precedence is the PEP 708-aligned default for a locally-
-            // owned name; a `tracks` declaration re-enables the union (#1582).
-            // Second pass: fetch a remote index only when the name is not
-            // isolated.
+            // the virtual serves ONLY that member's distributions for the name
+            // — in both the simple index and the download — rather than
+            // unioning the remote's versions for it. Unioning an unrelated
+            // public package that merely shares the name is a supply-chain hole
+            // (`pip` prefers the higher public version) AND makes the index
+            // inconsistent with the download path, which is also tracks-aware
+            // and 404s for any version only the remote has. Local precedence is
+            // the PEP 708-aligned default for a locally-owned name; a `tracks`
+            // declaration re-enables the union (#1582).
+            //
+            // #2311: the guard is applied PER REMOTE MEMBER relative to member
+            // priority. It only suppresses a Remote member the owning local
+            // outranks (owning priority value strictly lower). A Remote member
+            // at equal or higher priority than the owning local was explicitly
+            // ranked above the internal package by the operator, so its
+            // versions still surface.
+            // Second pass: fetch a remote index only from non-suppressed
+            // remote members.
             for member in &members {
-                if isolate {
-                    break;
-                }
                 if member.repo_type != RepositoryType::Remote {
                     continue;
+                }
+                if let Some(local_min) = owning_local_min_priority {
+                    // A member missing from the priority map cannot outrank the
+                    // owning local: treat it as lowest priority (fail closed).
+                    let member_priority = member_priorities
+                        .get(&member.id)
+                        .copied()
+                        .unwrap_or(i32::MAX);
+                    if local_min < member_priority {
+                        continue;
+                    }
                 }
                 // Only take the first remote response; multiple remote
                 // members in one virtual is rare, and merging two upstream
@@ -762,10 +848,14 @@ async fn simple_project(
                     continue;
                 };
 
-                let (effective_upstream, upstream_path) =
-                    pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
+                let member_index_path = fetch_pypi_upstream_index_path(&state.db, member.id).await;
+                let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(
+                    upstream_url,
+                    &format!("{}/", normalized),
+                    &member_index_path,
+                );
                 let result = if wants_json {
-                    proxy_helpers::proxy_fetch_with_cache_key_and_accept(
+                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept(
                         proxy,
                         member.id,
                         &member.key,
@@ -773,21 +863,54 @@ async fn simple_project(
                         &upstream_path,
                         &format!("{}index.v1+json", upstream_path),
                         Some(PEP691_JSON_CONTENT_TYPE),
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await
                 } else {
-                    proxy_helpers::proxy_fetch(
+                    proxy_helpers::proxy_fetch_capped(
                         proxy,
                         member.id,
                         &member.key,
                         &effective_upstream,
                         &upstream_path,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await
                 };
 
                 match result {
                     Ok((content, content_type)) => {
+                        // #2066: apply THIS gated remote member's age gate to its
+                        // own contribution before it is merged with local members
+                        // below. Locals stay unfiltered (they are not gated);
+                        // filtering the remote member here mirrors the direct
+                        // simple-index path so a young version of a gated member
+                        // is not leaked through the virtual listing.
+                        let member_info = proxy_helpers::repo_info_from_member(member);
+                        let ct = content_type.clone().unwrap_or_default();
+                        let content = if wants_json && ct.contains("json") {
+                            let filtered = filter_pypi_simple_json_response(
+                                &state,
+                                &member_info,
+                                &effective_upstream,
+                                &project,
+                                String::from_utf8_lossy(&content).into_owned(),
+                            )
+                            .await;
+                            Bytes::from(filtered)
+                        } else if ct.contains("text/html") {
+                            let filtered = filter_pypi_simple_html_response(
+                                &state,
+                                &member_info,
+                                &effective_upstream,
+                                &project,
+                                String::from_utf8_lossy(&content).into_owned(),
+                            )
+                            .await;
+                            Bytes::from(filtered)
+                        } else {
+                            content
+                        };
                         remote_response = Some((content, content_type));
                     }
                     Err(_e) => {
@@ -1137,6 +1260,219 @@ async fn download_or_metadata(
     serve_file(&state, &repo, &repo_key, &project, &filename, auth.as_ref()).await
 }
 
+fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
+    artifact_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(artifact_path)
+        .to_string()
+}
+
+fn build_pypi_proxy_cache_path(normalized_project: &str, filename: &str) -> String {
+    format!("simple/{}/{}", normalized_project, filename)
+}
+
+/// Apply the age-gate listing filter to a rewritten PEP 691 JSON simple
+/// index (#1944). The JSON and HTML representations of one index must
+/// withhold the same young versions, or a JSON-negotiating client (modern
+/// pip) sees everything the HTML filter hides. Mirrors the HTML hook in
+/// `simple_project`: a filter failure serves the unfiltered listing rather
+/// than failing the request — the download path re-checks every version
+/// independently and fails closed, so enforcement never rests on this
+/// listing-side filter.
+async fn filter_pypi_simple_json_response(
+    state: &SharedState,
+    repo: &RepoInfo,
+    effective_upstream: &str,
+    project: &str,
+    json: String,
+) -> String {
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return json;
+    };
+    let params = proxy_helpers::age_gate_params(repo);
+    if !AgeGateService::is_applicable(&params) {
+        return json;
+    }
+    let Ok(mut index) = serde_json::from_str::<serde_json::Value>(&json) else {
+        // `rewrite_upstream_simple_json` only returns JSON it serialized
+        // itself, so this branch is unreachable in practice.
+        return json;
+    };
+    if svc
+        .filter_pypi_simple_json(&params, project, effective_upstream, &mut index)
+        .await
+        .is_ok()
+    {
+        if let Ok(filtered) = serde_json::to_string(&index) {
+            return filtered;
+        }
+    }
+    json
+}
+
+/// Age-gate a PyPI simple-index **HTML** body (PEP 503) for a single repo,
+/// dropping the download links of upstream versions younger than the repo's
+/// threshold. Sibling of [`filter_pypi_simple_json_response`] for the HTML
+/// form; extracted from the direct-Remote branch so the virtual-resolution
+/// loop can apply the SAME per-member filter (#2066). Returns the input
+/// unchanged when the gate is not applicable or the publish times cannot be
+/// resolved (same data-dependent behavior as the original inline block).
+async fn filter_pypi_simple_html_response(
+    state: &SharedState,
+    repo: &RepoInfo,
+    effective_upstream: &str,
+    project: &str,
+    html: String,
+) -> String {
+    let Some(svc) = state.age_gate_service.as_ref() else {
+        return html;
+    };
+    let params = proxy_helpers::age_gate_params(repo);
+    if !AgeGateService::is_applicable(&params) {
+        return html;
+    }
+    let Ok(client) = metadata_http_client() else {
+        return html;
+    };
+    let Ok(times) = svc
+        .metadata_cache()
+        .fetch_pypi_publish_times(&client, repo.id, effective_upstream, project)
+        .await
+    else {
+        return html;
+    };
+    match svc
+        .filter_pypi_simple_index(&params, project, &times, &html)
+        .await
+    {
+        Ok(filtered) => filtered,
+        Err(_) => html,
+    }
+}
+
+async fn apply_pypi_download_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    project: &str,
+    filename: &str,
+) -> Result<Option<String>, Response> {
+    let svc = match state.age_gate_service.as_ref() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let params = proxy_helpers::age_gate_params(repo);
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(None);
+    }
+
+    let info = PypiHandler::parse_filename(filename)
+        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
+    let version = info.version.ok_or_else(|| {
+        AppError::Validation("Missing version in filename".to_string()).into_response()
+    })?;
+
+    let published_at =
+        if let (Some(upstream_url), Ok(client)) = (&repo.upstream_url, metadata_http_client()) {
+            svc.metadata_cache()
+                .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
+                .await
+                .ok()
+                .and_then(|times| times.get(&version).copied())
+        } else {
+            None
+        };
+
+    match svc
+        .check(&params, project, &version, published_at)
+        .await
+        .map_err(|e| e.into_response())?
+    {
+        AgeGateDecision::Allow => Ok(None),
+        AgeGateDecision::Block {
+            review_id: _,
+            last_known_good: Some(lkg),
+        } => Ok(Some(pypi_lkg_filename_from_artifact_path(
+            &lkg.artifact_path,
+        ))),
+        AgeGateDecision::Block {
+            review_id,
+            last_known_good: None,
+        } => {
+            let requested_age_days =
+                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
+            Err(proxy_helpers::age_gate_blocked_response(
+                review_id,
+                project,
+                &version,
+                repo.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
+}
+
+/// Run the remote-PyPI download age gate and, when the requested version is
+/// withheld, resolve the response the caller should return: the last-known-good
+/// wheel served via the proxy cache (presigned redirect / cache stream /
+/// upstream refetch), or the 451 block propagated as an `Err`.
+///
+/// Returns `Ok(Some(response))` when the gate handled the request and
+/// `Ok(None)` when the version is allowed and the caller should keep serving
+/// normally. Shared by both the cache-miss and the local-`artifacts`-hit
+/// branches of `serve_file` so a young version is never streamed just because a
+/// local row exists (parity with npm's unconditional `serve_tarball` gate).
+async fn enforce_pypi_download_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    project: &str,
+    filename: &str,
+) -> Result<Option<Response>, Response> {
+    let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
+        (Some(u), Some(p)) => (u, p),
+        _ => return Ok(None),
+    };
+
+    let lkg_filename = match apply_pypi_download_age_gate(state, repo, project, filename).await? {
+        Some(lkg) => lkg,
+        None => return Ok(None),
+    };
+
+    let normalized = PypiHandler::normalize_name(project);
+    let lkg_cache_path = build_pypi_proxy_cache_path(&normalized, &lkg_filename);
+    // #1555 ordering holds on the LKG fallback too: presigned redirect on a
+    // fresh cache hit BEFORE the streaming cache check, so a cached LKG wheel is
+    // not streamed through the backend.
+    if let Some(redirect) = pypi_proxy_cache_redirect(state, proxy, repo_key, &lkg_cache_path).await
+    {
+        return Ok(Some(redirect));
+    }
+    if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        &lkg_cache_path,
+    )
+    .await
+    {
+        return Ok(Some(build_streaming_file_response(&lkg_filename, result)));
+    }
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
+    let result = fetch_from_pypi_remote_streaming(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        project,
+        &lkg_filename,
+        &index_path,
+    )
+    .await?;
+    Ok(Some(build_streaming_file_response(&lkg_filename, result)))
+}
+
 async fn serve_file(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1170,14 +1506,25 @@ async fn serve_file(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
+                    let normalized = PypiHandler::normalize_name(project);
+
+                    // Enforce the download age gate before any proxy fetch, and
+                    // serve the last-known-good wheel if the requested version is
+                    // withheld. Shared with the local-`artifacts`-hit branch below.
+                    if let Some(resp) =
+                        enforce_pypi_download_age_gate(state, repo, repo_key, project, filename)
+                            .await?
+                    {
+                        return Ok(resp);
+                    }
+
                     // Try the proxy cache first using a predictable local
                     // path. This avoids fetching the simple index from upstream
                     // just to rediscover the download URL when the file is
                     // already cached from a previous request. Streamed straight
                     // from storage (#895): buffering cached multi-hundred-MiB
                     // wheels per request OOM-killed memory-constrained pods.
-                    let normalized = PypiHandler::normalize_name(project);
-                    let local_cache_path = format!("simple/{}/{}", normalized, filename);
+                    let local_cache_path = build_pypi_proxy_cache_path(&normalized, filename);
 
                     // #1555: redirect to a presigned URL on a fresh cache hit
                     // before falling back to streaming.
@@ -1201,6 +1548,7 @@ async fn serve_file(
 
                     // Cache miss: use PyPI-specific fetch logic, streaming the
                     // package file from upstream while teeing it into the cache.
+                    let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
                     let result = fetch_from_pypi_remote_streaming(
                         proxy,
                         repo.id,
@@ -1208,6 +1556,7 @@ async fn serve_file(
                         upstream_url,
                         project,
                         filename,
+                        &index_path,
                     )
                     .await?;
 
@@ -1219,7 +1568,7 @@ async fn serve_file(
             // logic for remote members because external registries (e.g.
             // pypi.org) host files on a different domain than the simple
             // index. We iterate members manually and delegate to
-            // fetch_from_pypi_remote for each remote member.
+            // fetch_from_pypi_remote_streaming for each remote member.
             if repo.repo_type == RepositoryType::Virtual {
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
@@ -1250,23 +1599,56 @@ async fn serve_file(
                 // version-aware shadowing guard (#1217, #1582) and the
                 // name-only local-precedence suppression (#1738). Isolate to the
                 // local owner when a local member owns the name and no operator
-                // `tracks` declaration permits merging with upstream. When
-                // isolated, every Remote member is skipped so an unrelated
-                // public package of the same name is never served through the
-                // virtual; the download then 404s for a version the local owner
-                // lacks, which matches what the simple index lists (consistent).
-                // When a `tracks` declaration exists (same project, split version
-                // ranges, #1582) this returns false and the proxy fallthrough
+                // `tracks` declaration permits merging with upstream. A
+                // suppressed Remote member is skipped so an unrelated public
+                // package of the same name is never served through the virtual;
+                // the download then 404s for a version the local owner lacks,
+                // which matches what the simple index lists (consistent). When
+                // a `tracks` declaration exists (same project, split version
+                // ranges, #1582) this returns None and the proxy fallthrough
                 // below applies.
+                //
+                // #2311: the guard is priority-aware and applied PER REMOTE
+                // MEMBER — it only suppresses a Remote member the owning local
+                // outranks (owning priority value strictly lower). A Remote
+                // member at equal or higher priority than the owning local
+                // still serves, mirroring the simple-index decision above so
+                // every version the index lists is downloadable.
                 let normalized_project = normalize_pep503(project);
-                let suppress_remote_members = proxy_helpers::pypi_virtual_isolates_name(
+                let owning_local_min_priority = proxy_helpers::pypi_virtual_isolates_name(
                     &state.db,
                     repo.id,
                     &normalized_project,
                 )
                 .await?;
+                let member_priorities = if owning_local_min_priority.is_some() {
+                    proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?
+                } else {
+                    Default::default()
+                };
 
                 for member in &members {
+                    // #2066: enforce THIS member's download age gate before any
+                    // of its bytes can be served — including from a local
+                    // `artifacts` cache row below (parity with the direct
+                    // artifacts-hit fix). For local / ungated members the helper
+                    // early-returns `Ok(None)` (no upstream_url / not applicable)
+                    // so normal resolution proceeds; an aged version also returns
+                    // `Ok(None)`. A withheld young version returns the
+                    // last-known-good wheel (`Ok(Some(resp))`) or 451 (`Err`).
+                    let member_info = proxy_helpers::repo_info_from_member(member);
+                    if let Some(resp) = enforce_pypi_download_age_gate(
+                        state,
+                        &member_info,
+                        &member.key,
+                        project,
+                        filename,
+                    )
+                    .await?
+                    {
+                        return Ok(resp);
+                    }
+
                     // Try local storage first (works for hosted repos and
                     // cached remote artifacts). #1555: redirect to S3 presigned
                     // URL instead of streaming when enabled.
@@ -1296,14 +1678,24 @@ async fn serve_file(
                     // a stable key, then fall back to the format-specific fetch
                     // that resolves the real download URL via the simple index.
                     //
-                    // Shadowing guard (#1217 follow-up, ak-hv3s): when
-                    // `suppress_remote_members` is set, skip every Remote
-                    // member so an upstream cannot serve a project whose
-                    // normalized PEP 503 name a local member already
-                    // owns. Pair with `order_members_local_first`-style
-                    // ordering at the top of this loop: locals run
-                    // first so they win even when the guard doesn't fire.
-                    if member.repo_type == RepositoryType::Remote && !suppress_remote_members {
+                    // Shadowing guard (#1217 follow-up, ak-hv3s; priority-aware
+                    // per #2311): skip this Remote member when a local member
+                    // that owns the normalized PEP 503 name outranks it, so an
+                    // upstream cannot serve a project a higher-priority local
+                    // member already owns. A member missing from the priority
+                    // map cannot outrank the owning local: it is treated as
+                    // lowest priority (fail closed, suppressed).
+                    let remote_suppressed = match owning_local_min_priority {
+                        Some(local_min) => {
+                            local_min
+                                < member_priorities
+                                    .get(&member.id)
+                                    .copied()
+                                    .unwrap_or(i32::MAX)
+                        }
+                        None => false,
+                    };
+                    if member.repo_type == RepositoryType::Remote && !remote_suppressed {
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
                         {
@@ -1312,7 +1704,8 @@ async fn serve_file(
                             // simple index from upstream when the file is already
                             // cached from a previous request through this member.
                             let normalized = PypiHandler::normalize_name(project);
-                            let local_cache_path = format!("simple/{}/{}", normalized, filename);
+                            let local_cache_path =
+                                build_pypi_proxy_cache_path(&normalized, filename);
 
                             // #1555: redirect to a presigned URL on a fresh
                             // cache hit before falling back to streaming.
@@ -1339,6 +1732,8 @@ async fn serve_file(
                                 return Ok(build_streaming_file_response(filename, result));
                             }
 
+                            let member_index_path =
+                                fetch_pypi_upstream_index_path(&state.db, member.id).await;
                             match fetch_from_pypi_remote_streaming(
                                 proxy,
                                 member.id,
@@ -1346,6 +1741,7 @@ async fn serve_file(
                                 upstream_url,
                                 project,
                                 filename,
+                                &member_index_path,
                             )
                             .await
                             {
@@ -1373,6 +1769,21 @@ async fn serve_file(
         }
     };
 
+    // Enforce the download age gate even when a local `artifacts` row exists for
+    // a Remote repo (a locally-published, hydrated/replicated, or pre-#1278
+    // cached wheel). Without this, the cache-hit branch above streams a young
+    // version UNGATED while the cache-miss branch blocks it — a fail-open
+    // asymmetry versus npm's serve_tarball, which gates unconditionally. A
+    // withheld version returns 451 (or the last-known-good wheel) instead of the
+    // young local artifact.
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(resp) =
+            enforce_pypi_download_age_gate(state, repo, repo_key, project, filename).await?
+        {
+            return Ok(resp);
+        }
+    }
+
     // Check quarantine status before serving
     crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
         .await
@@ -1387,16 +1798,21 @@ async fn serve_file(
             (&repo.upstream_url, &state.proxy_service)
         {
             get_remote_cached_or_refetch_stream(
-                storage.as_ref(),
+                storage.clone(),
                 &artifact.storage_key,
                 || async move {
-                    fetch_from_pypi_remote(
+                    // Fetched lazily inside the closure: this path serves
+                    // cache hits straight from storage, and the index_path is
+                    // only needed on a cache miss when we re-fetch upstream.
+                    let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
+                    fetch_from_pypi_remote_streaming(
                         proxy,
                         repo.id,
                         repo_key,
                         upstream_url,
                         project,
                         filename,
+                        &index_path,
                     )
                     .await
                 },
@@ -1444,18 +1860,24 @@ async fn serve_file(
 }
 
 /// Streaming variant of the PyPI proxy cache read. Streams a cache hit
-/// straight from storage; on a miss it re-fetches the wheel from upstream
-/// (buffered, since the recovery payload must also be written back to the
-/// cache to avoid a thundering herd) and re-wraps the recovered bytes as a
-/// one-shot stream so the caller always receives a `BoxStream`.
+/// straight from storage; on a miss it re-fetches the wheel from upstream and
+/// STREAMS it to the caller while teeing it back into storage so the next
+/// request is served warm.
+///
+/// #2192 / #1608 Phase 4c: the previous recovery path buffered the refetch
+/// (capped at 16 MiB by #2181) and 502'd a wheel larger than the cap even
+/// though the primary download path streams. The refetch now yields a
+/// [`StreamingFetchResult`] (via `fetch_from_pypi_remote_streaming`) and the
+/// body is teed into `storage_key` as it flows to the client — preserving the
+/// thundering-herd write-back (PR #1283) without ever buffering the whole wheel.
 async fn get_remote_cached_or_refetch_stream<F, Fut>(
-    storage: &dyn crate::storage::StorageBackend,
+    storage: std::sync::Arc<dyn crate::storage::StorageBackend>,
     storage_key: &str,
     refetch: F,
 ) -> Result<BoxStream<'static, Result<Bytes, std::io::Error>>, Response>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<Bytes, Response>>,
+    Fut: Future<Output = Result<crate::services::proxy_service::StreamingFetchResult, Response>>,
 {
     match storage.get_stream(storage_key).await {
         Ok(stream) => Ok(stream
@@ -1464,27 +1886,117 @@ where
         Err(AppError::NotFound(_)) => {
             tracing::warn!(
                 storage_key = %storage_key,
-                "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream"
+                "remote PyPI proxy cache entry is missing on disk; re-fetching from upstream (streaming)"
             );
-            let bytes = refetch().await?;
-            // Best-effort write-back: persist the refetched payload so the
-            // next request hits the cache instead of re-traversing the
-            // simple index and re-downloading from upstream. Without this,
-            // N concurrent `uv` clients each issue a fresh upstream fetch
-            // for the same wheel (thundering herd; see PR #1283 review).
-            // We swallow write errors to keep serving the current request,
-            // but log them so operators can spot a broken backend.
-            if let Err(e) = storage.put(storage_key, bytes.clone()).await {
-                tracing::warn!(
-                    storage_key = %storage_key,
-                    error = %e,
-                    "failed to write back refetched PyPI proxy payload; subsequent requests will re-fetch from upstream"
-                );
-            }
-            Ok(futures::stream::once(async { Ok(bytes) }).boxed())
+            let result = refetch().await?;
+            Ok(tee_refetch_to_storage(
+                storage,
+                storage_key.to_string(),
+                result.content_length,
+                result.body,
+            ))
         }
         Err(e) => Err(map_storage_err(e)),
     }
+}
+
+/// Tee a streaming refetch body into repo storage at `storage_key` while
+/// forwarding it to the caller (#2192 / #1608 Phase 4c).
+///
+/// Replaces the buffered `storage.put(storage_key, bytes)` write-back the
+/// recovery path used to perform, without buffering the whole payload:
+///
+/// * The body is forwarded to the client verbatim.
+/// * A clone of each chunk is streamed, in order and with backpressure, to a
+///   background `put_stream` so the cached blob is byte-exact.
+/// * The client stream awaits the write-back at EOF, so a subsequent request
+///   deterministically observes the warmed entry.
+/// * Best-effort: a write failure is logged but never fails the in-flight
+///   download. A truncated write-back (client disconnect, short read, or upstream
+///   error mid-stream) is detected against `expected_len` and the partial cache
+///   entry is deleted so no corrupt blob is ever served warm.
+fn tee_refetch_to_storage(
+    storage: std::sync::Arc<dyn crate::storage::StorageBackend>,
+    storage_key: String,
+    expected_len: Option<u64>,
+    upstream: BoxStream<'static, crate::error::Result<Bytes>>,
+) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
+    // Bounded channel: a slow backend applies backpressure to the upstream read
+    // instead of letting chunks pile up in memory. Order is preserved and no
+    // chunk is dropped, so the written-back blob matches the served bytes.
+    let (tx, rx) = tokio::sync::mpsc::channel::<crate::error::Result<Bytes>>(16);
+    let writer_key = storage_key.clone();
+    let writer = tokio::spawn(async move {
+        let rx_stream =
+            futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|i| (i, rx)) });
+        match storage.put_stream(&writer_key, Box::pin(rx_stream)).await {
+            Ok(w) => {
+                // Compensate for a partial write (the default put_stream commits
+                // whatever it received when the channel closes cleanly): if the
+                // written length does not match the advertised length, delete the
+                // truncated entry so it is never served as a warm hit.
+                if let Some(expected) = expected_len {
+                    if w.bytes_written != expected {
+                        tracing::warn!(
+                            storage_key = %writer_key,
+                            expected,
+                            written = w.bytes_written,
+                            "streaming write-back of refetched PyPI payload was truncated; \
+                             deleting partial cache entry"
+                        );
+                        let _ = storage.delete(&writer_key).await;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    storage_key = %writer_key,
+                    error = %e,
+                    "streaming write-back of refetched PyPI payload failed; \
+                     subsequent requests will re-fetch from upstream"
+                );
+            }
+        }
+    });
+
+    futures::stream::unfold(
+        (upstream, Some(tx), Some(writer)),
+        |(mut upstream, mut tx, mut writer)| async move {
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    if let Some(sender) = tx.as_ref() {
+                        // Backpressure on the writer; drop the tee (not the
+                        // client stream) if the writer has gone away.
+                        if sender.send(Ok(bytes.clone())).await.is_err() {
+                            tx = None;
+                        }
+                    }
+                    Some((Ok(bytes), (upstream, tx, writer)))
+                }
+                Some(Err(e)) => {
+                    // Propagate the error to the writer so the default put_stream
+                    // aborts (no partial commit), then stop teeing.
+                    if let Some(sender) = tx.as_ref() {
+                        let _ = sender
+                            .send(Err(crate::error::AppError::Internal(e.to_string())))
+                            .await;
+                    }
+                    let io_err = std::io::Error::other(e.to_string());
+                    Some((Err(io_err), (upstream, None, writer)))
+                }
+                None => {
+                    // EOF: closing the channel lets put_stream commit; await it so
+                    // a subsequent request observes the warmed entry.
+                    drop(tx);
+                    if let Some(handle) = writer.take() {
+                        let _ = handle.await;
+                    }
+                    None
+                }
+            }
+        },
+    )
+    .boxed()
 }
 
 /// Resolved upstream download target for a PyPI remote file, produced by
@@ -1518,21 +2030,22 @@ async fn resolve_pypi_remote_fetch_target(
     upstream_url: &str,
     project: &str,
     filename: &str,
+    index_path: &str,
 ) -> Result<PypiRemoteFetchTarget, Response> {
     let normalized = PypiHandler::normalize_name(project);
 
-    // Strip a trailing `/simple` from the configured upstream URL so we do
-    // not produce `https://pypi.org/simple/simple/{project}/` when the user
-    // copies the canonical Simple-API base verbatim into the repo config
-    // (issue #1130).
-    let (effective_upstream, index_path) =
-        pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
+    // Build the upstream index URL using the configured index_path.
+    // When `index_path` is "simple" (the default), the existing /simple-dedup
+    // logic from #1130 applies. When empty, the CDN flat-index layout is used
+    // (no prefix). Any other non-empty value is used verbatim as the prefix.
+    let (effective_upstream, upstream_index_path) =
+        pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized), index_path);
     let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
-        &index_path,
+        &upstream_index_path,
     )
     .await?;
 
@@ -1546,8 +2059,11 @@ async fn resolve_pypi_remote_fetch_target(
     let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url));
 
     let fallback = || {
-        let (base, path) =
-            pypi_upstream_url_and_path(upstream_url, &format!("{}/{}", normalized, filename));
+        let (base, path) = pypi_upstream_url_and_path(
+            upstream_url,
+            &format!("{}/{}", normalized, filename),
+            index_path,
+        );
         (base, path)
     };
 
@@ -1588,39 +2104,6 @@ async fn resolve_pypi_remote_fetch_target(
         fetch_path,
         cache_path,
     })
-}
-
-/// Fetch a file from a remote PyPI upstream using the format-specific URL
-/// resolution logic, buffering the whole body in memory.
-///
-/// **Prefer [`fetch_from_pypi_remote_streaming`] on download paths.** This
-/// buffered variant exists only for callers that genuinely need the full
-/// `Bytes` in-process — currently the cache-recovery closure in
-/// [`get_remote_cached_or_refetch_stream`], which must write the refetched
-/// payload back to storage.
-async fn fetch_from_pypi_remote(
-    proxy: &crate::services::proxy_service::ProxyService,
-    repo_id: uuid::Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    project: &str,
-    filename: &str,
-) -> Result<Bytes, Response> {
-    let target =
-        resolve_pypi_remote_fetch_target(proxy, repo_id, repo_key, upstream_url, project, filename)
-            .await?;
-
-    let (content, _content_type) = proxy_helpers::proxy_fetch_with_cache_key(
-        proxy,
-        repo_id,
-        repo_key,
-        &target.fetch_base,
-        &target.fetch_path,
-        &target.cache_path,
-    )
-    .await?;
-
-    Ok(content)
 }
 
 /// #1555: presigned-redirect fast path for a fresh proxy-cache hit on a remote
@@ -1664,11 +2147,14 @@ async fn pypi_proxy_cache_redirect(
     .await
 }
 
-/// Streaming sibling of [`fetch_from_pypi_remote`] (#895 OOM relief).
+/// Fetch a PyPI package file from a remote upstream as a stream (#895 OOM
+/// relief).
 ///
-/// Resolves the real download URL via the simple index exactly like the
-/// buffered variant, then streams the package file from upstream — teed
-/// into the proxy cache — instead of buffering it in memory. Large wheels
+/// Resolves the real download URL via the simple index (buffered, in-process),
+/// then streams the package file from upstream — teed into the proxy cache —
+/// instead of buffering it in memory. This is the single fetch path for remote
+/// PyPI downloads, including the cache-recovery write-back in
+/// [`get_remote_cached_or_refetch_stream`]. Large wheels
 /// (CUDA / ML packages routinely exceed 400 MiB) previously OOM-killed
 /// memory-constrained pods when several `pip install` runs downloaded
 /// concurrently through the buffered path.
@@ -1679,10 +2165,18 @@ async fn fetch_from_pypi_remote_streaming(
     upstream_url: &str,
     project: &str,
     filename: &str,
+    index_path: &str,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
-    let target =
-        resolve_pypi_remote_fetch_target(proxy, repo_id, repo_key, upstream_url, project, filename)
-            .await?;
+    let target = resolve_pypi_remote_fetch_target(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        filename,
+        index_path,
+    )
+    .await?;
 
     proxy_helpers::proxy_fetch_streaming_with_cache_key(
         proxy,
@@ -1814,6 +2308,7 @@ fn extract_metadata_from_sdist(content: &[u8]) -> Option<String> {
 // POST /pypi/{repo_key}/ — Twine upload
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1834,7 +2329,8 @@ async fn upload(
     let mut action: Option<String> = None;
     let mut pkg_name: Option<String> = None;
     let mut pkg_version: Option<String> = None;
-    let mut file_content: Option<Bytes> = None;
+    let mut staged_content: Option<proxy_helpers::StagedUpload> = None;
+    let mut content_digests: Option<crate::services::artifact_service::ContentDigests> = None;
     let mut file_name: Option<String> = None;
     let mut sha256_digest: Option<String> = None;
     let mut _md5_digest: Option<String> = None;
@@ -1886,9 +2382,12 @@ async fn upload(
             }
             "content" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                file_content = Some(field.bytes().await.map_err(|e| {
-                    AppError::Validation(format!("Invalid file: {}", e)).into_response()
-                })?);
+                // Spool the wheel straight to a bounded scratch file while
+                // computing SHA-256/SHA-1/MD5 incrementally — never buffered.
+                let (s, d) =
+                    proxy_helpers::stage_upload_field_content_addressed(&state, field).await?;
+                staged_content = Some(s);
+                content_digests = Some(d);
             }
             // Capture other metadata fields
             _ => {
@@ -1929,7 +2428,10 @@ async fn upload(
     let pkg_version = pkg_version.ok_or_else(|| {
         AppError::Validation("Missing 'version' field".to_string()).into_response()
     })?;
-    let content = file_content.ok_or_else(|| {
+    let staged_content = staged_content.ok_or_else(|| {
+        AppError::Validation("Missing 'content' field".to_string()).into_response()
+    })?;
+    let digests = content_digests.ok_or_else(|| {
         AppError::Validation("Missing 'content' field".to_string()).into_response()
     })?;
     let filename = file_name.ok_or_else(|| {
@@ -1938,10 +2440,8 @@ async fn upload(
 
     let normalized = PypiHandler::normalize_name(&pkg_name);
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    // SHA-256 was computed incrementally while the body was spooled to disk.
+    let computed_sha256 = digests.sha256.clone();
 
     // Verify digest if provided
     if let Some(ref expected) = sha256_digest {
@@ -1995,7 +2495,7 @@ async fn upload(
     let content_type = pypi_content_type(&filename);
 
     let artifact_path = format!("{}/{}/{}", normalized, pkg_version, filename);
-    let size_bytes = content.len() as i64;
+    let size_bytes = staged_content.size_bytes();
 
     // No pre-cleanup here: this path persists through
     // `artifact_service::upload_with_sync_options`, whose release-immutability
@@ -2008,19 +2508,26 @@ async fn upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
+    // Re-read the staged scratch file as a `'static` stream; the service does the
+    // dedup `exists()` check first and only streams into storage on a miss.
+    let content_stream = proxy_helpers::open_staged_upload_stream(&staged_content).await?;
     let artifact = artifact_service
-        .upload_with_sync_options(
+        .upload_stream_with_sync_options(
             repo.id,
             &artifact_path,
             &normalized,
             Some(&pkg_version),
             content_type,
-            content,
+            content_stream,
+            digests,
+            size_bytes,
             Some(user_id),
             should_enqueue_pypi_sync_tasks(&headers),
         )
         .await
         .map_err(|e| e.into_response())?;
+    // Scratch file no longer needed once the service has consumed the stream.
+    drop(staged_content);
 
     artifact_service
         .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))
@@ -2419,9 +2926,12 @@ fn merge_local_into_remote_simple_json(
     serde_json::to_string(&doc).ok()
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -2487,22 +2997,39 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn pypi_lkg_filename_from_artifact_path_takes_basename() {
+        assert_eq!(
+            pypi_lkg_filename_from_artifact_path("pkg/1.0.0/wheel.whl"),
+            "wheel.whl"
+        );
+    }
+
+    #[test]
+    fn build_pypi_proxy_cache_path_format() {
+        assert_eq!(
+            build_pypi_proxy_cache_path("requests", "requests-2.31.0.tar.gz"),
+            "simple/requests/requests-2.31.0.tar.gz"
+        );
+    }
+
+    #[test]
     fn test_pypi_upstream_strips_trailing_simple() {
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/");
+        let (url, path) =
+            pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
     }
 
     #[test]
     fn test_pypi_upstream_strips_trailing_simple_no_slash() {
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple", "flask/");
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple", "flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
     }
 
     #[test]
     fn test_pypi_upstream_keeps_non_simple_url() {
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "flask/");
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
     }
@@ -2510,15 +3037,18 @@ mod tests {
     #[test]
     fn test_pypi_upstream_keeps_devpi_path() {
         let (url, path) =
-            pypi_upstream_url_and_path("https://devpi.example.com/root/pypi", "numpy/");
+            pypi_upstream_url_and_path("https://devpi.example.com/root/pypi", "numpy/", "simple");
         assert_eq!(url, "https://devpi.example.com/root/pypi");
         assert_eq!(path, "simple/numpy/");
     }
 
     #[test]
     fn test_pypi_upstream_trailing_simple_with_file() {
-        let (url, path) =
-            pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/Flask-3.0.0.tar.gz");
+        let (url, path) = pypi_upstream_url_and_path(
+            "https://pypi.org/simple/",
+            "flask/Flask-3.0.0.tar.gz",
+            "simple",
+        );
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/Flask-3.0.0.tar.gz");
     }
@@ -2528,14 +3058,14 @@ mod tests {
         // Edge case: configured upstream is literally "/simple" — strip the
         // suffix and substitute "/" so build_upstream_url has a non-empty
         // base to operate on. Exercises the `if base.is_empty()` branch.
-        let (url, path) = pypi_upstream_url_and_path("/simple", "flask/");
+        let (url, path) = pypi_upstream_url_and_path("/simple", "flask/", "simple");
         assert_eq!(url, "/");
         assert_eq!(path, "simple/flask/");
     }
 
     #[test]
     fn test_pypi_upstream_bare_simple_with_trailing_slash_collapses_to_root() {
-        let (url, path) = pypi_upstream_url_and_path("/simple/", "flask/");
+        let (url, path) = pypi_upstream_url_and_path("/simple/", "flask/", "simple");
         assert_eq!(url, "/");
         assert_eq!(path, "simple/flask/");
     }
@@ -2555,7 +3085,7 @@ mod tests {
     #[test]
     fn test_pypi_upstream_strips_leading_slash_from_tail() {
         // Tail with a stray leading slash should not produce `simple//flask/`.
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "/flask/");
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "/flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
     }
@@ -2564,8 +3094,11 @@ mod tests {
     fn test_pypi_upstream_simple_substring_not_stripped() {
         // `simple-index` ends with `simple` substring but NOT the `/simple`
         // path segment, so it must not be stripped.
-        let (url, path) =
-            pypi_upstream_url_and_path("https://mirror.example.com/pypi-simple-index", "flask/");
+        let (url, path) = pypi_upstream_url_and_path(
+            "https://mirror.example.com/pypi-simple-index",
+            "flask/",
+            "simple",
+        );
         assert_eq!(url, "https://mirror.example.com/pypi-simple-index");
         assert_eq!(path, "simple/flask/");
     }
@@ -2574,9 +3107,74 @@ mod tests {
     fn test_pypi_upstream_multiple_trailing_slashes_handled() {
         // trim_end_matches('/') strips all trailing slashes; the resulting
         // URL must still strip the `/simple` segment correctly.
-        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple///", "flask/");
+        let (url, path) =
+            pypi_upstream_url_and_path("https://pypi.org/simple///", "flask/", "simple");
         assert_eq!(url, "https://pypi.org");
         assert_eq!(path, "simple/flask/");
+    }
+
+    // -----------------------------------------------------------------------
+    // pypi_upstream_url_and_path — flat CDN index (#1546)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pypi_upstream_flat_index_pytorch_cdn() {
+        // PyTorch CDN: packages live directly under the upstream root.
+        // index_path="" means no prefix: torch/ → {upstream}/torch/
+        let (url, path) =
+            pypi_upstream_url_and_path("https://download.pytorch.org/whl/cpu", "torch/", "");
+        assert_eq!(url, "https://download.pytorch.org/whl/cpu");
+        assert_eq!(path, "torch/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_flat_index_strips_leading_slash_from_tail() {
+        // Stray leading slash on tail must not produce `//torch/` on flat layout.
+        let (url, path) =
+            pypi_upstream_url_and_path("https://download.pytorch.org/whl/cpu", "/torch/", "");
+        assert_eq!(url, "https://download.pytorch.org/whl/cpu");
+        assert_eq!(path, "torch/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_flat_index_with_filename() {
+        // File download on flat layout: tail includes the filename.
+        let (url, path) = pypi_upstream_url_and_path(
+            "https://download.pytorch.org/whl/cpu",
+            "torch/torch-2.2.0+cpu-cp311-cp311-linux_x86_64.whl",
+            "",
+        );
+        assert_eq!(url, "https://download.pytorch.org/whl/cpu");
+        assert_eq!(path, "torch/torch-2.2.0+cpu-cp311-cp311-linux_x86_64.whl");
+    }
+
+    #[test]
+    fn test_pypi_upstream_flat_index_url_ending_in_simple_not_stripped() {
+        // When index_path is empty the /simple de-dup logic is intentionally
+        // skipped. A URL that happens to end in `/simple` is used verbatim.
+        let (url, path) =
+            pypi_upstream_url_and_path("https://cdn.example.com/simple", "numpy/", "");
+        assert_eq!(url, "https://cdn.example.com/simple");
+        assert_eq!(path, "numpy/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_custom_index_path() {
+        // Custom prefix other than "simple" (e.g. a private mirror's layout).
+        let (url, path) =
+            pypi_upstream_url_and_path("https://mirror.corp/pypi", "requests/", "packages");
+        assert_eq!(url, "https://mirror.corp/pypi");
+        assert_eq!(path, "packages/requests/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_custom_index_no_dedup_for_non_simple_prefix() {
+        // Even if the upstream URL ends in "/simple", the de-dup logic is
+        // skipped when index_path != "simple". The URL is used as-is.
+        let (url, path) =
+            pypi_upstream_url_and_path("https://mirror.corp/simple", "numpy/", "packages");
+        assert_eq!(url, "https://mirror.corp/simple");
+        assert_eq!(path, "packages/numpy/");
     }
 
     // -----------------------------------------------------------------------
@@ -3700,6 +4298,18 @@ mod tests {
         Bytes::from(buf)
     }
 
+    /// Wrap static bytes as a one-shot [`StreamingFetchResult`] so the recovery
+    /// tests can drive the streaming refetch closure (#2192).
+    fn one_shot_result(
+        content: &'static [u8],
+    ) -> crate::services::proxy_service::StreamingFetchResult {
+        crate::services::proxy_service::StreamingFetchResult {
+            body: futures::stream::once(async move { Ok(Bytes::from_static(content)) }).boxed(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_length: Some(content.len() as u64),
+        }
+    }
+
     /// Storage double that reports the entry as missing on every `get`, and
     /// records every `put` so tests can assert the write-back path persists
     /// refetched payloads (PR #1283 follow-up: thundering-herd fix).
@@ -3736,6 +4346,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     /// Returns the configured bytes for any `get` call, simulating a healthy
@@ -3761,6 +4378,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     /// Returns a non-`NotFound` storage error for every `get`, simulating an
@@ -3785,27 +4409,35 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     #[tokio::test]
     async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
         // Streaming refetch path is DB-free (storage doubles only), so this runs
         // in Tier-1 `cargo test --lib` without a live Postgres.
-        let storage = MissingStorage::new();
+        let storage = std::sync::Arc::new(MissingStorage::new());
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let storage_key =
             "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
-        let stream = super::get_remote_cached_or_refetch_stream(&storage, storage_key, move || {
-            let refetch_calls_clone = refetch_calls_clone.clone();
-            async move {
-                refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(Bytes::from_static(b"refetched-bytes"))
-            }
-        })
-        .await
-        .expect("refetch should succeed");
+        let stream =
+            super::get_remote_cached_or_refetch_stream(storage.clone(), storage_key, move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(one_shot_result(b"refetched-bytes"))
+                }
+            })
+            .await
+            .expect("refetch should succeed");
         let content = collect_stream(stream).await;
 
         assert_eq!(content, Bytes::from_static(b"refetched-bytes"));
@@ -3852,6 +4484,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
     }
 
     #[tokio::test]
@@ -3860,11 +4499,11 @@ mod tests {
         // disk is full or read-only the user still gets their wheel; the
         // next request will simply re-fetch from upstream until the backend
         // recovers.
-        let storage = WriteFailingStorage;
+        let storage = std::sync::Arc::new(WriteFailingStorage);
         let stream = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/urllib3/urllib3-2.2.0-py3-none-any.whl/__content__",
-            move || async move { Ok(Bytes::from_static(b"refetched-when-disk-full")) },
+            move || async move { Ok(one_shot_result(b"refetched-when-disk-full")) },
         )
         .await
         .expect("write-back failures must not fail the current request");
@@ -3877,20 +4516,20 @@ mod tests {
     async fn test_get_remote_cached_or_refetch_returns_cached_without_refetch() {
         // Happy path: cache hits should return the stored bytes verbatim and
         // must NEVER invoke the upstream refetch closure.
-        let storage = PresentStorage {
+        let storage = std::sync::Arc::new(PresentStorage {
             bytes: Bytes::from_static(b"cached-wheel-bytes"),
-        };
+        });
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let stream = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux.whl/__content__",
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
                     refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(Bytes::from_static(b"should-not-be-used"))
+                    Ok(one_shot_result(b"should-not-be-used"))
                 }
             },
         )
@@ -3911,18 +4550,18 @@ mod tests {
         // A storage backend error that is NOT `NotFound` (e.g. permission
         // denied, I/O error) must be surfaced as a 500 instead of silently
         // re-fetching, otherwise we mask infra issues from operators.
-        let storage = BrokenStorage;
+        let storage = std::sync::Arc::new(BrokenStorage);
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let result = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/six/six-1.16.0.tar.gz/__content__",
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
                     refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(Bytes::from_static(b"never-reached"))
+                    Ok(one_shot_result(b"never-reached"))
                 }
             },
         )
@@ -3947,12 +4586,12 @@ mod tests {
         // When the cache is stale AND the upstream refetch also fails, the
         // upstream error response must reach the caller untouched so the
         // client sees the correct upstream status (e.g. 502).
-        let storage = MissingStorage::new();
+        let storage = std::sync::Arc::new(MissingStorage::new());
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let result = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/requests/requests-2.32.0-py3-none-any.whl/__content__",
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
@@ -3984,20 +4623,20 @@ mod tests {
         // still a cache hit and must be returned without triggering a
         // refetch. This guards against accidentally treating empty bodies
         // as "missing".
-        let storage = PresentStorage {
+        let storage = std::sync::Arc::new(PresentStorage {
             bytes: Bytes::new(),
-        };
+        });
         let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refetch_calls_clone = refetch_calls.clone();
 
         let stream = super::get_remote_cached_or_refetch_stream(
-            &storage,
+            storage.clone(),
             "proxy-cache/pypi-remote/simple/empty/empty-0.0.0.tar.gz/__content__",
             move || {
                 let refetch_calls_clone = refetch_calls_clone.clone();
                 async move {
                     refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(Bytes::from_static(b"unexpected"))
+                    Ok(one_shot_result(b"unexpected"))
                 }
             },
         )
@@ -4010,6 +4649,116 @@ mod tests {
             refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "empty cached payload is a cache hit, not a stale miss"
+        );
+    }
+
+    /// Storage double that reports missing on `get` but records both `put`
+    /// (write-back) and `delete` (truncation compensation).
+    struct RecordingStorage {
+        puts: std::sync::Mutex<Vec<(String, Bytes)>>,
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingStorage {
+        fn new() -> Self {
+            Self {
+                puts: std::sync::Mutex::new(Vec::new()),
+                deletes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for RecordingStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.puts
+                .lock()
+                .expect("puts mutex")
+                .push((key.to_string(), content));
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound("missing cache entry".to_string()))
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.deletes
+                .lock()
+                .expect("deletes mutex")
+                .push(key.to_string());
+            Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
+    }
+
+    fn multi_chunk_result(
+        chunks: Vec<&'static [u8]>,
+        content_length: Option<u64>,
+    ) -> crate::services::proxy_service::StreamingFetchResult {
+        crate::services::proxy_service::StreamingFetchResult {
+            body: futures::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from_static(c))))
+                .boxed(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_length,
+        }
+    }
+
+    /// #2192: a multi-chunk streaming refetch must serve every chunk to the
+    /// caller AND write the full, byte-exact payload back for the next request.
+    #[tokio::test]
+    async fn test_streaming_refetch_tees_multi_chunk_body_to_cache() {
+        let storage = std::sync::Arc::new(RecordingStorage::new());
+        let key = "proxy-cache/pypi-remote/simple/big/big-9.9.9-py3-none-any.whl/__content__";
+        let stream =
+            super::get_remote_cached_or_refetch_stream(storage.clone(), key, move || async move {
+                Ok(multi_chunk_result(vec![b"aaaa", b"bbbb", b"cc"], Some(10)))
+            })
+            .await
+            .expect("streaming refetch should succeed");
+        let content = collect_stream(stream).await;
+
+        assert_eq!(content, Bytes::from_static(b"aaaabbbbcc"));
+        let puts = storage.puts.lock().expect("puts mutex");
+        assert_eq!(puts.len(), 1, "full body must be written back exactly once");
+        assert_eq!(puts[0].0, key);
+        assert_eq!(puts[0].1, Bytes::from_static(b"aaaabbbbcc"));
+        assert!(
+            storage.deletes.lock().expect("deletes mutex").is_empty(),
+            "a complete write-back must not be deleted"
+        );
+    }
+
+    /// #2192: if the written-back length does not match the advertised
+    /// `content_length` (truncation / short read), the partial cache entry must
+    /// be deleted so it is never served as a corrupt warm hit.
+    #[tokio::test]
+    async fn test_streaming_refetch_deletes_truncated_writeback() {
+        let storage = std::sync::Arc::new(RecordingStorage::new());
+        let key = "proxy-cache/pypi-remote/simple/trunc/trunc-1.0.0-py3-none-any.whl/__content__";
+        // Advertise 100 bytes but only deliver 4: the guard must delete.
+        let stream =
+            super::get_remote_cached_or_refetch_stream(storage.clone(), key, move || async move {
+                Ok(multi_chunk_result(vec![b"abcd"], Some(100)))
+            })
+            .await
+            .expect("streaming refetch should succeed even when truncated");
+        let content = collect_stream(stream).await;
+
+        // The caller still receives whatever bytes arrived.
+        assert_eq!(content, Bytes::from_static(b"abcd"));
+        let deletes = storage.deletes.lock().expect("deletes mutex");
+        assert_eq!(
+            deletes.as_slice(),
+            &[key.to_string()],
+            "a truncated write-back must be deleted, not served warm"
         );
     }
 
@@ -4147,6 +4896,506 @@ mod tests {
         );
 
         cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Age-gate fail-open regression: a local `artifacts` row must NOT bypass
+    // the download age gate on a Remote repo.
+    //
+    // `serve_file` looks up the local `artifacts` table first. Before this
+    // fix the gate ran ONLY on the cache-MISS branch, so a version with an
+    // `artifacts` row (locally-published / hydrated / pre-#1278 cached wheel)
+    // streamed UNGATED even when it was too young — an asymmetry versus npm's
+    // `serve_tarball`, which gates unconditionally. This test seeds exactly
+    // such a row for a gate-enabled Remote repo whose upstream reports a
+    // just-now `upload_time` (so the version is younger than the threshold)
+    // and asserts the request is blocked with HTTP 451 rather than streamed.
+    //
+    // Skips cleanly when DATABASE_URL is unset.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_serve_file_age_gate_blocks_young_version_on_artifacts_hit() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        let wheel_bytes: &[u8] = b"PK\x03\x04 young-wheel-should-be-gated";
+        let project = "gated";
+        let version = "1.2.3";
+        let filename = "gated-1.2.3-py3-none-any.whl";
+
+        // Upstream reports the version as published *just now* so it is younger
+        // than the (very large) threshold and must be withheld.
+        let upstream = MockServer::start().await;
+        let now_iso = Utc::now().to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path(format!("/pypi/{project}/json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "releases": { version: [ { "upload_time_iso_8601": now_iso } ] }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // Remote repo with the age gate ENABLED and an absurd threshold so any
+        // recent release is "young".
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+        repo_info.age_gate_enabled = true;
+        repo_info.age_gate_min_age_days = 36_500; // 100 years
+
+        // Seed the local `artifacts` row + payload that would otherwise be
+        // served straight from storage on the cache-hit branch.
+        let storage_key = format!(
+            "proxy-cache/{}/simple/{}/{}",
+            fx.repo_key, project, filename
+        );
+        let artifact_path = format!("simple/{}/{}", project, filename);
+        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+            &state,
+            &repo_info,
+            &storage_key,
+            Bytes::from_static(wheel_bytes),
+        )
+        .await
+        .expect("seed payload on disk");
+        let _artifact_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .bind(&artifact_path)
+        .bind(project)
+        .bind(version)
+        .bind(wheel_bytes.len() as i64)
+        .bind("test-gated")
+        .bind("application/zip")
+        .bind(&storage_key)
+        .bind(fx.user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("seed cached artifact row");
+
+        let result =
+            super::serve_file(&state, &repo_info, &fx.repo_key, project, filename, None).await;
+
+        // Clean up BEFORE asserting so a panic still leaves the DB clean. The
+        // age_gate_reviews row inserted by `check` cascades on repo delete.
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        match result {
+            Ok(r) => {
+                let status = r.status();
+                cleanup().await;
+                panic!(
+                    "young version with an artifacts-row hit must be gated, got {status} \
+                     (expected 451 age_gate_blocked)"
+                );
+            }
+            Err(resp) => {
+                let status = resp.status();
+                cleanup().await;
+                assert_eq!(
+                    status,
+                    StatusCode::from_u16(451).unwrap(),
+                    "artifacts-hit young version must return 451, got {status}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2066: age-gate enforcement on VIRTUAL-repo resolution (download + index)
+    // -----------------------------------------------------------------------
+
+    /// Attach a fresh Remote pypi member (upstream = `upstream_uri`) to the
+    /// virtual fixture, with the age gate enabled/disabled and a 30-day
+    /// threshold. The member is public so an anonymous virtual read authorizes
+    /// it. Returns the member id/key/dir plus a proxy+age-gate SharedState.
+    async fn setup_virtual_pypi_member(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        age_gate_enabled: bool,
+        upstream_uri: &str,
+    ) -> (
+        uuid::Uuid,
+        String,
+        std::path::PathBuf,
+        crate::api::SharedState,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "remote", "pypi").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, is_public = true, \
+             age_gate_enabled = $2, age_gate_min_age_days = 30 WHERE id = $3",
+        )
+        .bind(upstream_uri)
+        .bind(age_gate_enabled)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+        (member_id, member_key, member_dir, state)
+    }
+
+    /// Seed a cached wheel (`artifacts` row + payload) on a virtual member so
+    /// the virtual `serve_file` loop can serve it locally when the gate allows.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_member_wheel(
+        state: &crate::api::SharedState,
+        pool: &sqlx::PgPool,
+        user_id: uuid::Uuid,
+        member_id: uuid::Uuid,
+        member_key: &str,
+        member_dir: &std::path::Path,
+        upstream_uri: &str,
+        project: &str,
+        version: &str,
+        filename: &str,
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let wheel: &[u8] = b"PK\x03\x04 virtual-member-wheel";
+        let member_info = tdh::make_repo_info(
+            member_id,
+            member_key,
+            member_dir,
+            "remote",
+            Some(upstream_uri),
+        );
+        let storage_key = format!("proxy-cache/{}/simple/{}/{}", member_key, project, filename);
+        let artifact_path = format!("simple/{}/{}", project, filename);
+        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+            state,
+            &member_info,
+            &storage_key,
+            Bytes::from_static(wheel),
+        )
+        .await
+        .expect("seed member payload");
+        let _id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+        )
+        .bind(member_id)
+        .bind(&artifact_path)
+        .bind(project)
+        .bind(version)
+        .bind(wheel.len() as i64)
+        .bind("test-member")
+        .bind("application/zip")
+        .bind(&storage_key)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("seed member artifact row");
+    }
+
+    /// Drop everything a virtual member created.
+    async fn cleanup_virtual_member(
+        pool: &sqlx::PgPool,
+        member_id: uuid::Uuid,
+        member_dir: &std::path::Path,
+    ) {
+        for sql in [
+            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+            "DELETE FROM age_gate_reviews WHERE repository_id = $1",
+            "DELETE FROM role_assignments WHERE repository_id = $1",
+            "DELETE FROM artifacts WHERE repository_id = $1",
+            "DELETE FROM repository_config WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+        }
+        let _ = std::fs::remove_dir_all(member_dir);
+    }
+
+    /// Mount the `/pypi/<project>/json` publish-times endpoint used by the
+    /// per-version download gate, reporting `version` published at `iso`.
+    async fn mount_pypi_publish_times(
+        upstream: &wiremock::MockServer,
+        project: &str,
+        version: &str,
+        iso: &str,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/pypi/{project}/json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "releases": { version: [ { "upload_time_iso_8601": iso } ] }
+            })))
+            .mount(upstream)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_virtual_gated_member_blocks_young() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "gated";
+        let version = "9.9.9";
+        let filename = "gated-9.9.9-py3-none-any.whl";
+
+        let upstream = MockServer::start().await;
+        mount_pypi_publish_times(&upstream, project, version, &Utc::now().to_rfc3339()).await;
+
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, true, &upstream.uri()).await;
+        // Seed a cached young wheel too, so this also proves the gate fires
+        // BEFORE the local artifacts-hit can serve young bytes.
+        seed_member_wheel(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            member_id,
+            &member_key,
+            &member_dir,
+            &upstream.uri(),
+            project,
+            version,
+            filename,
+        )
+        .await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result =
+            super::serve_file(&state, &virtual_info, &fx.repo_key, project, filename, None).await;
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        match result {
+            Ok(r) => panic!(
+                "young version of a gated virtual member must be blocked, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::from_u16(451).unwrap(),
+                "young gated member must return 451 through the virtual"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_file_virtual_gated_member_allows_old() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "gated";
+        let version = "1.0.0";
+        let filename = "gated-1.0.0-py3-none-any.whl";
+
+        let upstream = MockServer::start().await;
+        let old = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        mount_pypi_publish_times(&upstream, project, version, &old).await;
+
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, true, &upstream.uri()).await;
+        seed_member_wheel(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            member_id,
+            &member_key,
+            &member_dir,
+            &upstream.uri(),
+            project,
+            version,
+            filename,
+        )
+        .await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result =
+            super::serve_file(&state, &virtual_info, &fx.repo_key, project, filename, None).await;
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let status = result.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "aged version of a gated virtual member must still resolve 200 (regression guard)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_ungated_member_unaffected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "ungated";
+        let version = "9.9.9";
+        let filename = "ungated-9.9.9-py3-none-any.whl";
+
+        // Age gate DISABLED on the member: a young version must NOT be blocked.
+        // No upstream is contacted (the gate short-circuits on !is_applicable).
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, false, "http://127.0.0.1:1").await;
+        seed_member_wheel(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            member_id,
+            &member_key,
+            &member_dir,
+            "http://127.0.0.1:1",
+            project,
+            version,
+            filename,
+        )
+        .await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let result =
+            super::serve_file(&state, &virtual_info, &fx.repo_key, project, filename, None).await;
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let status = result.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an ungated virtual member must serve its (young) version normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_simple_json_filters_young_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "gated";
+        let now = Utc::now().to_rfc3339();
+        let old = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        let index = serde_json::json!({
+            "meta": {"api-version": "1.0"},
+            "name": project,
+            "files": [
+                {"filename": "gated-1.0.0-py3-none-any.whl",
+                 "url": "https://files.example.test/gated-1.0.0-py3-none-any.whl",
+                 "hashes": {}, "upload-time": old},
+                {"filename": "gated-9.9.9-py3-none-any.whl",
+                 "url": "https://files.example.test/gated-9.9.9-py3-none-any.whl",
+                 "hashes": {}, "upload-time": now},
+            ]
+        });
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", PEP691_JSON_CONTENT_TYPE)
+                    .set_body_json(&index),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, true, &upstream.uri()).await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", PEP691_JSON_CONTENT_TYPE.parse().unwrap());
+        let result = super::simple_project(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((fx.repo_key.clone(), project.to_string())),
+            headers,
+        )
+        .await;
+
+        let names: Vec<String> = match result {
+            Ok(r) => {
+                let bytes = axum::body::to_bytes(r.into_body(), 1024 * 1024)
+                    .await
+                    .expect("read body");
+                let json: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                json.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|files| {
+                        files
+                            .iter()
+                            .filter_map(|f| {
+                                f.get("filename").and_then(|n| n.as_str()).map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            Err(r) => {
+                let status = r.status();
+                tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+                cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+                let _ = std::fs::remove_dir_all(&fx.storage_dir);
+                panic!("virtual simple JSON index must succeed, got {status}");
+            }
+        };
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        assert!(
+            names.iter().any(|n| n.contains("1.0.0")),
+            "aged 1.0.0 must remain in the virtual JSON index: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("9.9.9")),
+            "young 9.9.9 of a gated member must be filtered from the virtual JSON index: {names:?}"
+        );
     }
 
     #[tokio::test]
@@ -5687,6 +6936,7 @@ mod tests {
             &server.uri(),
             "numpy",
             "numpy-2.0.0-py3-none-any.whl",
+            "simple",
         )
         .await
         .expect("streaming fetch via fallback path must succeed");

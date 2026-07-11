@@ -920,9 +920,15 @@ async fn download(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, _content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
-                        .await?;
+                let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &path,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                )
+                .await?;
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "text/plain")
@@ -953,12 +959,13 @@ async fn download(
                     if let (Some(ref upstream_url), Some(ref proxy)) =
                         (&member.upstream_url, &state.proxy_service)
                     {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                        if let Ok((content, _)) = proxy_helpers::proxy_fetch_capped(
                             proxy,
                             member.id,
                             &member.key,
                             upstream_url,
                             &path,
+                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                         )
                         .await
                         {
@@ -1012,10 +1019,16 @@ async fn fetch_remote_member_metadata(
     }
     let upstream_url = member.upstream_url.as_deref()?;
     let proxy = state.proxy_service.as_ref()?;
-    let (content, _) =
-        proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, path)
-            .await
-            .ok()?;
+    let (content, _) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        member.id,
+        &member.key,
+        upstream_url,
+        path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await
+    .ok()?;
     std::str::from_utf8(&content).ok().map(|s| s.to_string())
 }
 
@@ -1032,8 +1045,15 @@ async fn fetch_maven_metadata_bytes(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, _) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, path).await?;
+            let (content, _) = proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                repo_key,
+                upstream_url,
+                path,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            )
+            .await?;
             return Ok(content);
         }
         return Err(AppError::NotFound("Metadata not found".to_string()).into_response());
@@ -1048,6 +1068,10 @@ async fn fetch_maven_metadata_bytes(
 
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
             let mut all_versions: Vec<String> = Vec::new();
+            // Newest `<lastUpdated>` reported by any member. Reused for the
+            // merged body so it is byte-identical across the separate metadata
+            // and checksum requests (#1922) instead of a per-request wall clock.
+            let mut max_last_updated: Option<String> = None;
 
             // Fan out across members CONCURRENTLY (#2069) in priority-order
             // batches of at most `MAX_VIRTUAL_FANOUT`: Remote members proxy their
@@ -1071,6 +1095,11 @@ async fn fetch_maven_metadata_bytes(
                 }))
                 .await;
                 for xml in member_docs.into_iter().flatten() {
+                    if let Some(ts) = crate::formats::maven::parse_metadata_last_updated(&xml) {
+                        if max_last_updated.as_deref() < Some(ts.as_str()) {
+                            max_last_updated = Some(ts);
+                        }
+                    }
                     if let Some((_, _, versions)) =
                         crate::formats::maven::parse_metadata_versions(&xml)
                     {
@@ -1088,9 +1117,12 @@ async fn fetch_maven_metadata_bytes(
                 let latest = sorted.last().unwrap().clone();
                 let release = maven_version::latest_release(&sorted).cloned();
 
-                // No single `MAX(updated_at)` across heterogeneous members;
-                // wall clock is the best we can do for the virtual aggregate.
-                let last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+                // Reuse the newest member `<lastUpdated>` so the merged body is
+                // reproducible across the separate metadata and checksum
+                // requests (#1922); fall back to wall clock only if no member
+                // reported one (e.g. all-remote members omitting the element).
+                let last_updated = max_last_updated
+                    .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d%H%M%S").to_string());
                 let xml = generate_metadata_xml(
                     &group_id,
                     &artifact_id,
@@ -2099,6 +2131,8 @@ async fn upload(
         .unwrap())
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2573,7 +2607,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.repo_type, "hosted");
@@ -2588,7 +2625,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
@@ -4239,6 +4279,214 @@ mod tests {
         assert_ne!(
             sha1, "0000bogussha1value0000",
             "resolver must not forward the upstream's mismatched sidecar"
+        );
+    }
+
+    /// Drive the real `upload` (PUT) handler for `<repo_key>/<path>`, asserting
+    /// a 201. Mirrors what a Maven client does when it deploys an object
+    /// (metadata body or a `.sha1`/`.md5` sidecar) to a hosted repo.
+    async fn put_object(
+        state: &SharedState,
+        auth: &AuthExtension,
+        repo_key: &str,
+        path: &str,
+        body: &[u8],
+    ) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let resp = upload(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path((repo_key.to_string(), path.to_string())),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::copy_from_slice(body),
+        )
+        .await
+        .expect("upload must succeed");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "PUT {} must be 201",
+            path
+        );
+    }
+
+    /// HOSTED repo, reporter's exact shape (#2183): a Maven client `mvn deploy`
+    /// PUTs a SNAPSHOT `maven-metadata.xml` AND a `maven-metadata.xml.sha1`
+    /// (and `.md5`) sidecar whose stored bytes DELIBERATELY DO NOT MATCH the
+    /// XML. On 1.2.0 the read path served the stored sidecar verbatim while the
+    /// body could be (re)generated, so `.sha1` diverged from the served
+    /// `maven-metadata.xml` and stayed wrong across re-deploys. #1922 made the
+    /// checksum a single source of truth: the download handler recomputes it
+    /// from the exact bytes the sibling `maven-metadata.xml` URL serves and
+    /// never reads the stored sidecar for a metadata checksum. This pins that
+    /// the planted-wrong sidecar is IGNORED and the served `.sha1`/`.md5` equal
+    /// the checksum of the served metadata body — the one case #1922's tests
+    /// (local-dynamic / virtual-merged / remote-bogus-upstream) did not cover.
+    #[tokio::test]
+    async fn test_resolver_hosted_snapshot_ignores_mismatched_sidecar_2183() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+
+        let meta_path = "com/example/foo/1.0.0-SNAPSHOT/maven-metadata.xml";
+        // A realistic SNAPSHOT metadata body, exactly as a Maven client renders
+        // and uploads it to a hosted repo.
+        let meta_v1 = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<metadata>\n",
+            "  <groupId>com.example</groupId>\n",
+            "  <artifactId>foo</artifactId>\n",
+            "  <version>1.0.0-SNAPSHOT</version>\n",
+            "  <versioning>\n",
+            "    <snapshot>\n",
+            "      <timestamp>20240101.000000</timestamp>\n",
+            "      <buildNumber>1</buildNumber>\n",
+            "    </snapshot>\n",
+            "    <lastUpdated>20240101000000</lastUpdated>\n",
+            "    <snapshotVersions>\n",
+            "      <snapshotVersion>\n",
+            "        <extension>jar</extension>\n",
+            "        <value>1.0.0-20240101.000000-1</value>\n",
+            "        <updated>20240101000000</updated>\n",
+            "      </snapshotVersion>\n",
+            "    </snapshotVersions>\n",
+            "  </versioning>\n",
+            "</metadata>\n",
+        )
+        .as_bytes();
+
+        // The client uploads the metadata AND deliberately-WRONG sidecars.
+        // (A real client uploads the correct digest, but 1.2.0's bug was that
+        // AK served the STORED sidecar; planting a wrong one makes any
+        // regression to that behavior unmistakable.)
+        let bogus_sha1 = "0000bogussha1value000000000000000000000000";
+        let bogus_md5 = "ffffbogusmd5value00000000000000f";
+        put_object(&state, &auth, &repo_key, meta_path, meta_v1).await;
+        put_object(
+            &state,
+            &auth,
+            &repo_key,
+            &format!("{}.sha1", meta_path),
+            bogus_sha1.as_bytes(),
+        )
+        .await;
+        put_object(
+            &state,
+            &auth,
+            &repo_key,
+            &format!("{}.md5", meta_path),
+            bogus_md5.as_bytes(),
+        )
+        .await;
+
+        // GET the metadata + its checksum siblings via the real download handler.
+        let (sha1_body, sha1) =
+            served_metadata_and_checksum(&state, &auth, &repo_key, meta_path, "sha1").await;
+        let (md5_body, md5) =
+            served_metadata_and_checksum(&state, &auth, &repo_key, meta_path, "md5").await;
+
+        // The served metadata body must be the stored SNAPSHOT document.
+        assert_eq!(
+            sha1_body.as_ref(),
+            meta_v1,
+            "hosted repo must serve the stored maven-metadata.xml verbatim"
+        );
+        assert_eq!(sha1_body, md5_body, "both GETs must serve identical bytes");
+
+        // The checksum must be recomputed from the SERVED bytes — never the
+        // planted-wrong stored sidecar (this is the exact #2183 assertion).
+        assert_eq!(
+            sha1,
+            compute_checksum(&sha1_body, ChecksumType::Sha1),
+            "served .sha1 must equal sha1 of the served metadata body (#2183)"
+        );
+        assert_ne!(
+            sha1, bogus_sha1,
+            "served .sha1 must NOT be the planted mismatched sidecar (#2183)"
+        );
+        assert_eq!(
+            md5,
+            compute_checksum(&md5_body, ChecksumType::Md5),
+            "served .md5 must equal md5 of the served metadata body (#2183)"
+        );
+        assert_ne!(
+            md5, bogus_md5,
+            "served .md5 must NOT be the planted mismatched sidecar (#2183)"
+        );
+
+        // Re-deploy: PUT an UPDATED metadata body (new buildNumber/timestamp)
+        // plus, again, a stale wrong sidecar. The served `.sha1`/`.md5` must
+        // stay in lockstep with the NEW served XML — proving the checksum
+        // tracks the body across re-deploy (the reporter observed the mismatch
+        // persisting across re-deploys on 1.2.0).
+        let meta_v2 = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<metadata>\n",
+            "  <groupId>com.example</groupId>\n",
+            "  <artifactId>foo</artifactId>\n",
+            "  <version>1.0.0-SNAPSHOT</version>\n",
+            "  <versioning>\n",
+            "    <snapshot>\n",
+            "      <timestamp>20240202.020202</timestamp>\n",
+            "      <buildNumber>2</buildNumber>\n",
+            "    </snapshot>\n",
+            "    <lastUpdated>20240202020202</lastUpdated>\n",
+            "    <snapshotVersions>\n",
+            "      <snapshotVersion>\n",
+            "        <extension>jar</extension>\n",
+            "        <value>1.0.0-20240202.020202-2</value>\n",
+            "        <updated>20240202020202</updated>\n",
+            "      </snapshotVersion>\n",
+            "    </snapshotVersions>\n",
+            "  </versioning>\n",
+            "</metadata>\n",
+        )
+        .as_bytes();
+        put_object(&state, &auth, &repo_key, meta_path, meta_v2).await;
+        // Sidecar is still stale/wrong after re-deploy.
+        put_object(
+            &state,
+            &auth,
+            &repo_key,
+            &format!("{}.sha1", meta_path),
+            bogus_sha1.as_bytes(),
+        )
+        .await;
+
+        let (sha1_body2, sha1_2) =
+            served_metadata_and_checksum(&state, &auth, &repo_key, meta_path, "sha1").await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            sha1_body2.as_ref(),
+            meta_v2,
+            "re-deploy must serve the UPDATED stored metadata body"
+        );
+        assert_ne!(
+            sha1_body2, sha1_body,
+            "the re-deployed body must actually differ from the first deploy"
+        );
+        assert_eq!(
+            sha1_2,
+            compute_checksum(&sha1_body2, ChecksumType::Sha1),
+            "after re-deploy the served .sha1 must track the NEW served body (#2183)"
+        );
+        assert_ne!(
+            sha1_2, bogus_sha1,
+            "re-deployed .sha1 must still ignore the planted mismatched sidecar (#2183)"
         );
     }
 

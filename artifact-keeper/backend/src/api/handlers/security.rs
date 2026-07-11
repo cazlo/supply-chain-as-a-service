@@ -86,6 +86,12 @@ pub struct ScoreResponse {
     pub acknowledged_count: i32,
     pub last_scan_at: Option<chrono::DateTime<chrono::Utc>>,
     pub calculated_at: chrono::DateTime<chrono::Utc>,
+    /// True when the latest applicable scan for this repo errored (#2167).
+    /// The `grade` is floored to `F` while this holds, so clients and the
+    /// release-gate must treat the repo as NOT clean regardless of the numeric
+    /// finding counts. Cleared automatically once a `completed` rescan
+    /// supersedes the failed scan.
+    pub has_failed_scan: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -285,6 +291,7 @@ impl From<crate::models::security::RepoSecurityScore> for ScoreResponse {
             acknowledged_count: s.acknowledged_count,
             last_scan_at: s.last_scan_at,
             calculated_at: s.calculated_at,
+            has_failed_scan: s.has_failed_scan,
         }
     }
 }
@@ -607,6 +614,25 @@ async fn trigger_scan(
     }
 
     if let Some(artifact_id) = body.artifact_id {
+        // Honest not-found up front (#2227): without this, an id with no
+        // `artifacts` row -- e.g. the synthetic, SHA-256-derived id a Remote
+        // repo lists for a proxy-cached object (#1280/#1278) -- returned a
+        // fire-and-forget 200 and then failed only in the worker's logs
+        // ("Scan failed for artifact ...: Artifact not found"). Resolve the
+        // row first and return a clear 404 so the caller learns that scans
+        // are only available for artifacts hosted in this registry.
+        let exists: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE id = $1 AND is_deleted = false")
+                .bind(artifact_id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
+        if exists.is_none() {
+            return Err(AppError::NotFound(
+                crate::api::handlers::sbom::ARTIFACT_NOT_ANALYZABLE_MSG.into(),
+            ));
+        }
+
         // Pre-allocate one scan_result row per configured scanner so the IDs
         // can be returned in this response. The actual scan work is still
         // fire-and-forget (tokio::spawn) but uses these pre-committed IDs
@@ -881,15 +907,18 @@ async fn list_policies(
     request_body = CreatePolicyRequest,
     responses(
         (status = 200, description = "Policy created", body = PolicyResponse),
+        (status = 400, description = "Invalid max_severity (must be one of critical, high, medium, low; case-insensitive)", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "repository_id does not reference an existing repository", body = crate::api::openapi::ErrorResponse),
         (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn create_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<CreatePolicyRequest>,
 ) -> Result<Json<PolicyResponse>> {
+    auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     let p = svc
         .create_policy(
@@ -949,10 +978,11 @@ async fn get_policy(
 )]
 async fn update_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdatePolicyRequest>,
 ) -> Result<Json<PolicyResponse>> {
+    auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     // PUT is partial-update friendly: any field client omits is left at its
     // current DB value via COALESCE in the service layer. See #1374.
@@ -989,9 +1019,10 @@ async fn update_policy(
 )]
 async fn delete_policy(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    auth.require_admin()?;
     let svc = PolicyService::new(state.db.clone());
     svc.delete_policy(id).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
@@ -1236,6 +1267,32 @@ mod tests {
                 body_of(reader).contains("require_visible("),
                 "{} must call require_visible (xtenant)",
                 reader
+            );
+        }
+    }
+
+    /// Admin gate on the GLOBAL security-policy write handlers. The global
+    /// /api/v1/security/policies write endpoints must be admin-only, matching
+    /// every sibling governance endpoint; otherwise any authenticated user can
+    /// disable/delete org-wide scan policies. String-grep because the handlers
+    /// need a full DB-backed `SharedState` to run.
+    #[test]
+    fn test_global_policy_write_handlers_require_admin() {
+        let source = include_str!("security.rs");
+        let body_of = |handler: &str| -> &str {
+            let marker = format!("async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+            &rest[..end]
+        };
+        for writer in ["create_policy", "update_policy", "delete_policy"] {
+            assert!(
+                body_of(writer).contains("require_admin("),
+                "{} must call require_admin (global policy write is admin-only)",
+                writer
             );
         }
     }
@@ -1922,7 +1979,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
 
         // ---- Case 1: non-admin + bypass_dedup=true -> 403 Authorization
@@ -2309,6 +2367,7 @@ mod tests {
             acknowledged_count: 1,
             last_scan_at: Some(now),
             calculated_at: now,
+            has_failed_scan: false,
         };
         assert_eq!(resp.score, 85);
         assert_eq!(resp.grade, "A");
@@ -2331,6 +2390,7 @@ mod tests {
             acknowledged_count: 0,
             last_scan_at: None,
             calculated_at: chrono::Utc::now(),
+            has_failed_scan: false,
         };
         assert_eq!(resp.score, 0);
         assert_eq!(resp.grade, "F");
@@ -2379,6 +2439,7 @@ mod tests {
                 acknowledged_count: 0,
                 last_scan_at: Some(now),
                 calculated_at: now,
+                has_failed_scan: false,
             }),
         };
         assert!(resp.config.is_some());
@@ -2479,6 +2540,7 @@ mod tests {
             acknowledged_count: 1,
             last_scan_at: Some(now),
             calculated_at: now,
+            has_failed_scan: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["score"], 75);

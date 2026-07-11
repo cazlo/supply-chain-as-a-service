@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{api_token_audit_entry, audit_fire_and_forget, AuditAction};
 use crate::services::auth_service::AuthService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::token_service::{is_token_expired, validate_scopes_pure};
@@ -347,6 +348,18 @@ pub async fn create_repo_token(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            auth.user_id,
+            token_id,
+            Some(&payload.name),
+            "repo",
+        ),
+    )
+    .await;
+
     Ok(Json(CreateRepoTokenResponse {
         id: token_id,
         token,
@@ -502,6 +515,18 @@ pub async fn revoke_repo_token(
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     auth_service.revoke_api_token(token_id, owner.0).await?;
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenRevoked,
+            auth.user_id,
+            token_id,
+            None,
+            "repo",
+        ),
+    )
+    .await;
+
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -586,7 +611,8 @@ mod tests {
             is_api_token: scopes.is_some(),
             is_service_account: false,
             scopes,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 

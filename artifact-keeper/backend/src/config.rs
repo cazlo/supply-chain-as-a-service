@@ -251,6 +251,28 @@ pub struct Config {
     /// permitted so users can authenticate and clients can negotiate.
     pub guest_access_enabled: bool,
 
+    /// When true, the unauthenticated `/health` (and `/healthz`) response
+    /// includes operator-only detail: the exact git commit SHA (`commit`),
+    /// the prerelease/`dirty` flag, and live connection-pool internals
+    /// (`db_pool`: max/idle/active/size). These fields let an anonymous caller
+    /// fingerprint the precise build and observe live pool pressure, so they
+    /// default to OFF (#2226): the public probe stays minimal
+    /// (status/version/checks), and the detail is surfaced only where an
+    /// operator explicitly opts in via `EXPOSE_DETAILED_HEALTH=true`. Admins
+    /// still get pool detail from the authenticated `/metrics` /memory-stats
+    /// endpoints regardless of this flag.
+    pub expose_detailed_health: bool,
+
+    /// When true, the gRPC server registers the tonic server-reflection
+    /// service, which lets clients enumerate the full service catalog, every
+    /// RPC method, and message schemas without authentication. Reflection is
+    /// convenient for `grpcurl` exploration and the SBOM e2e tooling, but in
+    /// production it hands an anonymous network peer a complete map of the API
+    /// surface, so it defaults to OFF (#2226). Enable it in dev/CI via
+    /// `GRPC_REFLECTION_ENABLED=true`. Data-plane RPCs remain protected by the
+    /// JWT auth interceptor irrespective of this flag.
+    pub grpc_reflection_enabled: bool,
+
     /// When true (the default), a WASM plugin may only be installed (via ZIP,
     /// Git, or reload) if it ships a detached Ed25519 signature
     /// (`plugin.wasm.sig`) over its raw WASM bytes that verifies against the
@@ -307,6 +329,17 @@ pub struct Config {
     /// the pass is still gated behind the `manifest_blob_refs` readiness
     /// check, so it never deletes while ref coverage is incomplete.
     pub blob_gc_enabled: bool,
+
+    /// Sweep-grace window (seconds) for the two-phase mark-and-sweep blob GC
+    /// (#1660). A blob is first *marked* (`pending_delete_at`) in one pass and
+    /// only physically *swept* (storage + row delete) in a later pass once it
+    /// has stayed marked for at least this long AND is still orphan. The
+    /// window gives a concurrent re-push time to resurrect a re-adopted blob
+    /// (clear the marker under the push-path row lock) before its bytes are
+    /// deleted, so no live blob is ever swept. Defaults to 3600 (1 hour); set
+    /// `BLOB_GC_SWEEP_GRACE_SECS` to tune. `0` sweeps a marked blob on the
+    /// next pass with no extra delay.
+    pub blob_gc_sweep_grace_secs: u64,
 
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
@@ -450,6 +483,22 @@ pub struct Config {
     /// sheds rather than starves. Env var:
     /// `RATE_LIMIT_LOGIN_GLOBAL_PER_WINDOW`. Default: 8192.
     pub rate_limit_login_global_per_window: u32,
+    /// Maximum login attempts per `(username, source-IP)` per
+    /// `rate_limit_login_window_secs`. The login handler bcrypt-verifies the
+    /// submitted password (cost-12, ~187ms) and does so even for locked
+    /// accounts, so borrowing the loose general-auth budget lets a single
+    /// client drive a burst of verifies that saturates CPU. This dedicated,
+    /// tight per-key budget sheds the excess as 429 in the middleware layer,
+    /// before the verifier runs. Sized for humans (automation uses tokens or
+    /// `rate_limit_exempt_usernames`); logout/refresh/totp keep the looser
+    /// `rate_limit_auth_per_window` budget. Env var:
+    /// `RATE_LIMIT_LOGIN_PER_WINDOW`. Default: 10.
+    pub rate_limit_login_per_window: u32,
+    /// Window length for the login limiter, in seconds. Decoupled from
+    /// `rate_limit_window_secs` (typically 60) so the login bucket can use a
+    /// longer, lockout-style window (default 15 minutes). Env var:
+    /// `RATE_LIMIT_LOGIN_WINDOW_SECS`. Default: 900.
+    pub rate_limit_login_window_secs: u64,
     /// Maximum self-password-change attempts per user per
     /// `rate_limit_password_change_window_secs`. Tighter than the global API
     /// bucket because `POST /users/:id/password` verifies the current
@@ -560,6 +609,26 @@ pub struct Config {
     /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
     pub presigned_download_expiry_secs: u64,
 
+    // -- Proxy pull-through cache cross-replica single-flight (#1609) --
+    /// Enable the cross-replica single-flight coordinator for pull-through cache
+    /// fills: a PostgreSQL advisory lock keyed on the cache key so exactly ONE
+    /// replica cold-fetches a given object cluster-wide instead of up to N (which
+    /// flaps the storage ETag under readers → `Stale file handle` / truncated
+    /// `.sha1`, #1606). Opt-in HA feature (like `presigned_downloads_enabled`):
+    /// default `false` keeps the unchanged per-process single-flight for
+    /// single-replica installs. Multi-replica deployments should set
+    /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`.
+    pub proxy_singleflight_advisory_locks_enabled: bool,
+
+    /// Follower poll cadence (milliseconds) while the cluster leader fetches,
+    /// when `proxy_singleflight_advisory_locks_enabled` is true. Default: 200.
+    pub proxy_singleflight_lock_poll_interval_ms: u64,
+
+    /// Upper bound (seconds) a follower waits for the leader's commit before
+    /// falling back to its own bounded fetch, when advisory locks are enabled.
+    /// Default: 65.
+    pub proxy_singleflight_lock_wait_timeout_secs: u64,
+
     // -- SMTP (optional, notifications are disabled when smtp_host is None) --
     /// SMTP server hostname. When absent, email delivery is disabled and the
     /// SMTP service operates as a no-op.
@@ -579,6 +648,35 @@ pub struct Config {
 
     /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
     pub smtp_tls_mode: String,
+
+    // -- npm computed-packument cache (#2162) --
+    /// Whether the npm computed-packument response cache (with
+    /// stale-while-revalidate) is enabled. Applies to **remote and virtual**
+    /// npm repositories only — local (hosted) packuments are a cheap DB read
+    /// and are never cached, so local publishes stay read-your-writes across
+    /// replicas. Defaults to `true`; only an explicit
+    /// `NPM_PACKUMENT_CACHE_ENABLED=false`/`0` disables it.
+    pub npm_packument_cache_enabled: bool,
+
+    /// Fresh window in seconds for cached packument responses: entries
+    /// younger than this serve directly with no revalidation. Env
+    /// `NPM_PACKUMENT_CACHE_FRESH_TTL_SECS`, default 300 (aligned with the
+    /// packument mutability policy in `cache_classifier`).
+    pub npm_packument_cache_fresh_ttl_secs: u64,
+
+    /// Stale window in seconds: entries older than the fresh TTL but younger
+    /// than this serve immediately while a background task refreshes them;
+    /// older entries are recomputed inline. Env
+    /// `NPM_PACKUMENT_CACHE_STALE_MAX_SECS`, default 86400 (24 h).
+    pub npm_packument_cache_stale_max_secs: u64,
+
+    /// Redis URL selecting the shared packument-cache backend for
+    /// multi-replica deployments (e.g. `redis://cache:6379/0`). When unset
+    /// (the default) the cache is in-process. When set, Redis is read first
+    /// and the in-process layer serves as a fallback whenever Redis errors,
+    /// so a Redis outage degrades to per-replica caching instead of failing
+    /// requests. Env `NPM_PACKUMENT_CACHE_REDIS_URL`.
+    pub npm_packument_cache_redis_url: Option<String>,
 }
 
 redacted_debug!(Config {
@@ -612,6 +710,8 @@ redacted_debug!(Config {
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
+    show expose_detailed_health,
+    show grpc_reflection_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show peer_instance_name,
@@ -623,6 +723,7 @@ redacted_debug!(Config {
     show otel_service_name,
     show gc_schedule,
     show blob_gc_enabled,
+    show blob_gc_sweep_grace_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
     show stuck_scan_check_interval_secs,
@@ -644,6 +745,8 @@ redacted_debug!(Config {
     show rate_limit_api_per_window,
     show rate_limit_search_per_window,
     show rate_limit_login_global_per_window,
+    show rate_limit_login_per_window,
+    show rate_limit_login_window_secs,
     show rate_limit_password_change_per_window,
     show rate_limit_password_change_window_secs,
     show rate_limit_window_secs,
@@ -666,12 +769,19 @@ redacted_debug!(Config {
     show password_min_strength,
     show presigned_downloads_enabled,
     show presigned_download_expiry_secs,
+    show proxy_singleflight_advisory_locks_enabled,
+    show proxy_singleflight_lock_poll_interval_ms,
+    show proxy_singleflight_lock_wait_timeout_secs,
     show smtp_host,
     show smtp_port,
     show smtp_username,
     redact_option smtp_password,
     show smtp_from_address,
     show smtp_tls_mode,
+    show npm_packument_cache_enabled,
+    show npm_packument_cache_fresh_ttl_secs,
+    show npm_packument_cache_stale_max_secs,
+    redact_option npm_packument_cache_redis_url,
 });
 
 impl Default for Config {
@@ -707,6 +817,8 @@ impl Default for Config {
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
+            expose_detailed_health: false,
+            grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             peer_instance_name: "test-instance".into(),
@@ -718,6 +830,7 @@ impl Default for Config {
             otel_service_name: "artifact-keeper".into(),
             gc_schedule: "0 0 * * * *".into(),
             blob_gc_enabled: false,
+            blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
             stuck_scan_check_interval_secs: 600,
@@ -740,6 +853,8 @@ impl Default for Config {
             rate_limit_search_per_window: 300,
             rate_limit_presign_per_window: 30,
             rate_limit_login_global_per_window: 8192,
+            rate_limit_login_per_window: 10,
+            rate_limit_login_window_secs: 900,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -764,12 +879,21 @@ impl Default for Config {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            proxy_singleflight_advisory_locks_enabled: false,
+            proxy_singleflight_lock_poll_interval_ms: 200,
+            proxy_singleflight_lock_wait_timeout_secs: 65,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
             smtp_password: None,
             smtp_from_address: "noreply@artifact-keeper.local".into(),
             smtp_tls_mode: "starttls".into(),
+            npm_packument_cache_enabled: true,
+            npm_packument_cache_fresh_ttl_secs:
+                crate::services::npm_packument_cache::NPM_PACKUMENT_FRESH_TTL_DEFAULT_SECS,
+            npm_packument_cache_stale_max_secs:
+                crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
+            npm_packument_cache_redis_url: None,
         }
     }
 }
@@ -843,6 +967,18 @@ impl Config {
                 env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
                 Ok("false" | "0")
             ),
+            // Info-disclosure hardening (#2226): the public /health response
+            // hides the git commit SHA and live db-pool internals unless an
+            // operator explicitly opts in. Default OFF; only "true"/"1" enables.
+            expose_detailed_health: parse_opt_in_flag(
+                env::var("EXPOSE_DETAILED_HEALTH").ok().as_deref(),
+            ),
+            // Info-disclosure hardening (#2226): gRPC server reflection exposes
+            // the whole service catalog + schemas to unauthenticated peers, so
+            // it is OFF unless explicitly enabled (dev/CI grpcurl tooling).
+            grpc_reflection_enabled: parse_opt_in_flag(
+                env::var("GRPC_REFLECTION_ENABLED").ok().as_deref(),
+            ),
             // Fail-closed supply-chain control: defaults to true so an
             // unsigned WASM plugin cannot be installed out of the box. Only an
             // explicit, recognized negative ("false"/"0", case/whitespace-
@@ -886,6 +1022,11 @@ impl Config {
             // Accepts "true" / "1" (case-insensitive); anything else
             // (empty, garbage, unset) keeps live blob deletion disabled.
             blob_gc_enabled: parse_opt_in_flag(env::var("BLOB_GC_ENABLED").ok().as_deref()),
+            // Two-phase blob-GC sweep grace (#1660). Clamped to at most 7 days
+            // so a fat-fingered enormous value can't silently disable the
+            // sweep forever; `0` is allowed (sweep on the next pass).
+            blob_gc_sweep_grace_secs: env_parse("BLOB_GC_SWEEP_GRACE_SECS", 3600u64)
+                .min(7 * 24 * 60 * 60),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
                 "STUCK_SCAN_THRESHOLD_SECS",
@@ -940,6 +1081,8 @@ impl Config {
                 "RATE_LIMIT_LOGIN_GLOBAL_PER_WINDOW",
                 8192,
             ),
+            rate_limit_login_per_window: env_parse("RATE_LIMIT_LOGIN_PER_WINDOW", 10),
+            rate_limit_login_window_secs: env_parse("RATE_LIMIT_LOGIN_WINDOW_SECS", 900),
             rate_limit_password_change_per_window: env_parse(
                 "RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW",
                 5,
@@ -1016,6 +1159,18 @@ impl Config {
                 Ok("true" | "1")
             ),
             presigned_download_expiry_secs: env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300),
+            proxy_singleflight_advisory_locks_enabled: matches!(
+                env::var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            proxy_singleflight_lock_poll_interval_ms: env_parse(
+                "PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS",
+                200,
+            ),
+            proxy_singleflight_lock_wait_timeout_secs: env_parse(
+                "PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS",
+                65,
+            ),
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
             smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
@@ -1037,6 +1192,25 @@ impl Config {
                     }
                 }
             },
+            // On by default; only an explicit, recognized negative disables
+            // the npm computed-packument cache (#2162).
+            npm_packument_cache_enabled: parse_opt_out_flag(
+                env::var("NPM_PACKUMENT_CACHE_ENABLED").ok().as_deref(),
+            ),
+            npm_packument_cache_fresh_ttl_secs: env_parse(
+                "NPM_PACKUMENT_CACHE_FRESH_TTL_SECS",
+                crate::services::npm_packument_cache::NPM_PACKUMENT_FRESH_TTL_DEFAULT_SECS,
+            ),
+            npm_packument_cache_stale_max_secs: env_parse(
+                "NPM_PACKUMENT_CACHE_STALE_MAX_SECS",
+                crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
+            ),
+            // Treat an empty value as unset, mirroring TRIVY_ADAPTER_URL:
+            // deployment templates commonly render the var present-but-empty
+            // when the shared cache is off.
+            npm_packument_cache_redis_url: env::var("NPM_PACKUMENT_CACHE_REDIS_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
         };
 
         config.validate_jwt_secret()?;
@@ -1358,6 +1532,26 @@ mod tests {
     }
 
     #[test]
+    fn test_config_login_rate_limit_env_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("RATE_LIMIT_LOGIN_PER_WINDOW", "3");
+        env::set_var("RATE_LIMIT_LOGIN_WINDOW_SECS", "600");
+        let config = Config::from_env().expect("config should load");
+        env::remove_var("RATE_LIMIT_LOGIN_PER_WINDOW");
+        env::remove_var("RATE_LIMIT_LOGIN_WINDOW_SECS");
+        assert_eq!(
+            config.rate_limit_login_per_window, 3,
+            "RATE_LIMIT_LOGIN_PER_WINDOW must override the per-key login budget"
+        );
+        assert_eq!(
+            config.rate_limit_login_window_secs, 600,
+            "RATE_LIMIT_LOGIN_WINDOW_SECS must override the login window length"
+        );
+    }
+
+    #[test]
     fn test_config_blob_gc_disabled_by_default() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let saved_db = env::var("DATABASE_URL").ok();
@@ -1422,6 +1616,15 @@ mod tests {
         // 100+ password guesses per minute through the bcrypt verifier.
         assert_eq!(config.rate_limit_password_change_per_window, 5);
         assert_eq!(config.rate_limit_password_change_window_secs, 900);
+        // The login endpoint gets its own tight per-(username, IP) budget so a
+        // failed-login burst sheds before the bcrypt verifier runs, rather than
+        // borrowing the loose general-auth budget.
+        assert_eq!(config.rate_limit_login_per_window, 10);
+        assert_eq!(config.rate_limit_login_window_secs, 900);
+        assert!(
+            config.rate_limit_login_per_window < config.rate_limit_auth_per_window,
+            "login budget must be strictly tighter than the general-auth budget"
+        );
         assert!(
             (config.rate_limit_password_change_per_window as u64) * config.rate_limit_window_secs
                 < (config.rate_limit_api_per_window as u64)
@@ -1760,6 +1963,13 @@ mod tests {
         assert_eq!(config.rate_limit_search_per_window, 300);
         assert_eq!(config.rate_limit_window_secs, 60);
 
+        // npm computed-packument cache defaults (#2162): enabled out of the
+        // box on the in-process backend (no Redis URL).
+        assert!(config.npm_packument_cache_enabled);
+        assert_eq!(config.npm_packument_cache_fresh_ttl_secs, 300);
+        assert_eq!(config.npm_packument_cache_stale_max_secs, 86_400);
+        assert_eq!(config.npm_packument_cache_redis_url, None);
+
         // Restore
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -2007,6 +2217,113 @@ mod tests {
         // which is what test_config() relies on.
         let config = Config::default();
         assert!(config.guest_access_enabled);
+    }
+
+    #[test]
+    fn test_config_expose_detailed_health_default_false() {
+        // Info-disclosure hardening (#2226): the public /health response must
+        // hide commit SHA + db-pool internals unless explicitly opted in, so
+        // the flag defaults to false when the env var is unset.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("EXPOSE_DETAILED_HEALTH").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("EXPOSE_DETAILED_HEALTH");
+
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("EXPOSE_DETAILED_HEALTH", saved_flag);
+    }
+
+    #[test]
+    fn test_config_expose_detailed_health_explicit_values() {
+        // Only an explicit, recognized affirmative enables the detail; garbage,
+        // empty, and "false"/"0" all keep it off (safe-by-default opt-in).
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("EXPOSE_DETAILED_HEALTH").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::set_var("EXPOSE_DETAILED_HEALTH", "true");
+        assert!(Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "1");
+        assert!(Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "false");
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "0");
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "yes");
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+        env::set_var("EXPOSE_DETAILED_HEALTH", "");
+        assert!(!Config::from_env().unwrap().expose_detailed_health);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("EXPOSE_DETAILED_HEALTH", saved_flag);
+    }
+
+    #[test]
+    fn test_config_grpc_reflection_enabled_default_false() {
+        // Info-disclosure hardening (#2226): gRPC reflection is off by default
+        // so an anonymous peer cannot enumerate the service catalog in prod.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("GRPC_REFLECTION_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("GRPC_REFLECTION_ENABLED");
+
+        assert!(!Config::from_env().unwrap().grpc_reflection_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("GRPC_REFLECTION_ENABLED", saved_flag);
+    }
+
+    #[test]
+    fn test_config_grpc_reflection_enabled_explicit_values() {
+        // Only "true"/"1" enable reflection; everything else keeps it disabled.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("GRPC_REFLECTION_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::set_var("GRPC_REFLECTION_ENABLED", "true");
+        assert!(Config::from_env().unwrap().grpc_reflection_enabled);
+        env::set_var("GRPC_REFLECTION_ENABLED", "1");
+        assert!(Config::from_env().unwrap().grpc_reflection_enabled);
+        env::set_var("GRPC_REFLECTION_ENABLED", "false");
+        assert!(!Config::from_env().unwrap().grpc_reflection_enabled);
+        env::set_var("GRPC_REFLECTION_ENABLED", "0");
+        assert!(!Config::from_env().unwrap().grpc_reflection_enabled);
+        env::set_var("GRPC_REFLECTION_ENABLED", "garbage");
+        assert!(!Config::from_env().unwrap().grpc_reflection_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("GRPC_REFLECTION_ENABLED", saved_flag);
+    }
+
+    #[test]
+    fn test_config_default_new_disclosure_flags_off() {
+        // Config::default() (used by tests + non-env construction) must also
+        // keep both hardening flags off so the safe posture is the baseline.
+        let config = Config::default();
+        assert!(!config.expose_detailed_health);
+        assert!(!config.grpc_reflection_enabled);
     }
 
     #[test]
@@ -2686,6 +3003,39 @@ mod tests {
         env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
         let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
         assert_eq!(expiry, 300);
+    }
+
+    // ── proxy cross-replica single-flight config tests (#1609) ────────────
+
+    #[test]
+    fn test_proxy_singleflight_advisory_locks_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS");
+        let config = Config::from_env().expect("config should load");
+        assert!(!config.proxy_singleflight_advisory_locks_enabled);
+        assert_eq!(config.proxy_singleflight_lock_poll_interval_ms, 200);
+        assert_eq!(config.proxy_singleflight_lock_wait_timeout_secs, 65);
+    }
+
+    #[test]
+    fn test_proxy_singleflight_advisory_locks_opt_in() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED", "true");
+        env::set_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS", "125");
+        env::set_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS", "42");
+        let config = Config::from_env().expect("config should load");
+        assert!(config.proxy_singleflight_advisory_locks_enabled);
+        assert_eq!(config.proxy_singleflight_lock_poll_interval_ms, 125);
+        assert_eq!(config.proxy_singleflight_lock_wait_timeout_secs, 42);
+        env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
+        env::remove_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS");
     }
 
     #[test]

@@ -12,6 +12,9 @@
 //!     let Some(pool) = tdh::try_pool().await else { return; };
 
 #![allow(dead_code)]
+// streaming-invariant: test scaffolding exempt — buffering response bodies in
+// DB-backed handler tests is not an artifact path (#1608).
+#![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +30,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::{AppState, SharedState};
 use crate::config::Config;
+use crate::models::user::User;
 
 /// Connect to the test database. Returns `None` when `DATABASE_URL` is
 /// unset or unreachable so suites no-op gracefully.
@@ -34,7 +38,10 @@ pub async fn try_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(3)
-        .acquire_timeout(std::time::Duration::from_secs(3))
+        // llvm-cov + nextest runs DB-backed lib tests in parallel processes.
+        // Keep each per-test pool small, but give Postgres pressure a chance
+        // to clear instead of turning transient contention into PoolTimedOut.
+        .acquire_timeout(std::time::Duration::from_secs(30))
         .connect(&url)
         .await
         .ok()
@@ -93,6 +100,55 @@ pub async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
     ScanDedupSerialGuard { _conn: Some(conn) }
 }
 
+/// Advisory-lock key for [`blob_gc_serial_lock`] (#1660).
+///
+/// Distinct from [`SCAN_DEDUP_TEST_LOCK_KEY`] and from the application
+/// advisory locks, so the blob-GC test cluster serializes only against
+/// itself.
+const BLOB_GC_TEST_LOCK_KEY: i64 = 0x424C_1660; // "BL" + issue #1660
+
+/// Cross-process serialization guard for the DB-backed blob-GC tests (#1660).
+///
+/// The blob-GC service operates on the WHOLE database: `select_orphan_blobs`,
+/// `select_pending_delete_blobs`, `prune_orphan_blob_refs` and the mark/sweep
+/// loops are not scoped to a single repository. Under the coverage job's
+/// process-per-test parallelism (`cargo nextest`), one test's apply-mode pass
+/// would mark/sweep another test's freshly-seeded orphan blob, or prune a peer
+/// test's still-referenced-but-untagged `manifest_blob_refs` row, before that
+/// peer asserts on it. A Postgres *session* advisory lock — mirroring
+/// [`scan_dedup_serial_lock`] — makes every blob-GC test contend for one key,
+/// so only one runs its seed → GC → assert critical section at a time. The
+/// lock releases when the guard drops (connection closes), including on panic.
+pub struct BlobGcSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide blob-GC test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of a DB-backed blob-GC
+/// test and bind the result for the whole test body.
+pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
+    use sqlx::Connection;
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return BlobGcSerialGuard { _conn: None };
+    };
+    let mut conn = match sqlx::PgConnection::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => return BlobGcSerialGuard { _conn: None },
+    };
+    if sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(BLOB_GC_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .is_err()
+    {
+        return BlobGcSerialGuard { _conn: None };
+    }
+    BlobGcSerialGuard { _conn: Some(conn) }
+}
+
 /// Build a lazily-connecting pool that never actually opens a connection
 /// unless a query is issued. Useful for DB-free unit tests of code paths that
 /// short-circuit before touching the database.
@@ -135,6 +191,8 @@ fn cfg(storage_path: &str) -> Config {
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
         guest_access_enabled: true,
+        expose_detailed_health: false,
+        grpc_reflection_enabled: false,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         peer_instance_name: "test".into(),
@@ -146,6 +204,7 @@ fn cfg(storage_path: &str) -> Config {
         otel_service_name: "test".into(),
         gc_schedule: "0 0 * * * *".into(),
         blob_gc_enabled: false,
+        blob_gc_sweep_grace_secs: 3600,
         lifecycle_check_interval_secs: 60,
         stuck_scan_threshold_secs: 1800,
         stuck_scan_check_interval_secs: 600,
@@ -169,6 +228,8 @@ fn cfg(storage_path: &str) -> Config {
         rate_limit_presign_per_window: 30,
 
         rate_limit_login_global_per_window: 8192,
+        rate_limit_login_per_window: 10,
+        rate_limit_login_window_secs: 900,
         rate_limit_password_change_per_window: 5,
         rate_limit_password_change_window_secs: 900,
         rate_limit_window_secs: 60,
@@ -193,12 +254,19 @@ fn cfg(storage_path: &str) -> Config {
         password_min_strength: 0,
         presigned_downloads_enabled: false,
         presigned_download_expiry_secs: 300,
+        proxy_singleflight_advisory_locks_enabled: false,
+        proxy_singleflight_lock_poll_interval_ms: 200,
+        proxy_singleflight_lock_wait_timeout_secs: 65,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,
         smtp_password: None,
         smtp_from_address: "noreply@test.local".to_string(),
         smtp_tls_mode: "starttls".to_string(),
+        npm_packument_cache_enabled: true,
+        npm_packument_cache_fresh_ttl_secs: 300,
+        npm_packument_cache_stale_max_secs: 86_400,
+        npm_packument_cache_redis_url: None,
         scan_token_ttl_seconds: 300,
     }
 }
@@ -270,7 +338,8 @@ pub fn make_auth(user_id: Uuid, username: &str) -> AuthExtension {
         is_api_token: false,
         is_service_account: false,
         scopes: None,
-        allowed_repo_ids: None,
+        allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+        iat_ms: None,
     }
 }
 
@@ -359,6 +428,99 @@ pub async fn grant_repo_access(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     .expect("grant developer role");
 }
 
+/// Recursively find the largest file (in bytes) under `dir`, or 0 if none.
+fn dir_max_file_size(dir: &std::path::Path) -> u64 {
+    let mut max = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            max = max.max(dir_max_file_size(&path));
+        } else if let Ok(meta) = std::fs::metadata(&path) {
+            max = max.max(meta.len());
+        }
+    }
+    max
+}
+
+/// Poll `dir` until a file of at least `min_size` bytes appears (the committed
+/// proxy-cache blob) or a bounded timeout elapses. The streaming write-back tee
+/// commits the cache asynchronously after the response body drains, so tests
+/// that assert a WARM second request must wait for the commit deterministically
+/// instead of racing it (#2192 / #1608 Phase 4c).
+pub async fn wait_for_cached_blob(dir: &std::path::Path, min_size: u64) {
+    for _ in 0..200 {
+        if dir_max_file_size(dir) >= min_size {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// True when `dir` holds a committed proxy-cache entry of at least
+/// `min_size` bytes: a `{base}__content__` object of that size whose
+/// matching `{base}__cache_meta__.json` sidecar exists.
+pub fn committed_cache_entry_exists(dir: &std::path::Path, min_size: u64) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if committed_cache_entry_exists(&path, min_size) {
+                return true;
+            }
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(base) = name.strip_suffix("__content__") else {
+            continue;
+        };
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < min_size {
+            continue;
+        }
+        if path
+            .with_file_name(format!("{base}__cache_meta__.json"))
+            .exists()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Poll `dir` until the proxy streaming write-back has fully COMMITTED a
+/// cache entry of at least `min_size` bytes, or panic after ~60s. The budget
+/// must absorb worst-case parallel-run latency: the tee's ETag pin and
+/// sidecar write sit behind the same runtime and DB pool as every other
+/// concurrent test, and pool acquire alone is allowed 30s. A ~10s budget
+/// expired spuriously at 16 coverage test threads.
+///
+/// The tee (`ProxyService::tee_stream`) commits in three ordered steps:
+/// content object (`{base}__content__`), storage-ETag pin (a backend HEAD),
+/// then the metadata sidecar (`{base}__cache_meta__.json`) — and only the
+/// sidecar makes the next lookup a cache HIT. [`wait_for_cached_blob`]'s
+/// size-only condition becomes true at step one, so warm-cache tests gating
+/// on it race the sidecar write and observe a second upstream fetch under
+/// parallel test load. This waits for the matching sidecar as well — the
+/// same commit marker the production hit path requires.
+pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
+    for _ in 0..2400 {
+        if committed_cache_entry_exists(dir, min_size) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "proxy cache never committed (content + __cache_meta__.json sidecar) under {}",
+        dir.display()
+    );
+}
+
 pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
     let _ = sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1")
         .bind(repo_id)
@@ -385,6 +547,114 @@ pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
         .await;
 }
 
+/// Count `audit_log` rows for a given resource id + action string.
+///
+/// Shared by the auth-event audit trail tests (#386 / #1617 Phase 1) across
+/// the `profile`, `totp`, and `users` handler modules so the identical
+/// count-query is defined once rather than copy-pasted into each DB-backed
+/// test module (keeps the jscpd duplication gate green).
+pub async fn audit_count(pool: &PgPool, resource_id: Uuid, action: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
+    )
+    .bind(resource_id)
+    .bind(action)
+    .fetch_one(pool)
+    .await
+    .expect("audit_log count query")
+}
+
+/// Delete a test user plus the auth-related rows the audit/2FA test modules
+/// create for it (audit_log, refresh/pending jti, password history). Shared
+/// teardown so the identical cleanup block isn't copy-pasted across the #386
+/// audit test modules (jscpd dedup).
+pub async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
+    let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await;
+    for table in ["refresh_token_jti", "totp_pending_jti", "password_history"] {
+        let _ = sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await;
+}
+
+/// A TOTP-enrolled test user plus everything the enable/disable/verify handler
+/// tests need: the loaded [`User`] model, the raw secret bytes for generating
+/// live codes, the base32 secret, and the storage-backed [`SharedState`].
+pub struct TotpUserFixture {
+    pub user: User,
+    pub secret_bytes: Vec<u8>,
+    pub secret_b32: String,
+    pub state: SharedState,
+    pub storage_dir: PathBuf,
+}
+
+/// Seed a fresh `totp_enabled` user with the given backup-code hashes and
+/// return a [`TotpUserFixture`]. Centralizes the seed + `User` literal so the
+/// TOTP handler test modules (verify-hardening #1819/#1820/#1822 and the #386
+/// audit-trail tests) share one definition instead of copy-pasting it (jscpd
+/// dedup). `password_hash` is seeded to the sentinel `"unused"`; tests that
+/// exercise the password-verify path (e.g. `disable_totp`) overwrite it with a
+/// real bcrypt hash.
+pub async fn create_totp_user(pool: &PgPool, backup_hashes: &[String]) -> TotpUserFixture {
+    let (user_id, username) = create_user(pool).await;
+    let secret = totp_rs::Secret::generate_secret();
+    let secret_b32 = secret.to_encoded().to_string();
+    let secret_bytes = secret.to_bytes().expect("secret bytes");
+    let backup_json = serde_json::to_string(backup_hashes).expect("serialize backup");
+    sqlx::query(
+        "UPDATE users SET totp_secret = $1, totp_enabled = true, totp_backup_codes = $2 \
+         WHERE id = $3",
+    )
+    .bind(&secret_b32)
+    .bind(&backup_json)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("enable totp");
+    let storage_dir = std::env::temp_dir().join(format!("totp-fixture-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+    let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+    let user = User {
+        id: user_id,
+        username,
+        email: format!("{user_id}@test.local"),
+        password_hash: Some("unused".to_string()),
+        display_name: None,
+        auth_provider: crate::models::user::AuthProvider::Local,
+        external_id: None,
+        is_admin: false,
+        is_active: true,
+        is_service_account: false,
+        must_change_password: false,
+        totp_secret: Some(secret_b32.clone()),
+        totp_enabled: true,
+        totp_backup_codes: Some(backup_json),
+        totp_verified_at: None,
+        failed_login_attempts: 0,
+        locked_until: None,
+        last_failed_login_at: None,
+        password_changed_at: chrono::Utc::now(),
+        last_login_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    TotpUserFixture {
+        user,
+        secret_bytes,
+        secret_b32,
+        state,
+        storage_dir,
+    }
+}
+
 /// Build a `Basic <base64(user:pass)>` header value.
 pub fn basic_auth(user: &str, pass: &str) -> String {
     use base64::Engine;
@@ -407,8 +677,11 @@ pub fn make_repo_info(
         storage_path: storage_dir.to_string_lossy().into_owned(),
         storage_backend: "filesystem".to_string(),
         repo_type: repo_type.to_string(),
+        format: "generic".to_string(),
         upstream_url: upstream_url.map(|s| s.to_string()),
         promotion_only: false,
+        age_gate_enabled: false,
+        age_gate_min_age_days: 7,
     }
 }
 
@@ -629,6 +902,26 @@ pub fn build_state_with_proxy(
     Arc::new(state)
 }
 
+/// Like [`build_state_with_proxy`] but also wires an [`AgeGateService`] onto the
+/// state so handler tests can exercise the download age gate end-to-end
+/// (`serve_file` / `serve_tarball` only enforce the gate when the service is
+/// present; when it is `None` every check returns `Allow`).
+pub fn build_state_with_proxy_and_age_gate(
+    pool: PgPool,
+    storage_path: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+) -> crate::api::SharedState {
+    use crate::services::age_gate_service::AgeGateService;
+    use crate::services::event_bus::EventBus;
+    let mut state = app_state_with(cfg(storage_path), pool.clone(), storage_path);
+    state.set_proxy_service(proxy);
+    state.set_age_gate_service(Arc::new(AgeGateService::new(
+        pool,
+        Arc::new(EventBus::new(4)),
+    )));
+    Arc::new(state)
+}
+
 /// Like [`build_state_with_proxy`] but with `presigned_downloads_enabled = true`
 /// so tests can drive the presigned-redirect gate (#1555). The filesystem
 /// backend still reports `supports_redirect() == false`, so the redirect path
@@ -643,4 +936,28 @@ pub fn build_state_with_proxy_presigned(
     let mut state = app_state_with(config, pool, storage_path);
     state.set_proxy_service(proxy);
     Arc::new(state)
+}
+
+/// Repoint a fixture's Remote repository at `upstream_url` and build a
+/// [`SharedState`] wired with a real [`ProxyService`] whose proxy cache lives in
+/// a fresh temp dir (returned so the caller keeps it alive for the request).
+///
+/// Shared by the format handlers' `remote download streams upstream blob`
+/// regression tests (#1608 Phase 4): they mount a wiremock upstream, call this
+/// to wire the proxy in, then drive the handler router end-to-end to exercise
+/// the streaming pull-through branch (`proxy_fetch_streaming`).
+pub async fn rewire_remote_proxy(
+    fx: &Fixture,
+    upstream_url: &str,
+) -> (crate::api::SharedState, tempfile::TempDir) {
+    sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+        .bind(upstream_url)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("update upstream_url");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proxy = build_proxy_service_with_fs(fx.pool.clone(), dir.path().to_str().unwrap());
+    let state = build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
+    (state, dir)
 }

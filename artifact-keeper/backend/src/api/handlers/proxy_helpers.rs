@@ -16,11 +16,15 @@ use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
-use crate::services::proxy_hydration::coordinate_proxy_hydration;
+use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
 use crate::services::proxy_service::ProxyService;
 pub use crate::services::proxy_service::StreamingFetchResult;
+// Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
+// #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
+pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
 use crate::storage::StorageLocation;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -39,8 +43,11 @@ pub struct RepoInfo {
     pub storage_path: String,
     pub storage_backend: String,
     pub repo_type: String,
+    pub format: String,
     pub upstream_url: Option<String>,
     pub promotion_only: bool,
+    pub age_gate_enabled: bool,
+    pub age_gate_min_age_days: i32,
 }
 
 impl RepoInfo {
@@ -80,7 +87,8 @@ pub async fn resolve_repo_by_key(
     use sqlx::Row;
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
-         repo_type::text as repo_type, upstream_url, promotion_only \
+         repo_type::text as repo_type, upstream_url, promotion_only, \
+         age_gate_enabled, age_gate_min_age_days \
          FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
@@ -111,8 +119,11 @@ pub async fn resolve_repo_by_key(
         storage_path: repo.try_get("storage_path").unwrap_or_default(),
         storage_backend: repo.try_get("storage_backend").unwrap_or_default(),
         repo_type: repo.try_get("repo_type").unwrap_or_default(),
+        format: fmt,
         upstream_url: repo.try_get("upstream_url").ok(),
         promotion_only: repo.try_get("promotion_only").unwrap_or(false),
+        age_gate_enabled: repo.try_get("age_gate_enabled").unwrap_or(false),
+        age_gate_min_age_days: repo.try_get("age_gate_min_age_days").unwrap_or(7),
     })
 }
 
@@ -188,6 +199,47 @@ pub fn reject_direct_upload_if_promotion_only(
         Err((
             StatusCode::CONFLICT,
             "Direct uploads are disabled for this repository; publish via promotion",
+        )
+            .into_response())
+    } else {
+        Ok(())
+    }
+}
+
+/// Decide whether a direct user delete must be rejected because the target
+/// repository is flagged `promotion_only`.
+///
+/// A `promotion_only` repository is a release/production repository whose
+/// contents may only be mutated through the promotion workflow (staging ->
+/// promotion -> approval). The write gate already blocks direct uploads to
+/// such repos; a direct DELETE is the symmetric mutation and would let a
+/// principal with plain repo-write access permanently destroy a released
+/// artifact, bypassing the same controls.
+///
+/// Unlike the upload gate, delete keeps an escape hatch for release-approvers
+/// (`is_admin` == approver here: `approve_promotion` requires `is_admin`) so a
+/// genuinely bad release can still be retracted through the API — mirroring the
+/// admin exemption in `delete_blocked_by_immutability`. Non-admins are rejected.
+///
+/// The promotion service writes through its own RAW SQL path, which does not
+/// traverse the HTTP delete handlers, so promotions are unaffected. A repo with
+/// `promotion_only = false` is never affected (no-op for all callers).
+pub fn promotion_only_blocks_direct_delete(promotion_only: bool, is_admin: bool) -> bool {
+    promotion_only && !is_admin
+}
+
+/// 403 plain-text response for a rejected direct delete on a `promotion_only`
+/// repository. Provided for `Response`-returning call sites so both delete
+/// handlers share one message/shape.
+#[allow(clippy::result_large_err)]
+pub fn reject_direct_delete_if_promotion_only(
+    promotion_only: bool,
+    is_admin: bool,
+) -> Result<(), Response> {
+    if promotion_only_blocks_direct_delete(promotion_only, is_admin) {
+        Err((
+            StatusCode::FORBIDDEN,
+            "Direct deletes are disabled for this release repository; retract via an approver/promotion workflow",
         )
             .into_response())
     } else {
@@ -416,6 +468,48 @@ pub async fn proxy_fetch_with_accept(
     with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
         proxy_service
             .fetch_artifact_with_accept(&repo, path, accept)
+            .await
+    })
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch`] (#1608 Phase 4b / #2181).
+///
+/// Identical to [`proxy_fetch`] except the buffered upstream *metadata* read is
+/// capped at `max` bytes: a hostile or broken upstream that streams more than
+/// `max` yields a 502 instead of an unbounded buffer that OOMs the pod, and no
+/// truncated body is ever cached. Callers pass the per-format ceiling
+/// ([`DEFAULT_METADATA_MAX_BYTES`] for most formats, [`LARGE_METADATA_MAX_BYTES`]
+/// for formats with legitimately large metadata documents). This is the
+/// buffered-metadata path only — large binaries must use [`proxy_fetch_streaming`].
+pub async fn proxy_fetch_capped(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service.fetch_artifact_capped(&repo, path, max).await
+    })
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch_with_accept`] (#1608 Phase 4b /
+/// #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+pub async fn proxy_fetch_capped_with_accept(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    accept: Option<&str>,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_artifact_with_accept_capped(&repo, path, accept, max)
             .await
     })
     .await
@@ -866,10 +960,13 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Bytes, Response>>,
 {
-    let _ = db;
     let hydration_lease_key = format!("artifact-repair:{}", storage_key);
-    coordinate_proxy_hydration(
-        &hydration_lease_key,
+    // #1609: single-flight the missing-file repair CLUSTER-WIDE (was per-process)
+    // via the config-selected advisory-lock coordinator, so concurrent replicas
+    // do not each re-download and write back the same object.
+    HydrationCoordinator::from_env(db.clone())
+        .coordinate(
+            &hydration_lease_key,
         || async {
             match storage.get(storage_key).await {
                 Ok(content) => Ok(Some(content)),
@@ -902,8 +999,8 @@ where
             )
                 .into_response()
         },
-    )
-    .await
+        )
+        .await
 }
 
 /// Serialise concurrent reads for a locally-stored artifact whose physical
@@ -925,43 +1022,45 @@ pub(crate) async fn coordinated_retry_get(
     storage_key: &str,
     storage: &dyn crate::storage::StorageBackend,
 ) -> Result<Bytes, Response> {
-    let _ = db;
     let hydration_lease_key = format!("artifact-read-retry:{}", storage_key);
     tracing::warn!(
         artifact_id = %artifact_id,
         storage_key = %storage_key,
         "storage miss on local artifact; coordinating re-read"
     );
-    coordinate_proxy_hydration(
-        &hydration_lease_key,
-        || async {
-            match storage.get(storage_key).await {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(crate::error::AppError::NotFound(_)) => Ok(None),
-                Err(e) => Err(map_storage_err(e)),
-            }
-        },
-        || async {
-            tracing::error!(
-                artifact_id = %artifact_id,
-                storage_key = %storage_key,
-                "artifact file still absent after coordinated retry; returning 507"
-            );
-            Err((
-                StatusCode::INSUFFICIENT_STORAGE,
-                "artifact file unavailable; retry later",
-            )
-                .into_response())
-        },
-        || {
-            (
-                StatusCode::INSUFFICIENT_STORAGE,
-                "artifact file unavailable; retry later",
-            )
-                .into_response()
-        },
-    )
-    .await
+    // #1609: coordinate the re-read CLUSTER-WIDE (was per-process) via the
+    // config-selected advisory-lock coordinator.
+    HydrationCoordinator::from_env(db.clone())
+        .coordinate(
+            &hydration_lease_key,
+            || async {
+                match storage.get(storage_key).await {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(crate::error::AppError::NotFound(_)) => Ok(None),
+                    Err(e) => Err(map_storage_err(e)),
+                }
+            },
+            || async {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    storage_key = %storage_key,
+                    "artifact file still absent after coordinated retry; returning 507"
+                );
+                Err((
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "artifact file unavailable; retry later",
+                )
+                    .into_response())
+            },
+            || {
+                (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "artifact file unavailable; retry later",
+                )
+                    .into_response()
+            },
+        )
+        .await
 }
 
 /// Fetch from upstream using `fetch_path` for the URL but `cache_path` for
@@ -1017,6 +1116,60 @@ pub async fn proxy_fetch_with_cache_key_and_accept(
     .await
 }
 
+/// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key`] (#1608 Phase
+/// 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+pub async fn proxy_fetch_capped_with_cache_key(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_with_cache_path_capped(&repo, fetch_path, cache_path, max)
+                .await
+        },
+    )
+    .await
+}
+
+/// Byte-ceiling-bounded sibling of [`proxy_fetch_with_cache_key_and_accept`]
+/// (#1608 Phase 4b / #2181). See [`proxy_fetch_capped`] for the `max` semantics.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_cache_key_and_accept(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    accept: Option<&str>,
+    max: usize,
+) -> Result<(Bytes, Option<String>), Response> {
+    with_proxy_repo(
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        |repo| async move {
+            proxy_service
+                .fetch_artifact_with_cache_path_and_accept_capped(
+                    &repo, fetch_path, cache_path, accept, max,
+                )
+                .await
+        },
+    )
+    .await
+}
+
 /// Streaming sibling of [`proxy_fetch_with_cache_key`] (#895 OOM relief for
 /// format handlers whose upstream download URL differs from the canonical
 /// artifact path). Fetches `fetch_path` from the upstream but keys the proxy
@@ -1030,6 +1183,33 @@ pub async fn proxy_fetch_streaming_with_cache_key(
     fetch_path: &str,
     cache_path: &str,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
+    proxy_fetch_streaming_with_cache_key_verified(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        fetch_path,
+        cache_path,
+        None,
+    )
+    .await
+}
+
+/// Digest-gated sibling of [`proxy_fetch_streaming_with_cache_key`] (#2274).
+/// Identical, except the proxy-cache commit is gated on `expected_checksum`
+/// (bare lowercase SHA-256 hex): a streamed body whose SHA-256 does not match
+/// is served to the client but NOT persisted, so a digest-addressed upstream
+/// answering with wrong bytes cannot poison the cache. The OCI virtual-repo
+/// blob fallback passes the requested blob digest here.
+pub async fn proxy_fetch_streaming_with_cache_key_verified(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    expected_checksum: Option<String>,
+) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     with_proxy_repo(
         repo_id,
         repo_key,
@@ -1037,7 +1217,12 @@ pub async fn proxy_fetch_streaming_with_cache_key(
         fetch_path,
         |repo| async move {
             proxy_service
-                .fetch_artifact_streaming_with_cache_path(&repo, fetch_path, cache_path)
+                .fetch_artifact_streaming_with_cache_path_gated(
+                    &repo,
+                    fetch_path,
+                    cache_path,
+                    expected_checksum,
+                )
                 .await
         },
     )
@@ -2017,6 +2202,36 @@ where
     Ok(results)
 }
 
+/// Adapt a virtual-repo member [`Repository`] (as returned by
+/// [`fetch_virtual_members`]) into the lightweight [`RepoInfo`] the per-member
+/// proxy/age-gate helpers accept.
+///
+/// This exists so the format handlers can reuse the SAME per-member age-gate
+/// helpers on their virtual-resolution loops (#2066) that the direct-Remote
+/// branches already use, without teaching those helpers about the full model
+/// type. `fetch_virtual_members` already SELECTs `age_gate_enabled` /
+/// `age_gate_min_age_days`, so the gate columns survive the conversion.
+///
+/// The `format` string is produced lowercase to match what
+/// [`age_gate_params`] parses (it lower-cases and matches the `npm`/`pypi`
+/// families); the three underscore-renamed enum variants (`wasm_oci`,
+/// `helm_oci`, `conda_native`) are not age-gate formats, so the debug-derived
+/// lowercase is exact for every format the gate acts on.
+pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoInfo {
+    RepoInfo {
+        id: m.id,
+        key: m.key.clone(),
+        storage_path: m.storage_path.clone(),
+        storage_backend: m.storage_backend.clone(),
+        repo_type: m.repo_type.as_str().to_string(),
+        format: format!("{:?}", m.format).to_lowercase(),
+        upstream_url: m.upstream_url.clone(),
+        promotion_only: m.promotion_only,
+        age_gate_enabled: m.age_gate_enabled,
+        age_gate_min_age_days: m.age_gate_min_age_days,
+    }
+}
+
 /// Fetch virtual repository member repos sorted by priority.
 pub async fn fetch_virtual_members(
     db: &PgPool,
@@ -2034,6 +2249,7 @@ pub async fn fetch_virtual_members(
             r.replication_priority as "replication_priority: ReplicationPriority",
             r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
             r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
+            r.age_gate_enabled, r.age_gate_min_age_days,
             r.created_at, r.updated_at
         FROM repositories r
         INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
@@ -2766,17 +2982,27 @@ fn shadowing_guard_db_err(virtual_repo_id: Uuid, format: &str, e: sqlx::Error) -
     (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
 }
 
-/// PEP 708 dependency-confusion decision for a PyPI virtual repository (#1600).
+/// PEP 708 dependency-confusion decision for a PyPI virtual repository (#1600,
+/// made priority-aware by #2311).
 ///
-/// Returns `true` when the virtual must ISOLATE this project name to its local
-/// owner: a local/staging member owns the PEP 503 normalized `normalized_name`
-/// AND no `pypi_project_tracks` declaration exists on an owning member for it.
-/// When `true`, the caller MUST serve only the owning member's distributions in
-/// both the simple index and the file download (no cross-member union, no
-/// proxy fallthrough), which is PEP 708's "refuse to implicitly assume merging
-/// is safe" default and keeps the index and download consistent.
+/// Returns `Some(min_priority)` when a local/staging member owns the PEP 503
+/// normalized `normalized_name` AND no `pypi_project_tracks` declaration
+/// exists on an owning member for it. `min_priority` is the smallest
+/// `virtual_repo_members.priority` value among the owning local members
+/// (lower value = higher priority, matching the `ORDER BY vrm.priority`
+/// member ordering).
 ///
-/// Returns `false` when the name is not locally owned (proxy normally) or when
+/// The caller must then decide isolation PER REMOTE MEMBER: a Remote member
+/// `R` is suppressed only when the owning local member outranks it
+/// (`min_priority < R.priority`). A Remote member configured at equal or
+/// higher priority than every owning local (`R.priority <= min_priority`)
+/// still surfaces — the operator explicitly ranked the upstream above the
+/// local owner, so hiding it would invert their priority intent (#2311).
+/// Suppression when the local owner outranks the remote is PEP 708's "refuse
+/// to implicitly assume merging is safe" default and must be applied
+/// consistently in both the simple index and the file download.
+///
+/// Returns `None` when the name is not locally owned (proxy normally) or when
 /// an operator `tracks` declaration permits merging the same project across
 /// members (the #1267 union / #1584 version fallthrough then apply).
 ///
@@ -2788,7 +3014,7 @@ pub async fn pypi_virtual_isolates_name(
     db: &PgPool,
     virtual_repo_id: Uuid,
     normalized_name: &str,
-) -> Result<bool, Response> {
+) -> Result<Option<i32>, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let local_ids: Vec<Uuid> = members
         .iter()
@@ -2796,28 +3022,34 @@ pub async fn pypi_virtual_isolates_name(
         .map(|m| m.id)
         .collect();
     if local_ids.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
-    // Which local/staging members actually own (hold artifacts for) this name?
-    // Uses the same PEP 503 normalization as simple_project so isolation agrees
-    // with what the index lists.
-    let owning_ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT repository_id FROM artifacts \
-         WHERE repository_id = ANY($1) \
-           AND is_deleted = false \
-           AND LOWER(REPLACE(REPLACE(REPLACE(name, '_', '-'), '.', '-'), '--', '-')) = $2",
+    // Which local/staging members actually own (hold artifacts for) this name,
+    // and at what member priority? Uses the same PEP 503 normalization as
+    // simple_project so isolation agrees with what the index lists.
+    let owning: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT DISTINCT a.repository_id, vrm.priority \
+         FROM artifacts a \
+         INNER JOIN virtual_repo_members vrm \
+                 ON vrm.member_repo_id = a.repository_id \
+                AND vrm.virtual_repo_id = $3 \
+         WHERE a.repository_id = ANY($1) \
+           AND a.is_deleted = false \
+           AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2",
     )
     .bind(&local_ids)
     .bind(normalized_name)
+    .bind(virtual_repo_id)
     .fetch_all(db)
     .await
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
-    if owning_ids.is_empty() {
+    if owning.is_empty() {
         // Name is not owned by any local member: no confusion risk, proxy normally.
-        return Ok(false);
+        return Ok(None);
     }
+    let owning_ids: Vec<Uuid> = owning.iter().map(|(id, _)| *id).collect();
 
     // A `tracks` declaration on any owning member means the operator has
     // asserted the local project is the same project as upstream, so merging is
@@ -2832,7 +3064,31 @@ pub async fn pypi_virtual_isolates_name(
     .await
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
-    Ok(tracked == 0)
+    if tracked > 0 {
+        return Ok(None);
+    }
+    Ok(owning.iter().map(|(_, priority)| *priority).min())
+}
+
+/// Fetches the `virtual_repo_members.priority` value for every member of
+/// `virtual_repo_id`, keyed by member repository id (lower value = higher
+/// priority). Used by the PyPI virtual paths to make the PEP 708 isolation
+/// decision per remote member relative to the owning local member's priority
+/// (#2311). Fails closed (Err) on DB error, matching
+/// [`pypi_virtual_isolates_name`].
+#[allow(clippy::result_large_err)]
+pub async fn fetch_virtual_member_priorities(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<std::collections::HashMap<Uuid, i32>, Response> {
+    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT member_repo_id, priority FROM virtual_repo_members WHERE virtual_repo_id = $1",
+    )
+    .bind(virtual_repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(map_db_err)?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Returns true if any non-Remote member of `virtual_repo_id` owns an
@@ -3278,6 +3534,7 @@ pub async fn find_local_by_filename_suffix(
 /// `json_field_names` lists the form-field names to accept for the JSON
 /// payload (Ansible accepts both `collection` and `metadata`; Puppet uses
 /// `module`). The first matching field wins. Unknown fields are ignored.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (assignment expr); the exempt call is marked inline below (#1608)
 pub async fn parse_multipart_file_with_json(
     mut multipart: axum::extract::Multipart,
     json_field_names: &[&str],
@@ -3293,6 +3550,7 @@ pub async fn parse_multipart_file_with_json(
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
             tarball = Some(field.bytes().await.map_err(|e| {
+                // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
                 (
                     StatusCode::BAD_REQUEST,
                     format!("Failed to read file: {}", e),
@@ -3300,6 +3558,8 @@ pub async fn parse_multipart_file_with_json(
                     .into_response()
             })?);
         } else if json_field_names.iter().any(|n| *n == field_name) {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: upload handler buffers one bounded multipart field (capped by DefaultBodyLimit); tracked for incremental-hash put_stream conversion in a later #1608 phase
             let data = field.bytes().await.map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -3348,6 +3608,298 @@ pub async fn put_artifact_bytes(
         .await
         .map_err(|e| internal_error("Storage", e))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming artifact uploads (#1608 Phase 2)
+// ---------------------------------------------------------------------------
+//
+// Light-format upload handlers (chef, ansible, pub, ...) historically buffered
+// the entire artifact body in memory via `Field::bytes()` before handing it to
+// `put_artifact_bytes` -> `storage.put(Bytes)`. `stage_upload_field` +
+// `put_artifact_stream` replace that with a memory-bounded path: the multipart
+// field is spooled chunk-by-chunk to a scratch temp file (peak RAM =
+// STREAM_STAGE_CHUNK), then streamed into the repo's `StorageBackend` through
+// its native `put_stream` primitive (S3 multipart / GCS resumable / Azure
+// block-blob / filesystem temp-and-rename), which computes the SHA-256
+// incrementally as it copies. Mirrors the incus monolithic-upload pattern
+// (`stream_body_to_file` + `open_temp_file_as_stream`). `put_artifact_bytes`
+// is retained for the small metadata writers that still need the bytes in hand.
+//
+// This pair is the shared entry point later #1608 phases (helm/pypi/nuget)
+// build on: `stage_upload_field` decouples the (borrowed, non-`'static`)
+// multipart field lifetime from the `'static` stream `put_stream` requires,
+// and lets a handler parse archive metadata off the staged file before the
+// storage key is known.
+
+/// Chunk size for reading a staged scratch file back into `put_stream`.
+const STREAM_STAGE_CHUNK: usize = 256 * 1024;
+
+/// A multipart upload body spooled to a bounded scratch file on local disk.
+///
+/// The scratch file is removed on drop (RAII), so every early return — a
+/// mid-receive stream error, a `?`-propagated failure, or a storage failure in
+/// [`put_artifact_stream`] — unlinks it instead of leaking an orphan (#1573).
+/// The file is staged under the shared upload staging root, so the orphan
+/// sweep reaps it as a backstop if the process dies mid-request.
+pub struct StagedUpload {
+    path: PathBuf,
+    size_bytes: i64,
+}
+
+impl StagedUpload {
+    /// On-disk path of the staged scratch file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Number of bytes spooled to disk (== the eventual artifact size).
+    pub fn size_bytes(&self) -> i64 {
+        self.size_bytes
+    }
+
+    /// Whether the spooled body is empty (no bytes received).
+    pub fn is_empty(&self) -> bool {
+        self.size_bytes == 0
+    }
+}
+
+impl Drop for StagedUpload {
+    fn drop(&mut self) {
+        // Synchronous best-effort unlink: Drop can't await and the file is
+        // local scratch, so a blocking unlink is negligible.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Spool one multipart field to a bounded scratch temp file, aborting with
+/// `413 Payload Too Large` once `max_upload_size_bytes` is exceeded (a value of
+/// 0 disables the limit, matching the `DefaultBodyLimit` config semantics).
+///
+/// Never buffers the whole field in memory: chunks are written straight to
+/// disk. The returned [`StagedUpload`] owns the scratch file and removes it on
+/// drop. Feed it to [`put_artifact_stream`] once the storage key is known.
+#[allow(clippy::result_large_err)]
+pub async fn stage_upload_field(
+    state: &crate::api::SharedState,
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<StagedUpload, Response> {
+    use tokio::io::AsyncWriteExt;
+
+    let path =
+        crate::api::handlers::incus::temp_upload_path(&state.config.storage_path, &Uuid::new_v4());
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| internal_error("Staging directory", e))?;
+    }
+
+    // Arm the RAII cleanup before the first write so any early return below
+    // unlinks the partial file rather than leaking it.
+    let mut staged = StagedUpload {
+        path: path.clone(),
+        size_bytes: 0,
+    };
+
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| internal_error("Staging file", e))?;
+
+    let max = state.config.max_upload_size_bytes;
+    let mut written: u64 = 0;
+    while let Some(chunk) = field.chunk().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read upload body: {e}"),
+        )
+            .into_response()
+    })? {
+        written = written.saturating_add(chunk.len() as u64);
+        if max != 0 && written > max {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Upload exceeds the maximum allowed size of {max} bytes"),
+            )
+                .into_response());
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| internal_error("Staging write", e))?;
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| internal_error("Staging flush", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| internal_error("Staging sync", e))?;
+
+    staged.size_bytes = written as i64;
+    Ok(staged)
+}
+
+/// Stream a [`StagedUpload`] scratch file into the repository's configured
+/// `StorageBackend` via its native `put_stream`, computing the SHA-256
+/// checksum incrementally as it copies (no separate hashing pass over a
+/// buffered body). Returns the incremental checksum + byte count for building
+/// the artifact row.
+///
+/// Consumes the `StagedUpload`: the scratch file is removed when this returns,
+/// on success or on error.
+#[allow(clippy::result_large_err)]
+pub async fn put_artifact_stream(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    storage_key: &str,
+    staged: StagedUpload,
+) -> Result<crate::storage::PutStreamResult, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+
+    let stream = open_staged_stream(staged.path()).await?;
+    let result = storage
+        .put_stream(storage_key, stream)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+    Ok(result)
+    // `staged` drops here -> scratch file removed.
+}
+
+/// Open a staged scratch file as a `'static` byte stream ready to feed
+/// `StorageBackend::put_stream`. A buffered `ReaderStream` keeps the
+/// disk->backend copy bounded to `STREAM_STAGE_CHUNK`.
+#[allow(clippy::result_large_err)]
+async fn open_staged_stream(
+    path: &Path,
+) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, Response> {
+    use tokio::io::BufReader;
+    use tokio_util::io::ReaderStream;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| internal_error("Staging reopen", e))?;
+    let reader = BufReader::with_capacity(STREAM_STAGE_CHUNK, file);
+    let stream = ReaderStream::with_capacity(reader, STREAM_STAGE_CHUNK)
+        .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("staged read: {e}"))));
+    Ok(Box::pin(stream))
+}
+
+/// Spool an arbitrary byte stream to a bounded scratch temp file while computing
+/// SHA-256, SHA-1, and MD5 incrementally. Aborts with `413 Payload Too Large`
+/// once `max_upload_size_bytes` is exceeded (a value of 0 disables the limit,
+/// matching `DefaultBodyLimit`). Never buffers the whole body in memory.
+///
+/// This is the shared content-addressed staging primitive: pypi feeds it an axum
+/// multipart [`Field`](axum::extract::multipart::Field) (via
+/// [`stage_upload_field_content_addressed`]); nuget feeds it a `multer` field
+/// (streaming multipart) or the raw request-body data stream. Hand the returned
+/// [`StagedUpload`] to [`open_staged_upload_stream`] and the
+/// [`ContentDigests`](crate::services::artifact_service::ContentDigests) to
+/// [`ArtifactService::upload_stream_with_sync_options`](crate::services::artifact_service::ArtifactService::upload_stream_with_sync_options).
+#[allow(clippy::result_large_err)]
+pub async fn stage_stream_content_addressed<S, E>(
+    state: &crate::api::SharedState,
+    stream: S,
+) -> Result<
+    (
+        StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let path =
+        crate::api::handlers::incus::temp_upload_path(&state.config.storage_path, &Uuid::new_v4());
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| internal_error("Staging directory", e))?;
+    }
+
+    // Arm the RAII cleanup before the first write so any early return below
+    // unlinks the partial file rather than leaking it.
+    let mut staged = StagedUpload {
+        path: path.clone(),
+        size_bytes: 0,
+    };
+
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| internal_error("Staging file", e))?;
+
+    let max = state.config.max_upload_size_bytes;
+    let mut hasher = crate::services::artifact_service::MultiHasher::new();
+    let mut written: u64 = 0;
+
+    tokio::pin!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read upload body: {e}"),
+            )
+                .into_response()
+        })?;
+        written = written.saturating_add(chunk.len() as u64);
+        if max != 0 && written > max {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Upload exceeds the maximum allowed size of {max} bytes"),
+            )
+                .into_response());
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| internal_error("Staging write", e))?;
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| internal_error("Staging flush", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| internal_error("Staging sync", e))?;
+
+    staged.size_bytes = written as i64;
+    Ok((staged, hasher.finalize()))
+}
+
+/// Content-addressed variant of [`stage_upload_field`]: spool one axum multipart
+/// field to scratch while computing SHA-256 / SHA-1 / MD5. Thin wrapper over
+/// [`stage_stream_content_addressed`] (axum's `Field` is itself a byte stream).
+#[allow(clippy::result_large_err)]
+pub async fn stage_upload_field_content_addressed(
+    state: &crate::api::SharedState,
+    field: axum::extract::multipart::Field<'_>,
+) -> Result<
+    (
+        StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+> {
+    stage_stream_content_addressed(state, field).await
+}
+
+/// Re-open a [`StagedUpload`] scratch file as a `'static` byte stream ready to
+/// hand to
+/// [`ArtifactService::upload_stream_with_sync_options`](crate::services::artifact_service::ArtifactService::upload_stream_with_sync_options).
+///
+/// The caller must keep the [`StagedUpload`] alive until the consumer finishes:
+/// the returned stream holds an independent open file handle, and the scratch
+/// file is only unlinked when the `StagedUpload` drops.
+#[allow(clippy::result_large_err)]
+pub async fn open_staged_upload_stream(
+    staged: &StagedUpload,
+) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, Response> {
+    open_staged_stream(staged.path()).await
 }
 
 /// Borrowed handle to the columns required to insert a new artifact row.
@@ -3526,12 +4078,85 @@ pub(crate) fn build_download_response(
     builder.body(axum::body::Body::from(content)).unwrap()
 }
 
+/// Build age-gate params from a resolved repository descriptor.
+pub fn age_gate_params(info: &RepoInfo) -> crate::services::age_gate_service::AgeGateRepoParams {
+    use crate::models::repository::{RepositoryFormat, RepositoryType};
+    use crate::services::age_gate_service::AgeGateRepoParams;
+
+    let repo_type = match info.repo_type.as_str() {
+        "remote" => RepositoryType::Remote,
+        "virtual" => RepositoryType::Virtual,
+        "staging" => RepositoryType::Staging,
+        _ => RepositoryType::Local,
+    };
+    let format = match info.format.to_lowercase().as_str() {
+        "npm" => RepositoryFormat::Npm,
+        "pypi" => RepositoryFormat::Pypi,
+        other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
+            RepositoryFormat::Npm
+        }
+        other if other.starts_with("pypi") || other == "poetry" => RepositoryFormat::Pypi,
+        _ => RepositoryFormat::Generic,
+    };
+
+    AgeGateRepoParams::from_parts(
+        info.id,
+        info.key.clone(),
+        repo_type,
+        format,
+        info.age_gate_enabled,
+        info.age_gate_min_age_days,
+    )
+}
+
+/// HTTP 451 JSON body when a package version is blocked by the age gate with no LKG.
+pub fn age_gate_blocked_body(
+    review_id: uuid::Uuid,
+    package: &str,
+    version: &str,
+    min_age_days: i32,
+    requested_age_days: Option<i64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": "age_gate_blocked",
+        "review_id": review_id,
+        "package": package,
+        "version": version,
+        "min_age_days": min_age_days,
+        "requested_age_days": requested_age_days,
+        "message": "Package version is younger than the configured age threshold and is pending review"
+    })
+}
+
+/// HTTP 451 response when a package version is blocked by the age gate with no LKG.
+pub fn age_gate_blocked_response(
+    review_id: uuid::Uuid,
+    package: &str,
+    version: &str,
+    min_age_days: i32,
+    requested_age_days: Option<i64>,
+) -> Response {
+    let body = age_gate_blocked_body(
+        review_id,
+        package,
+        version,
+        min_age_days,
+        requested_age_days,
+    );
+    (
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Build a minimal `Repository` model for proxy operations.
 ///
 /// Visible to other handler modules so they can construct a stand-in
 /// `Repository` value for `ProxyService` calls that need more than just
 /// the fields carried on the thin `RepoInfo` struct, e.g.
-/// `ProxyService::fetch_dists_detecting_change` in the Debian handler.
+/// `ProxyService::fetch_dists_with_revalidation` in the Debian handler.
 pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repository {
     Repository {
         id,
@@ -3553,11 +4178,15 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
         curation_default_action: "allow".to_string(),
         curation_sync_interval_secs: 3600,
         curation_auto_fetch: false,
+        age_gate_enabled: false,
+        age_gate_min_age_days: 7,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4246,8 +4875,11 @@ mod tests {
             storage_path: "/data/gate-test".to_string(),
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
+            format: "generic".to_string(),
             upstream_url: None,
             promotion_only,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         }
     }
 
@@ -4277,6 +4909,46 @@ mod tests {
         let repo = promo_repo_info(false);
         assert!(repo.reject_if_promotion_only(false).is_ok());
         assert!(repo.reject_if_promotion_only(true).is_ok());
+    }
+
+    // ── promotion_only direct-delete gate ───────────────────────────
+
+    #[test]
+    fn test_promotion_only_blocks_non_admin_direct_delete() {
+        // Non-admin (non-approver) + promotion_only repo => delete blocked.
+        assert!(promotion_only_blocks_direct_delete(true, false));
+    }
+
+    #[test]
+    fn test_promotion_only_admin_retains_delete_escape_hatch() {
+        // Admins are the release-approvers and keep the retraction escape hatch,
+        // unlike the upload gate: (promotion_only=true, is_admin=true) => allowed.
+        assert!(!promotion_only_blocks_direct_delete(true, true));
+    }
+
+    #[test]
+    fn test_promotion_only_delete_normal_repo_not_blocked() {
+        // promotion_only = false => never blocked, for any caller (no regression
+        // for normal repos).
+        assert!(!promotion_only_blocks_direct_delete(false, false));
+        assert!(!promotion_only_blocks_direct_delete(false, true));
+    }
+
+    #[test]
+    fn test_reject_direct_delete_if_promotion_only_returns_403() {
+        // Non-admin delete on a promotion_only repo is rejected 403 FORBIDDEN.
+        let err = reject_direct_delete_if_promotion_only(true, false)
+            .expect_err("non-admin direct delete on promotion_only repo must be rejected");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_reject_direct_delete_if_promotion_only_admin_and_normal_ok() {
+        // Admin delete on a promotion_only repo passes (retraction hatch); a
+        // normal repo is a no-op for any caller.
+        assert!(reject_direct_delete_if_promotion_only(true, true).is_ok());
+        assert!(reject_direct_delete_if_promotion_only(false, false).is_ok());
+        assert!(reject_direct_delete_if_promotion_only(false, true).is_ok());
     }
 
     // ── LocalLookup dispatch tests ──────────────────────────────────
@@ -4791,7 +5463,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         let loc = info.storage_location();
         assert_eq!(loc.backend, "filesystem");
@@ -4988,6 +5663,13 @@ mod tests {
                 expires_in,
                 source: crate::storage::PresignedUrlSource::S3,
             }))
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 
@@ -5192,6 +5874,13 @@ mod tests {
         async fn delete(&self, _key: &str) -> crate::error::Result<()> {
             *self.content.lock().await = None;
             Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
         }
     }
 
@@ -5994,7 +6683,7 @@ mod tests {
             let url = std::env::var("DATABASE_URL").ok()?;
             sqlx::postgres::PgPoolOptions::new()
                 .max_connections(3)
-                .acquire_timeout(std::time::Duration::from_secs(3))
+                .acquire_timeout(std::time::Duration::from_secs(30))
                 .connect(&url)
                 .await
                 .ok()
@@ -6031,6 +6720,8 @@ mod tests {
                 scan_workspace_path: "/tmp/scan".into(),
                 demo_mode: false,
                 guest_access_enabled: true,
+                expose_detailed_health: false,
+                grpc_reflection_enabled: false,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
                 peer_instance_name: "test".into(),
@@ -6042,6 +6733,7 @@ mod tests {
                 otel_service_name: "test".into(),
                 gc_schedule: "0 0 * * * *".into(),
                 blob_gc_enabled: false,
+                blob_gc_sweep_grace_secs: 3600,
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,
                 stuck_scan_check_interval_secs: 600,
@@ -6065,6 +6757,8 @@ mod tests {
                 rate_limit_presign_per_window: 30,
 
                 rate_limit_login_global_per_window: 8192,
+                rate_limit_login_per_window: 10,
+                rate_limit_login_window_secs: 900,
                 rate_limit_password_change_per_window: 5,
                 rate_limit_password_change_window_secs: 900,
                 rate_limit_window_secs: 60,
@@ -6089,12 +6783,19 @@ mod tests {
                 password_min_strength: 0,
                 presigned_downloads_enabled: false,
                 presigned_download_expiry_secs: 300,
+                proxy_singleflight_advisory_locks_enabled: false,
+                proxy_singleflight_lock_poll_interval_ms: 200,
+                proxy_singleflight_lock_wait_timeout_secs: 65,
                 smtp_host: None,
                 smtp_port: 587,
                 smtp_username: None,
                 smtp_password: None,
                 smtp_from_address: "noreply@test.local".to_string(),
                 smtp_tls_mode: "starttls".to_string(),
+                npm_packument_cache_enabled: true,
+                npm_packument_cache_fresh_ttl_secs: 300,
+                npm_packument_cache_stale_max_secs: 86_400,
+                npm_packument_cache_redis_url: None,
                 scan_token_ttl_seconds: 300,
             }
         }
@@ -6551,7 +7252,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let bytes = Bytes::from_static(b"package-data");
@@ -6595,6 +7299,111 @@ mod tests {
         assert!(cd.to_str().unwrap().contains("foo.tar.gz"));
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── stage_upload_field + put_artifact_stream (#1608 Phase 2) ─────────
+
+    /// Encode a single-field (`file`) multipart/form-data body.
+    fn one_field_multipart(boundary: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"f.tar.gz\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(payload);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// Extract the first multipart field from an in-memory body.
+    async fn first_field(body: Vec<u8>) -> axum::extract::Multipart {
+        use axum::extract::FromRequest;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "multipart/form-data; boundary=BND")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stage_and_put_artifact_stream_roundtrip() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) =
+            db_helpers::create_repo(&pool, "local", "chef").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let repo = RepoInfo {
+            id: repo_id,
+            key: repo_key,
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            format: "chef".to_string(),
+            upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+        };
+
+        let payload = b"streamed-artifact-body".repeat(64);
+        let mut mp = first_field(one_field_multipart("BND", &payload)).await;
+        let field = mp.next_field().await.unwrap().unwrap();
+
+        let staged = stage_upload_field(&state, field).await.expect("stage");
+        assert!(!staged.is_empty());
+        assert_eq!(staged.size_bytes(), payload.len() as i64);
+        // Field bytes really landed on disk (spooled, not buffered).
+        assert_eq!(tokio::fs::read(staged.path()).await.unwrap(), payload);
+        let scratch = staged.path().to_path_buf();
+
+        let put = put_artifact_stream(&state, &repo, "chef/x/1.0/x.tar.gz", staged)
+            .await
+            .expect("put_stream");
+
+        // Checksum computed incrementally by put_stream matches a direct hash.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        assert_eq!(put.checksum_sha256, format!("{:x}", hasher.finalize()));
+        assert_eq!(put.bytes_written, payload.len() as u64);
+
+        // Scratch file removed once the StagedUpload dropped.
+        assert!(!scratch.exists());
+
+        // Bytes are retrievable from the backend under the storage key.
+        let storage = state.storage_for_repo(&repo.storage_location()).unwrap();
+        let got = storage.get("chef/x/1.0/x.tar.gz").await.unwrap();
+        assert_eq!(got.as_ref(), payload.as_slice());
+
+        db_helpers::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_upload_field_reports_empty_body() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, storage_dir) =
+            db_helpers::create_repo(&pool, "local", "pub").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let mut mp = first_field(one_field_multipart("BND", b"")).await;
+        let field = mp.next_field().await.unwrap().unwrap();
+
+        let staged = stage_upload_field(&state, field).await.expect("stage");
+        assert!(staged.is_empty());
+        assert_eq!(staged.size_bytes(), 0);
+        // Even an empty spool leaves a scratch file that is cleaned up on drop.
+        let scratch = staged.path().to_path_buf();
+        drop(staged);
+        assert!(!scratch.exists());
+
+        db_helpers::cleanup(&pool, repo_id, Uuid::nil()).await;
     }
 
     // ── record_artifact_metadata ────────────────────────────────────────
@@ -6701,7 +7510,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let opts = DownloadResponseOpts {
@@ -6736,7 +7548,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "remote".to_string(),
             upstream_url: Some("https://upstream.example.test".to_string()),
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         // state.proxy_service is None: should short-circuit to Ok(None).
@@ -6772,7 +7587,10 @@ mod tests {
             // Force the Remote branch but with upstream_url = None.
             repo_type: "remote".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
 
         let opts = DownloadResponseOpts {
@@ -6809,7 +7627,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "local".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         let bytes = Bytes::from_static(b"abc123");
         put_artifact_bytes(&state, &repo, "pypi/foo/1.0/foo.whl", bytes.clone())
@@ -7957,6 +8778,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 0,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -7971,7 +8794,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -8107,5 +8931,36 @@ mod tests {
             .execute(&pool)
             .await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[test]
+    fn age_gate_params_maps_remote_npm_repo() {
+        let info = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "npm-remote".to_string(),
+            storage_path: "/data".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "remote".to_string(),
+            format: "npm".to_string(),
+            upstream_url: Some("https://registry.npmjs.org".to_string()),
+            promotion_only: false,
+            age_gate_enabled: true,
+            age_gate_min_age_days: 14,
+        };
+        let params = age_gate_params(&info);
+        assert!(params.age_gate_enabled);
+        assert_eq!(params.age_gate_min_age_days, 14);
+        assert_eq!(params.key, "npm-remote");
+    }
+
+    #[test]
+    fn age_gate_blocked_body_fields() {
+        let id = uuid::Uuid::new_v4();
+        let body = age_gate_blocked_body(id, "lodash", "4.0.0", 7, Some(2));
+        assert_eq!(body["error"], "age_gate_blocked");
+        assert_eq!(body["review_id"], id.to_string());
+        assert_eq!(body["package"], "lodash");
+        assert_eq!(body["min_age_days"], 7);
+        assert_eq!(body["requested_age_days"], 2);
     }
 }

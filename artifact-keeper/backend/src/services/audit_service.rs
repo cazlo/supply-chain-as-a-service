@@ -73,6 +73,19 @@ pub enum AuditAction {
 
     // Scanning / janitors
     ScanReaped,
+
+    // Auth-event audit completeness (#386 / #1617 Phase 1). Appended at the
+    // END of the enum so the additive change has no effect on the ordering of
+    // existing variants and minimizes merge-conflict surface with other
+    // in-flight audit-taxonomy work.
+    TotpEnabled,
+    TotpDisabled,
+    SessionsInvalidated,
+
+    // Age gate
+    AgeGateQueued,
+    AgeGateApproved,
+    AgeGateRejected,
 }
 
 impl AuditAction {
@@ -118,6 +131,12 @@ impl AuditAction {
             AuditAction::SbomGenerated => "SBOM_GENERATED",
             AuditAction::SbomRead => "SBOM_READ",
             AuditAction::ScanReaped => "SCAN_REAPED",
+            AuditAction::TotpEnabled => "TOTP_ENABLED",
+            AuditAction::TotpDisabled => "TOTP_DISABLED",
+            AuditAction::SessionsInvalidated => "SESSIONS_INVALIDATED",
+            AuditAction::AgeGateQueued => "AGE_GATE_QUEUED",
+            AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
+            AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
         }
     }
 }
@@ -462,6 +481,112 @@ impl AuditService {
 
         Ok(result.rows_affected())
     }
+}
+
+/// Fire-and-forget audit write for auth-event and token-lifecycle emitters
+/// (#1617 Phase 1: auth-event audit completeness).
+///
+/// A write failure is swallowed — logged at `warn`, never propagated — so an
+/// audit-table outage can never fail the originating request. Logins and token
+/// mint/revoke MUST succeed even when audit is unavailable; the audit trail is
+/// a side effect, never a gate. Mirrors the `audit_auth` fire-and-forget
+/// contract already used on the local-password login path.
+pub async fn audit_fire_and_forget(db: PgPool, entry: AuditEntry) {
+    if let Err(e) = AuditService::new(db).log(entry).await {
+        tracing::warn!(error = %e, "audit log write failed; ignored (fire-and-forget)");
+    }
+}
+
+/// Build the `details` JSON for a federated (SSO) login audit event.
+///
+/// `provider` is a stable label (`"oidc"` | `"saml"` | `"ldap"`) recorded so
+/// SOC 2 / EU CRA auditors can attribute enterprise-auth events per provider.
+/// Any object keys in `extra` (e.g. the attempted username on a failure) are
+/// merged in; a non-object `extra` is ignored. Pure so it is unit-testable
+/// without a database.
+pub fn federated_login_details(provider: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "provider": provider,
+        "auth_method": "federated",
+    });
+    if let (serde_json::Value::Object(base), serde_json::Value::Object(more)) =
+        (&mut details, extra)
+    {
+        base.extend(more);
+    }
+    details
+}
+
+/// Build an audit entry for an API-token lifecycle event (mint or revoke)
+/// (#1617 Phase 1).
+///
+/// Records the acting principal (`actor`), the token id as the resource, and
+/// the token id/name/surface in `details`. The token SECRET is NEVER included.
+/// `surface` labels the endpoint family (`"user"`, `"profile"`, `"repo"`,
+/// `"service_account"`) for SIEM attribution. Pure builder — unit-testable.
+pub fn api_token_audit_entry(
+    action: AuditAction,
+    actor: Uuid,
+    token_id: Uuid,
+    token_name: Option<&str>,
+    surface: &str,
+) -> AuditEntry {
+    AuditEntry::new(action, ResourceType::ApiToken)
+        .user(actor)
+        .resource(token_id)
+        .details(serde_json::json!({
+            "token_id": token_id.to_string(),
+            "token_name": token_name,
+            "surface": surface,
+        }))
+}
+
+/// Build an audit entry for a self-service or admin password change (#386 /
+/// #1617 Phase 1).
+///
+/// `subject` is the user whose password changed (recorded as `user_id` and the
+/// resource). `actor` is the principal that performed the change; it equals
+/// `subject` on a self-change and is the acting admin on an admin reset. The
+/// plaintext password and any hash are NEVER included. The acting principal is
+/// recorded under `actor_id` (not the reserved `actor` key, which
+/// [`AuditEntry::details`] strips as an anti-spoof measure). Pure builder —
+/// unit-testable without a database.
+pub fn password_change_audit_entry(subject: Uuid, actor: Uuid, by_admin: bool) -> AuditEntry {
+    AuditEntry::new(AuditAction::PasswordChanged, ResourceType::User)
+        .user(subject)
+        .resource(subject)
+        .details(serde_json::json!({
+            "actor_id": actor.to_string(),
+            "by_admin": by_admin,
+        }))
+}
+
+/// Build an audit entry for a TOTP enable/disable — a self-service
+/// credential-posture change (#386). `action` is [`AuditAction::TotpEnabled`]
+/// or [`AuditAction::TotpDisabled`]; `subject` is the user whose 2FA changed.
+/// Pure builder — unit-testable without a database.
+pub fn totp_audit_entry(action: AuditAction, subject: Uuid) -> AuditEntry {
+    AuditEntry::new(action, ResourceType::User)
+        .user(subject)
+        .resource(subject)
+}
+
+/// Build an audit entry for a mass session / refresh-token invalidation (#386).
+///
+/// `subject` is the user whose sessions were invalidated; `actor` is the
+/// principal that triggered it (equals `subject` on a self-service change,
+/// the acting admin otherwise). `trigger` is a stable static label
+/// (`"totp_enable"` | `"totp_disable"` | `"password_change"` |
+/// `"password_reset"` | `"force_password_change"`). Recorded under `actor_id`
+/// (not the reserved `actor` key). Pure builder — unit-testable.
+pub fn sessions_invalidated_audit_entry(subject: Uuid, actor: Uuid, trigger: &str) -> AuditEntry {
+    AuditEntry::new(AuditAction::SessionsInvalidated, ResourceType::User)
+        .user(subject)
+        .resource(subject)
+        .details(serde_json::json!({
+            "actor_id": actor.to_string(),
+            "trigger": trigger,
+        }))
 }
 
 /// Audit log entry from database
@@ -926,5 +1051,166 @@ mod tests {
         let rt = ResourceType::Artifact;
         let cloned = rt;
         assert_eq!(rt.as_str(), cloned.as_str());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1617 Phase 1: auth-event audit helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_federated_login_details_marks_provider_and_method() {
+        let details = federated_login_details("oidc", serde_json::json!({}));
+        assert_eq!(details["provider"], "oidc");
+        assert_eq!(details["auth_method"], "federated");
+    }
+
+    #[test]
+    fn test_federated_login_details_merges_extra_object() {
+        let details = federated_login_details("ldap", serde_json::json!({ "username": "alice" }));
+        assert_eq!(details["provider"], "ldap");
+        assert_eq!(details["username"], "alice");
+    }
+
+    #[test]
+    fn test_federated_login_details_ignores_non_object_extra() {
+        // A non-object `extra` must not clobber the base object.
+        let details = federated_login_details("saml", serde_json::json!("nope"));
+        assert_eq!(details["provider"], "saml");
+        assert_eq!(details["auth_method"], "federated");
+    }
+
+    #[test]
+    fn test_api_token_audit_entry_created_shape() {
+        let actor = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let entry = api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            actor,
+            token_id,
+            Some("ci-token"),
+            "profile",
+        );
+        assert_eq!(entry.user_id(), Some(actor));
+        assert_eq!(entry.resource_id(), Some(token_id));
+        assert_eq!(entry.action().as_str(), "API_TOKEN_CREATED");
+        assert_eq!(entry.resource_type().as_str(), "api_token");
+        let details = entry.details_ref().expect("details present");
+        assert_eq!(details["token_id"], token_id.to_string());
+        assert_eq!(details["token_name"], "ci-token");
+        assert_eq!(details["surface"], "profile");
+    }
+
+    #[test]
+    fn test_api_token_audit_entry_revoked_without_name() {
+        let actor = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let entry = api_token_audit_entry(
+            AuditAction::ApiTokenRevoked,
+            actor,
+            token_id,
+            None,
+            "service_account",
+        );
+        assert_eq!(entry.action().as_str(), "API_TOKEN_REVOKED");
+        let details = entry.details_ref().expect("details present");
+        // A missing name serializes to JSON null, never the secret.
+        assert!(details["token_name"].is_null());
+        assert_eq!(details["surface"], "service_account");
+    }
+
+    #[test]
+    fn test_api_token_audit_entry_never_carries_secret_key() {
+        let entry = api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some("t"),
+            "user",
+        );
+        let details = entry.details_ref().expect("details present");
+        let obj = details.as_object().expect("details is object");
+        assert!(!obj.contains_key("token"));
+        assert!(!obj.contains_key("secret"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #386 (#1617 Phase 1): auth-event audit completeness — new action
+    // variants + pure builder helpers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_audit_action_as_str_auth_event_completeness() {
+        assert_eq!(AuditAction::TotpEnabled.as_str(), "TOTP_ENABLED");
+        assert_eq!(AuditAction::TotpDisabled.as_str(), "TOTP_DISABLED");
+        assert_eq!(
+            AuditAction::SessionsInvalidated.as_str(),
+            "SESSIONS_INVALIDATED"
+        );
+    }
+
+    #[test]
+    fn test_password_change_audit_entry_self_shape() {
+        let subject = Uuid::new_v4();
+        let entry = password_change_audit_entry(subject, subject, false);
+        assert_eq!(entry.user_id(), Some(subject));
+        assert_eq!(entry.resource_id(), Some(subject));
+        assert_eq!(entry.action().as_str(), "PASSWORD_CHANGED");
+        assert_eq!(entry.resource_type().as_str(), "user");
+        let details = entry.details_ref().expect("details present");
+        assert_eq!(details["actor_id"], subject.to_string());
+        assert_eq!(details["by_admin"], false);
+        let obj = details.as_object().expect("details is object");
+        // The audit entry must never carry the password, a hash, or the
+        // reserved (stripped) `actor` key.
+        assert!(!obj.contains_key("password"));
+        assert!(!obj.contains_key("hash"));
+        assert!(!obj.contains_key("password_hash"));
+        assert!(!obj.contains_key("actor"));
+    }
+
+    #[test]
+    fn test_password_change_audit_entry_admin_records_distinct_actor() {
+        let subject = Uuid::new_v4();
+        let actor = Uuid::new_v4();
+        let entry = password_change_audit_entry(subject, actor, true);
+        assert_eq!(entry.user_id(), Some(subject));
+        let details = entry.details_ref().expect("details present");
+        assert_eq!(details["actor_id"], actor.to_string());
+        assert_eq!(details["by_admin"], true);
+    }
+
+    #[test]
+    fn test_totp_audit_entry_enable_shape() {
+        let subject = Uuid::new_v4();
+        let entry = totp_audit_entry(AuditAction::TotpEnabled, subject);
+        assert_eq!(entry.action().as_str(), "TOTP_ENABLED");
+        assert_eq!(entry.resource_type().as_str(), "user");
+        assert_eq!(entry.user_id(), Some(subject));
+        assert_eq!(entry.resource_id(), Some(subject));
+    }
+
+    #[test]
+    fn test_totp_audit_entry_disable_shape() {
+        let subject = Uuid::new_v4();
+        let entry = totp_audit_entry(AuditAction::TotpDisabled, subject);
+        assert_eq!(entry.action().as_str(), "TOTP_DISABLED");
+        assert_eq!(entry.user_id(), Some(subject));
+        assert_eq!(entry.resource_id(), Some(subject));
+    }
+
+    #[test]
+    fn test_sessions_invalidated_audit_entry_shape_and_trigger_roundtrip() {
+        let subject = Uuid::new_v4();
+        let actor = Uuid::new_v4();
+        let entry = sessions_invalidated_audit_entry(subject, actor, "password_change");
+        assert_eq!(entry.action().as_str(), "SESSIONS_INVALIDATED");
+        assert_eq!(entry.resource_type().as_str(), "user");
+        assert_eq!(entry.user_id(), Some(subject));
+        assert_eq!(entry.resource_id(), Some(subject));
+        let details = entry.details_ref().expect("details present");
+        assert_eq!(details["actor_id"], actor.to_string());
+        assert_eq!(details["trigger"], "password_change");
+        // Reserved key must not survive into the stored payload.
+        assert!(!details.as_object().expect("object").contains_key("actor"));
     }
 }

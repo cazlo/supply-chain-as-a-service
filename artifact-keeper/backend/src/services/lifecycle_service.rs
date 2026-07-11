@@ -334,7 +334,7 @@ pub struct LifecyclePolicy {
 
 /// Request to create a lifecycle policy.
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct CreatePolicyRequest {
+pub struct CreateLifecyclePolicyRequest {
     pub repository_id: Option<Uuid>,
     pub name: String,
     pub description: Option<String>,
@@ -347,7 +347,7 @@ pub struct CreatePolicyRequest {
 
 /// Request to update a lifecycle policy.
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdatePolicyRequest {
+pub struct UpdateLifecyclePolicyRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
@@ -399,7 +399,10 @@ impl LifecycleService {
     }
 
     /// Create a new lifecycle policy.
-    pub async fn create_policy(&self, req: CreatePolicyRequest) -> Result<LifecyclePolicy> {
+    pub async fn create_policy(
+        &self,
+        req: CreateLifecyclePolicyRequest,
+    ) -> Result<LifecyclePolicy> {
         // Validate policy_type
         let valid_types = [
             "max_age_days",
@@ -505,7 +508,7 @@ impl LifecycleService {
     pub async fn update_policy(
         &self,
         id: Uuid,
-        req: UpdatePolicyRequest,
+        req: UpdateLifecyclePolicyRequest,
     ) -> Result<LifecyclePolicy> {
         let existing = self.get_policy(id).await?;
 
@@ -1345,7 +1348,11 @@ mod tests {
     // Helper: create a minimal LifecycleService for calling validate_policy_config.
     // PgPool::connect_lazy requires a Tokio context, so these tests use #[tokio::test].
     fn make_service_for_validation() -> LifecycleService {
-        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+        // Fake-DB pool: any test that reaches the INSERT is asserting on the
+        // Database error, so fail acquires in 1s, not sqlx's default 30s.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("connect_lazy should not fail");
         LifecycleService::new(pool)
     }
@@ -1616,7 +1623,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_max_versions_without_repository_id_rejected() {
         let svc = make_service_for_validation();
-        let req = CreatePolicyRequest {
+        let req = CreateLifecyclePolicyRequest {
             repository_id: None,
             name: "global-max-versions".to_string(),
             description: None,
@@ -1633,7 +1640,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_size_quota_without_repository_id_rejected() {
         let svc = make_service_for_validation();
-        let req = CreatePolicyRequest {
+        let req = CreateLifecyclePolicyRequest {
             repository_id: None,
             name: "global-size-quota".to_string(),
             description: None,
@@ -1655,7 +1662,7 @@ mod tests {
         // would fail here is the INSERT (no live DB), which surfaces as a
         // Database error, never a Validation error about repository_id.
         let svc = make_service_for_validation();
-        let req = CreatePolicyRequest {
+        let req = CreateLifecyclePolicyRequest {
             repository_id: None,
             name: "global-max-age".to_string(),
             description: None,
@@ -1735,7 +1742,7 @@ mod tests {
             "policy_type": "max_age_days",
             "config": {"days": 30}
         }"#;
-        let req: CreatePolicyRequest = serde_json::from_str(json_str).unwrap();
+        let req: CreateLifecyclePolicyRequest = serde_json::from_str(json_str).unwrap();
         assert_eq!(req.name, "My Policy");
         assert_eq!(req.policy_type, "max_age_days");
         assert!(req.repository_id.is_none());
@@ -1754,7 +1761,7 @@ mod tests {
             "config": {"quota_bytes": 1000000},
             "priority": 5
         });
-        let req: CreatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        let req: CreateLifecyclePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert_eq!(req.repository_id, Some(repo_id));
         assert_eq!(req.description, Some("With all fields".to_string()));
         assert_eq!(req.priority, Some(5));
@@ -1763,7 +1770,7 @@ mod tests {
     #[test]
     fn test_update_policy_request_empty() {
         let json_str = "{}";
-        let req: UpdatePolicyRequest = serde_json::from_str(json_str).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_str(json_str).unwrap();
         assert!(req.name.is_none());
         assert!(req.description.is_none());
         assert!(req.enabled.is_none());
@@ -2360,14 +2367,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // CreatePolicyRequest: deserialization edge cases
+    // CreateLifecyclePolicyRequest: deserialization edge cases
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_create_policy_request_missing_required_field() {
         // Missing "name" field
         let json_str = r#"{"policy_type": "max_age_days", "config": {"days": 30}}"#;
-        let result: std::result::Result<CreatePolicyRequest, _> = serde_json::from_str(json_str);
+        let result: std::result::Result<CreateLifecyclePolicyRequest, _> =
+            serde_json::from_str(json_str);
         assert!(result.is_err());
     }
 
@@ -2375,7 +2383,8 @@ mod tests {
     fn test_create_policy_request_missing_config() {
         // Missing "config" field
         let json_str = r#"{"name": "Test", "policy_type": "max_age_days"}"#;
-        let result: std::result::Result<CreatePolicyRequest, _> = serde_json::from_str(json_str);
+        let result: std::result::Result<CreateLifecyclePolicyRequest, _> =
+            serde_json::from_str(json_str);
         assert!(result.is_err());
     }
 
@@ -2385,7 +2394,7 @@ mod tests {
             "enabled": false,
             "priority": 99
         });
-        let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert!(req.name.is_none());
         assert!(req.description.is_none());
         assert_eq!(req.enabled, Some(false));
@@ -2403,7 +2412,7 @@ mod tests {
             "priority": 5,
             "cron_schedule": "0 0 3 * * *"
         });
-        let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert_eq!(req.name, Some("Updated Name".to_string()));
         assert_eq!(req.description, Some("Updated Description".to_string()));
         assert_eq!(req.enabled, Some(true));
@@ -2425,7 +2434,7 @@ mod tests {
             "config": {"days": 7},
             "cron_schedule": "0 0 2 * * *"
         });
-        let req: CreatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        let req: CreateLifecyclePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert_eq!(req.cron_schedule, Some("0 0 2 * * *".to_string()));
     }
 
@@ -2436,7 +2445,7 @@ mod tests {
             "policy_type": "max_age_days",
             "config": {"days": 7}
         });
-        let req: CreatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        let req: CreateLifecyclePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert!(req.cron_schedule.is_none());
     }
 
@@ -2445,7 +2454,7 @@ mod tests {
         let json_val = json!({
             "enabled": true
         });
-        let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        let req: UpdateLifecyclePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert!(req.cron_schedule.is_none());
     }
 

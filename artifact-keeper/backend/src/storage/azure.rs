@@ -189,6 +189,10 @@ const AZURE_BLOCK_WARNING_THRESHOLD: usize = 40_000;
 const AZURE_PUT_BLOB_FROM_URL_MAX_SIZE: u64 = 5_000 * 1024 * 1024;
 const AZURE_COPY_SOURCE_URL_MAX_LEN: usize = 2 * 1024;
 
+/// How far to backdate a SAS token's signed start (st) to tolerate clock
+/// skew between this host and Azure storage (Azure's documented allowance).
+const SAS_CLOCK_SKEW_ALLOWANCE_MINUTES: i64 = 15;
+
 impl TokenCredentialProvider {
     /// Build a provider from environment variables.
     fn from_env(client: &reqwest::Client) -> Result<Self> {
@@ -553,6 +557,8 @@ impl AzureBackend {
                 fallback = %fallback_key,
                 "Found artifact range at Artifactory fallback path"
             );
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
             let bytes = response
                 .bytes()
                 .await
@@ -594,6 +600,32 @@ impl AzureBackend {
         Ok(Self::append_query(url, "comp=blocklist"))
     }
 
+    /// Content-Length field for a Shared Key string-to-sign.
+    ///
+    /// For service version 2015-02-21 and later, Azure requires this field
+    /// to be an empty string when the length is zero — signing a literal
+    /// "0" produces a MAC mismatch and the request fails with 403
+    /// AuthenticationFailed.
+    fn content_length_field(content_length: u64) -> String {
+        if content_length == 0 {
+            String::new()
+        } else {
+            content_length.to_string()
+        }
+    }
+
+    /// String-to-sign for a single-shot Put Blob request in Shared Key mode.
+    fn put_blob_string_to_sign(&self, content_length: u64, date_str: &str, key: &str) -> String {
+        format!(
+            "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
+            Self::content_length_field(content_length),
+            date_str,
+            self.config.account_name,
+            self.config.container_name,
+            key
+        )
+    }
+
     /// Generate a Shared Key authorization header for a request.
     fn shared_key_auth(
         decoded_key: &[u8],
@@ -618,15 +650,8 @@ impl AzureBackend {
 
         match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => {
-                let content_length = content.len();
-                let string_to_sign = format!(
-                    "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
-                    content_length,
-                    date_str,
-                    self.config.account_name,
-                    self.config.container_name,
-                    key
-                );
+                let string_to_sign =
+                    self.put_blob_string_to_sign(content.len() as u64, &date_str, key);
                 let auth_header =
                     Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?;
 
@@ -873,6 +898,18 @@ impl AzureBackend {
         }
     }
 
+    /// URL for the health-check HEAD probe.
+    ///
+    /// Must be a read-authorized URL: in Shared Key mode `authorized_head`
+    /// adds no Authorization header (it expects a SAS URL), so a bare
+    /// `blob_url` yields an anonymous request that Azure answers with
+    /// 409 PublicAccessNotPermitted whenever public blob access is disabled
+    /// on the account — reporting storage as unhealthy regardless of its
+    /// real state.
+    fn health_probe_url(&self) -> Result<String> {
+        self.read_url(".health-probe", Duration::from_secs(60))
+    }
+
     /// Generate a SAS token for a blob (Shared Key mode only).
     ///
     /// Uses Service SAS with blob resource type.
@@ -898,10 +935,16 @@ impl AzureBackend {
 
         let now = Utc::now();
         let expiry = now + ChronoDuration::seconds(expires_in.as_secs() as i64);
+        // Backdate the start time to tolerate clock skew between this host
+        // and the Azure storage service (Azure's documented guidance is a
+        // 15-minute allowance). With st == now, a request arriving while
+        // Azure's clock is even a few milliseconds behind ours is rejected
+        // with 403 "Signature not valid in the specified time frame".
+        let start = now - ChronoDuration::minutes(SAS_CLOCK_SKEW_ALLOWANCE_MINUTES);
 
         let signed_version = "2021-06-08";
         let signed_resource = "b";
-        let signed_start = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let signed_start = start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let signed_expiry = expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let signed_protocol = "https";
 
@@ -1116,6 +1159,7 @@ impl AzureBackend {
 
 #[async_trait]
 impl StorageBackend for AzureBackend {
+    #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let url = self.blob_url(key);
         let response = self.authorized_put(&url, key, &content).await?;
@@ -1132,6 +1176,7 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get"))]
     async fn get(&self, key: &str) -> Result<Bytes> {
         let url = self.read_url(key, Duration::from_secs(300))?;
         let response = self.authorized_get(&url).await?;
@@ -1157,6 +1202,8 @@ impl StorageBackend for AzureBackend {
                                 fallback = %fallback_key,
                                 "Found artifact at Artifactory fallback path"
                             );
+                            #[allow(clippy::disallowed_methods)]
+                            // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
                             let bytes = fallback_response.bytes().await.map_err(|e| {
                                 AppError::Storage(format!("Failed to read response: {}", e))
                             })?;
@@ -1173,6 +1220,8 @@ impl StorageBackend for AzureBackend {
             )));
         }
 
+        #[allow(clippy::disallowed_methods)]
+        // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
         let bytes = response
             .bytes()
             .await
@@ -1181,6 +1230,7 @@ impl StorageBackend for AzureBackend {
         Ok(bytes)
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_range"))]
     async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -1191,6 +1241,8 @@ impl StorageBackend for AzureBackend {
         let response = self.authorized_get_range(&url, &range_header).await?;
 
         if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: storage-internal Artifactory-fallback get()/range body; backs the streaming get impl; genuinely exempt (#1608)
             return response
                 .bytes()
                 .await
@@ -1212,6 +1264,9 @@ impl StorageBackend for AzureBackend {
         )))
     }
 
+    // The span covers GET initiation (time-to-first-byte); the body transfer
+    // happens later as the caller polls the returned stream.
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_stream"))]
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let url = self.read_url(key, Duration::from_secs(300))?;
         let mut response = self.authorized_get(&url).await?;
@@ -1255,6 +1310,7 @@ impl StorageBackend for AzureBackend {
         Ok(Box::pin(stream))
     }
 
+    #[tracing::instrument(skip(self, stream), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_stream"))]
     async fn put_stream(
         &self,
         key: &str,
@@ -1329,6 +1385,7 @@ impl StorageBackend for AzureBackend {
         })
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let size = match self.size(source).await {
             Ok(size) => size,
@@ -1374,6 +1431,7 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists"))]
     async fn exists(&self, key: &str) -> Result<bool> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
@@ -1403,6 +1461,7 @@ impl StorageBackend for AzureBackend {
         Ok(false)
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "delete"))]
     async fn delete(&self, key: &str) -> Result<()> {
         let url = self.blob_url(key);
         let response = self.authorized_delete(&url, key).await?;
@@ -1425,6 +1484,7 @@ impl StorageBackend for AzureBackend {
     /// revalidation. Returns `Ok(None)` for a missing blob or for a
     /// response without an `ETag` header so the freshness probe can fall
     /// through to the slow path without surfacing a backend error.
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "head_etag"))]
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         let url = self.read_url(key, Duration::from_secs(60))?;
         let response = self.authorized_head(&url).await?;
@@ -1451,6 +1511,7 @@ impl StorageBackend for AzureBackend {
         self.config.redirect_downloads && !self.is_rbac()
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_presigned_url"))]
     async fn get_presigned_url(
         &self,
         key: &str,
@@ -1486,6 +1547,7 @@ impl StorageBackend for AzureBackend {
     /// PUT BlockBlob request and let `reqwest::Body::wrap_stream` pump the
     /// file chunk-by-chunk over the wire. Peak heap usage is O(chunk_size),
     /// not O(file_size).
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_file"))]
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         use futures::StreamExt;
         use tokio::io::BufReader;
@@ -1508,14 +1570,7 @@ impl StorageBackend for AzureBackend {
 
         let response = match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => {
-                let string_to_sign = format!(
-                    "PUT\n\n\n{}\n\napplication/octet-stream\n\n\n\n\n\n\nx-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:2021-06-08\n/{}/{}/{}",
-                    content_length,
-                    date_str,
-                    self.config.account_name,
-                    self.config.container_name,
-                    key
-                );
+                let string_to_sign = self.put_blob_string_to_sign(content_length, &date_str, key);
                 let auth_header =
                     Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?;
 
@@ -1561,11 +1616,12 @@ impl StorageBackend for AzureBackend {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "health_check"))]
     async fn health_check(&self) -> Result<()> {
         // HEAD a sentinel blob path. A 404 is fine (proves the container is
         // reachable and credentials are accepted). Only transport-level or
         // authentication errors indicate an unhealthy backend.
-        let url = self.blob_url(".health-probe");
+        let url = self.health_probe_url()?;
         let response = self
             .authorized_head(&url)
             .await
@@ -1786,6 +1842,42 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Shared Key Put Blob string-to-sign ───────────────────────────────
+
+    #[test]
+    fn test_content_length_field_zero_is_empty() {
+        // Azure Shared Key (API >= 2015-02-21): the Content-Length field of
+        // the string-to-sign must be empty when the length is zero.
+        assert_eq!(AzureBackend::content_length_field(0), "");
+    }
+
+    #[test]
+    fn test_content_length_field_nonzero() {
+        assert_eq!(AzureBackend::content_length_field(42), "42");
+    }
+
+    #[tokio::test]
+    async fn test_put_string_to_sign_empty_body_has_empty_content_length_field() {
+        let backend = create_test_backend().await;
+        let string_to_sign =
+            backend.put_blob_string_to_sign(0, "Mon, 06 Jul 2026 22:37:12 GMT", "test/blob");
+        let fields: Vec<&str> = string_to_sign.split('\n').collect();
+        assert_eq!(
+            fields[3], "",
+            "Content-Length field must be empty for a zero-length body, not \"0\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_string_to_sign_nonempty_body_has_numeric_content_length_field() {
+        let backend = create_test_backend().await;
+        let string_to_sign =
+            backend.put_blob_string_to_sign(1234, "Mon, 06 Jul 2026 22:37:12 GMT", "test/blob");
+        let fields: Vec<&str> = string_to_sign.split('\n').collect();
+        assert_eq!(fields[3], "1234");
+        assert!(string_to_sign.ends_with("/testaccount/testcontainer/test/blob"));
+    }
+
     // ── SAS URL generation (Shared Key only) ─────────────────────────────
 
     #[tokio::test]
@@ -1823,6 +1915,46 @@ mod tests {
         assert!(token.contains("spr=https"));
     }
 
+    /// Decode a datetime query parameter (st/se) out of a SAS token.
+    fn sas_param_datetime(token: &str, param: &str) -> chrono::DateTime<Utc> {
+        let encoded = token
+            .split(&format!("{}=", param))
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .unwrap_or_else(|| panic!("token should contain {}=", param));
+        let raw = urlencoding::decode(encoded).unwrap();
+        chrono::DateTime::parse_from_rfc3339(&raw)
+            .unwrap_or_else(|e| panic!("{} should be RFC 3339, got {:?}: {}", param, raw, e))
+            .with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn test_sas_signed_start_backdated_for_clock_skew() {
+        let backend = create_test_backend().await;
+
+        let token = backend
+            .generate_sas_token("test/file.txt", Duration::from_secs(3600))
+            .unwrap();
+        let now = Utc::now();
+
+        let start = sas_param_datetime(&token, "st");
+        let backdate = now.signed_duration_since(start);
+        assert!(
+            backdate >= ChronoDuration::minutes(SAS_CLOCK_SKEW_ALLOWANCE_MINUTES - 1),
+            "signed start must be backdated ~{} minutes for clock skew, got {}",
+            SAS_CLOCK_SKEW_ALLOWANCE_MINUTES,
+            backdate
+        );
+        assert!(backdate <= ChronoDuration::minutes(SAS_CLOCK_SKEW_ALLOWANCE_MINUTES + 1));
+
+        // The expiry window is measured from now, not from the backdated
+        // start — backdating must not shorten (or extend) token lifetime.
+        let expiry = sas_param_datetime(&token, "se");
+        let lifetime = expiry.signed_duration_since(now);
+        assert!(lifetime >= ChronoDuration::minutes(59));
+        assert!(lifetime <= ChronoDuration::minutes(61));
+    }
+
     #[tokio::test]
     async fn test_sas_url_different_keys() {
         let backend = create_test_backend().await;
@@ -1846,6 +1978,34 @@ mod tests {
         assert!(url.starts_with(
             "https://testaccount.blob.core.windows.net/testcontainer/path/to/blob.dat?"
         ));
+    }
+
+    // ── Health probe URL ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_health_probe_url_is_signed_in_shared_key_mode() {
+        let backend = create_test_backend().await;
+
+        let url = backend.health_probe_url().unwrap();
+        assert!(url.contains(".health-probe"));
+        assert!(
+            url.contains("sig="),
+            "Shared Key mode must HEAD a SAS-signed URL; an unsigned HEAD is \
+             anonymous and fails with 409 when public blob access is disabled"
+        );
+        assert!(url.contains("sp=r"), "probe needs read permission");
+    }
+
+    #[test]
+    fn test_health_probe_url_is_bare_in_rbac_mode() {
+        let backend = create_rbac_backend(service_principal_cred());
+
+        let url = backend.health_probe_url().unwrap();
+        assert!(url.contains(".health-probe"));
+        assert!(
+            !url.contains("sig="),
+            "RBAC mode authorizes via bearer header, not SAS"
+        );
     }
 
     // ── Redirect support ─────────────────────────────────────────────────

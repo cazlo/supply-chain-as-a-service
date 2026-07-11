@@ -14,8 +14,10 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, VARY,
+};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Extension;
@@ -35,6 +37,12 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::RepositoryType;
+use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::npm_packument_cache::{
+    self as packument_cache, CachedPackument, NpmPackumentCache,
+};
+use crate::services::upstream_metadata::UpstreamMetadataCache;
+use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -113,6 +121,411 @@ fn npm_metadata_compression_layer() -> CompressionLayer<impl Predicate> {
             .and(NotForContentType::const_new("application/gzip"))
             .and(NotForContentType::const_new("application/octet-stream")),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Computed-packument response cache (#2162)
+// ---------------------------------------------------------------------------
+
+/// Buffering cap when caching a computed packument body. Packuments are
+/// bounded JSON; keep this aligned with the upstream npm metadata cap so
+/// large public packuments (for example `prisma`) can still be cached.
+const NPM_PACKUMENT_BUFFER_CAP: usize = proxy_helpers::LARGE_METADATA_MAX_BYTES;
+
+/// True when the client advertises `gzip` (or `*`) in `Accept-Encoding`, i.e.
+/// the metadata compression layer would have gzipped the response. Only gzip
+/// is pre-encoded; brotli-only clients are served the identity variant (which
+/// the compression layer may still compress on the fly).
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ae| {
+            ae.split(',').any(|tok| {
+                let name = tok.split(';').next().unwrap_or("").trim();
+                name.eq_ignore_ascii_case("gzip") || name == "*"
+            })
+        })
+}
+
+/// Only JSON metadata is cached; error responses and non-JSON passthroughs
+/// are cheap to recompute and must never be pinned in the cache.
+fn is_cacheable_packument_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .ends_with("json")
+}
+
+/// gzip-compress a JSON body at the level the metadata compression layer
+/// uses, so a pre-encoded hit is byte-comparable in size to the layer output.
+fn gzip_encode(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+/// Build a `Response` from a cached computed packument. The
+/// `Content-Encoding` header (present when the body is gzip) makes the
+/// metadata compression layer skip this response, so the pre-encoded bytes
+/// are served verbatim. `Vary` covers both request dimensions of the cache
+/// key: tower-http only adds `Vary: accept-encoding` when it compresses, so
+/// pre-encoded hits must declare it themselves or a shared HTTP cache could
+/// serve one client's encoding (or Accept variant) to another.
+fn cached_packument_response(entry: &CachedPackument) -> Response {
+    let mut response = Response::new(Body::from(entry.bytes.clone()));
+    let headers = response.headers_mut();
+    // Stored values originate from valid responses, but a corrupt shared
+    // cache entry must degrade to a safe default, never a panic.
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&entry.content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
+    );
+    if let Some(ref encoding) = entry.content_encoding {
+        if let Ok(value) = HeaderValue::from_str(encoding) {
+            headers.insert(CONTENT_ENCODING, value);
+        }
+    }
+    headers.insert(VARY, HeaderValue::from_static("Accept, Accept-Encoding"));
+    response
+}
+
+/// How the age gate affects computed-packument cache eligibility for a repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackumentCacheAgeGateCheck {
+    /// No age-gate influence; the repo may use the cache.
+    Cacheable,
+    /// The gate applies to this repo directly; bypass the cache.
+    Bypass,
+    /// Virtual repo with the gate service present: eligibility depends on
+    /// whether any member repo is age-gated, which needs a DB lookup.
+    CheckVirtualMembers,
+}
+
+/// Pure part of the age-gate cache-eligibility decision.
+///
+/// The computed-packument cache stores final response bytes served verbatim
+/// to every later client, but an age-gated repo's packument is a policy- and
+/// time-dependent VIEW of that response: storing the filtered bytes would pin
+/// one moment's view for everyone (a version stays hidden for up to the stale
+/// window after aging past the threshold, and one repo's policy could poison
+/// another's entry), while serving pre-gate cached bytes would leak unfiltered
+/// packuments through the SWR fast path. Rather than keying the cache by a
+/// decision that changes with wall-clock time, age-gated repos bypass the
+/// cache and compute per-request; repos without the gate keep the full #2162
+/// speedup.
+fn classify_packument_cache_age_gate(
+    has_age_gate_service: bool,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+) -> PackumentCacheAgeGateCheck {
+    if !has_age_gate_service {
+        return PackumentCacheAgeGateCheck::Cacheable;
+    }
+    if AgeGateService::is_applicable(params) {
+        return PackumentCacheAgeGateCheck::Bypass;
+    }
+    if params.repo_type == RepositoryType::Virtual {
+        return PackumentCacheAgeGateCheck::CheckVirtualMembers;
+    }
+    PackumentCacheAgeGateCheck::Cacheable
+}
+
+/// Whether this repo must bypass the computed-packument cache because the age
+/// gate can filter its packuments (see [`classify_packument_cache_age_gate`]).
+/// Remote repos consult their own configuration; virtual repos bypass when
+/// ANY member has the gate enabled, because the virtual metadata path filters
+/// each member's contribution with that member's own params. A failed member
+/// lookup also bypasses: recomputing is merely slower, while serving a
+/// possibly-unfiltered cached packument is wrong.
+async fn age_gate_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo) -> bool {
+    match classify_packument_cache_age_gate(
+        state.age_gate_service.is_some(),
+        &proxy_helpers::age_gate_params(repo),
+    ) {
+        PackumentCacheAgeGateCheck::Cacheable => false,
+        PackumentCacheAgeGateCheck::Bypass => true,
+        PackumentCacheAgeGateCheck::CheckVirtualMembers => {
+            virtual_has_age_gated_member(&state.db, repo.id).await
+        }
+    }
+}
+
+/// True when any member of a virtual repository has the age gate enabled.
+/// Errs on the side of `true` (bypass) if the lookup fails.
+pub(crate) async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: uuid::Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+            SELECT 1 FROM repositories r \
+            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
+            WHERE vrm.virtual_repo_id = $1 AND r.age_gate_enabled = true)",
+    )
+    .bind(virtual_repo_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(true)
+}
+
+/// Cache-fronted packument fetch used by the GET-metadata handlers.
+///
+/// Only remote and virtual repositories are cached: that is where the
+/// upstream round-trip being eliminated lives. Local (hosted) packuments are
+/// a cheap indexed DB read, and caching them would break read-your-writes
+/// across replicas with the in-process backend (a publish on one pod would
+/// leave other pods serving the pre-publish entry for the fresh window).
+/// Age-gated repos bypass the cache entirely (see
+/// [`classify_packument_cache_age_gate`]).
+///
+/// Fresh hits serve the pre-computed, pre-encoded response with no upstream
+/// fetch, tarball-URL rewrite, abbreviation or serialize/compress. Stale hits
+/// serve immediately while one background task refreshes the entry. Misses
+/// compute inline under single-flight, so a burst on one packument costs one
+/// upstream fetch.
+async fn get_package_metadata_cached(
+    state: &SharedState,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let want_abbreviated = wants_abbreviated_metadata(headers);
+    // One indexed lookup to classify the repo before consulting the cache;
+    // its cost is negligible next to the upstream round-trip a hit saves.
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    let cache_eligible = (repo.repo_type == RepositoryType::Remote
+        || repo.repo_type == RepositoryType::Virtual)
+        && !age_gate_bypasses_packument_cache(state, &repo).await;
+    let Some(cache) = state.npm_packument_cache.clone().filter(|_| cache_eligible) else {
+        return get_package_metadata(state, repo_key, package_name, base_url, want_abbreviated)
+            .await;
+    };
+    let want_gzip = accepts_gzip(headers);
+    let key = packument_cache::cache_key(
+        repo_key,
+        package_name,
+        want_abbreviated,
+        want_gzip,
+        base_url,
+    );
+    let flight = packument_cache::flight_key(repo_key, package_name, want_abbreviated, base_url);
+
+    cache
+        .serve(
+            &key,
+            &flight,
+            || {
+                compute_and_store_packument(
+                    state,
+                    &cache,
+                    repo_key,
+                    package_name,
+                    base_url,
+                    want_abbreviated,
+                    want_gzip,
+                )
+            },
+            |claim| {
+                let state = state.clone();
+                let cache = cache.clone();
+                let repo_key = repo_key.to_string();
+                let package_name = package_name.to_string();
+                let base_url = base_url.to_string();
+                tokio::spawn(async move {
+                    // The claim dedups a stale burst within this process; the
+                    // cross-replica lease inside `refresh_under_lease` dedups
+                    // it across replicas sharing a cache backend (#2248).
+                    let refreshed = cache
+                        .refresh_under_lease(claim, || {
+                            compute_and_store_packument(
+                                &state,
+                                &cache,
+                                &repo_key,
+                                &package_name,
+                                &base_url,
+                                want_abbreviated,
+                                want_gzip,
+                            )
+                        })
+                        .await;
+                    if matches!(refreshed, Some(Err(_))) {
+                        debug!(
+                            repo_key,
+                            package = package_name,
+                            "npm packument background refresh failed; stale entry remains"
+                        );
+                    }
+                });
+            },
+            || {
+                AppError::ServiceUnavailable(
+                    "Timed out waiting for npm packument refresh".to_string(),
+                )
+                .into_response()
+            },
+        )
+        .await
+        .map(|entry| cached_packument_response(&entry))
+}
+
+/// True when a response status is an authoritative "this package does not
+/// exist (any more)" rather than a transient failure. A 404/410 observed by
+/// a refresh must EVICT the cached packument so unpublishes and takedowns
+/// propagate immediately; transient failures (5xx, timeouts) must NOT evict,
+/// so stale entries keep serving through upstream blips (the point of SWR).
+fn is_definitive_missing_status(status: StatusCode) -> bool {
+    matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE)
+}
+
+/// Compute a packument via [`get_package_metadata`] and cache the result.
+///
+/// Successful JSON responses are stored in both encodings — identity always,
+/// gzip when the body compresses — so any later client hits regardless of its
+/// `Accept-Encoding`. The entry matching `want_gzip` is returned for serving.
+/// Error responses and non-JSON passthroughs are returned unchanged via
+/// `Err` and left uncached; an authoritative 404/410 additionally evicts the
+/// package's cached variants (see [`is_definitive_missing_status`]).
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped; the exempt call is marked inline below (#1608)
+async fn compute_and_store_packument(
+    state: &SharedState,
+    cache: &NpmPackumentCache,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+    want_abbreviated: bool,
+    want_gzip: bool,
+) -> Result<CachedPackument, Response> {
+    // Capture the invalidation generation BEFORE computing, so a publish
+    // that lands mid-compute wins over the data computed from before it.
+    let store_guard = cache.begin_store(repo_key, package_name);
+    let response =
+        match get_package_metadata(state, repo_key, package_name, base_url, want_abbreviated).await
+        {
+            Ok(response) => response,
+            Err(error_response) => {
+                if is_definitive_missing_status(error_response.status()) {
+                    cache.invalidate_package(repo_key, package_name).await;
+                }
+                return Err(error_response);
+            }
+        };
+    if response.status() != StatusCode::OK {
+        if is_definitive_missing_status(response.status()) {
+            cache.invalidate_package(repo_key, package_name).await;
+        }
+        return Err(response);
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    if !is_cacheable_packument_content_type(&content_type) {
+        return Err(response);
+    }
+
+    // STREAMING-EXEMPT: capped metadata read (a computed npm packument JSON, not an artifact blob); bounded to <=128 MiB via NPM_PACKUMENT_BUFFER_CAP so a hostile/broken upstream cannot OOM us; over-cap is surfaced as an error and left uncached; tracked under #1608
+    let body_bytes = axum::body::to_bytes(response.into_body(), NPM_PACKUMENT_BUFFER_CAP)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Failed to read packument body: {}", e)).into_response()
+        })?;
+
+    let identity_entry = CachedPackument {
+        bytes: body_bytes.clone(),
+        content_type: content_type.clone(),
+        content_encoding: None,
+    };
+    cache
+        .store_guarded(
+            &store_guard,
+            &packument_cache::cache_key(repo_key, package_name, want_abbreviated, false, base_url),
+            identity_entry.clone(),
+        )
+        .await;
+
+    // Encoder failure is not fatal: the identity variant serves this client
+    // and later gzip clients recompute.
+    let gzip_entry = match gzip_encode(&body_bytes) {
+        Ok(gz) => {
+            let entry = CachedPackument {
+                bytes: Bytes::from(gz),
+                content_type,
+                content_encoding: Some("gzip".to_string()),
+            };
+            cache
+                .store_guarded(
+                    &store_guard,
+                    &packument_cache::cache_key(
+                        repo_key,
+                        package_name,
+                        want_abbreviated,
+                        true,
+                        base_url,
+                    ),
+                    entry.clone(),
+                )
+                .await;
+            Some(entry)
+        }
+        Err(_) => None,
+    };
+
+    Ok(match (want_gzip, gzip_entry) {
+        (true, Some(entry)) => entry,
+        _ => identity_entry,
+    })
+}
+
+/// Derive the npm package name from an artifact path
+/// (`{package}/{version}/{filename}`, where a scoped package contributes two
+/// leading segments). Returns `None` for paths that do not follow the npm
+/// layout. Used by the REST artifact-delete path to invalidate the computed
+/// packument cache without parsing metadata.
+pub(crate) fn npm_package_name_from_artifact_path(path: &str) -> Option<&str> {
+    // rsplitn(3) yields [filename, version, package-possibly-with-slashes].
+    let mut segments = path.rsplitn(3, '/');
+    let _filename = segments.next().filter(|s| !s.is_empty())?;
+    let _version = segments.next().filter(|s| !s.is_empty())?;
+    segments.next().filter(|s| !s.is_empty())
+}
+
+/// Invalidate the computed-packument cache for a package after a local write
+/// (publish, dist-tag change, artifact delete), in the hosting repo and in
+/// every virtual repo that includes it — the packument a virtual repo serves
+/// for this package changes too. Mirrors how cargo publish invalidates its
+/// index cache.
+pub(crate) async fn invalidate_packument_caches(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    package: &str,
+) {
+    let Some(cache) = state.npm_packument_cache.as_ref() else {
+        return;
+    };
+    cache.invalidate_package(repo_key, package).await;
+
+    let virtual_keys: Vec<String> = sqlx::query_scalar(
+        "SELECT r.key FROM repositories r \
+         INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
+         WHERE vrm.member_repo_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    for virtual_key in &virtual_keys {
+        cache.invalidate_package(virtual_key, package).await;
+    }
 }
 
 use crate::api::middleware::auth::require_auth_with_bearer_fallback;
@@ -281,6 +694,7 @@ fn empty_audits_quick_response() -> Response {
 /// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
 /// well-formed response so the audit degrades gracefully instead of failing
 /// the client command. See issue #1400.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
 async fn proxy_npm_audit_post(
     upstream_url: &str,
     path: &str,
@@ -304,7 +718,10 @@ async fn proxy_npm_audit_post(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
-            match resp.bytes().await {
+            // STREAMING-EXEMPT: capped metadata read (upstream npm audit advisory JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap degrades to empty advisories; tracked under #1608
+            match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024)
+                .await
+            {
                 Ok(bytes) => {
                     if !status.is_success() {
                         debug!(
@@ -353,6 +770,7 @@ async fn proxy_npm_audit_post(
 /// Returns the upstream status + body verbatim. On any transport error (DNS,
 /// TLS, timeout) returns `None` so the caller can fall through to the local
 /// fallback.
+#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
 async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Response> {
     let base = upstream_url.trim_end_matches('/');
     // Reconstruct the `/-/<rest>` meta path. axum 0.7 wildcard captures do NOT
@@ -383,7 +801,8 @@ async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Respo
         .unwrap_or("application/json")
         .to_string();
 
-    match resp.bytes().await {
+    // STREAMING-EXEMPT: capped metadata read (upstream npm registry packument/meta JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap falls through to local fallback; tracked under #1608
+    match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024).await {
         Ok(bytes) => Some(
             Response::builder()
                 .status(status)
@@ -557,15 +976,7 @@ async fn get_metadata(
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    let want_abbreviated = wants_abbreviated_metadata(&headers);
-    get_package_metadata(
-        &state,
-        &repo_key,
-        &package,
-        base_url.as_str(),
-        want_abbreviated,
-    )
-    .await
+    get_package_metadata_cached(&state, &repo_key, &package, base_url.as_str(), &headers).await
 }
 
 async fn get_scoped_metadata(
@@ -578,15 +989,7 @@ async fn get_scoped_metadata(
     let package = normalize_package_name(&package);
     let full_name = format!("@{}/{}", scope, package);
     validate_package_name(&full_name)?;
-    let want_abbreviated = wants_abbreviated_metadata(&headers);
-    get_package_metadata(
-        &state,
-        &repo_key,
-        &full_name,
-        base_url.as_str(),
-        want_abbreviated,
-    )
-    .await
+    get_package_metadata_cached(&state, &repo_key, &full_name, base_url.as_str(), &headers).await
 }
 
 async fn get_version_metadata(
@@ -840,22 +1243,27 @@ async fn get_package_metadata(
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let encoded_name = encode_package_name_for_upstream(package_name);
-                let (content, content_type) = proxy_helpers::proxy_fetch(
+                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     repo.id,
                     repo_key,
                     upstream_url,
                     &encoded_name,
+                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
                 )
                 .await?;
 
-                return Ok(rewrite_and_respond(
+                return rewrite_and_respond_with_age_gate(
+                    state,
+                    &repo,
+                    package_name,
                     content,
                     content_type,
                     base_url,
                     repo_key,
                     want_abbreviated,
-                ));
+                )
+                .await;
             }
         }
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
@@ -905,24 +1313,33 @@ async fn get_package_metadata(
             };
 
             let encoded_name = encode_package_name_for_upstream(package_name);
-            let result = proxy_helpers::proxy_fetch(
+            let result = proxy_helpers::proxy_fetch_capped(
                 proxy,
                 member.id,
                 &member.key,
                 upstream_url,
                 &encoded_name,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
             )
             .await;
 
             match result {
                 Ok((content, content_type)) => {
-                    return Ok(rewrite_and_respond(
+                    let params =
+                        crate::services::age_gate_service::AgeGateRepoParams::from_repository(
+                            member,
+                        );
+                    return rewrite_and_respond_with_age_gate_params(
+                        state,
+                        &params,
+                        package_name,
                         content,
                         content_type,
                         base_url,
                         repo_key,
                         want_abbreviated,
-                    ));
+                    )
+                    .await;
                 }
                 Err(_e) => {
                     debug!(
@@ -993,6 +1410,8 @@ async fn get_package_version_metadata(
             &serde_json::Map::new(),
             false,
         )?;
+        #[allow(clippy::disallowed_methods)]
+        // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
         let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
             .await
             .map_err(|e| {
@@ -1038,8 +1457,15 @@ async fn fetch_remote_packument(
         .as_ref()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
     let encoded_name = encode_package_name_for_upstream(package_name);
-    let (content, _ct) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &encoded_name).await?;
+    let (content, _ct) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        &encoded_name,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await?;
     let mut json: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
         AppError::Internal(format!("Invalid JSON from upstream: {}", e)).into_response()
     })?;
@@ -1076,6 +1502,8 @@ async fn fetch_virtual_packument(
                     &serde_json::Map::new(),
                     false,
                 )?;
+                #[allow(clippy::disallowed_methods)]
+                // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
                 let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
                     .await
                     .map_err(|e| {
@@ -1101,9 +1529,15 @@ async fn fetch_virtual_packument(
         };
 
         let encoded_name = encode_package_name_for_upstream(package_name);
-        let result =
-            proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, &encoded_name)
-                .await;
+        let result = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            &encoded_name,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await;
 
         match result {
             Ok((content, _ct)) => {
@@ -1137,32 +1571,6 @@ async fn fetch_virtual_packument(
 /// generation, Trivy, Grype) rely on it to decide how to extract and scan the
 /// artifact contents.
 const NPM_TARBALL_CONTENT_TYPE: &str = "application/gzip";
-
-/// Build an HTTP response for an npm tarball download.
-///
-/// All three download paths (remote, virtual, local) return the same response
-/// shape: the tarball bytes with `application/gzip` content type, a
-/// `Content-Disposition` attachment header, and the content length. This helper
-/// eliminates the repeated response-builder blocks.
-fn build_tarball_response(
-    content: Bytes,
-    filename: &str,
-    content_type: Option<String>,
-) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            CONTENT_TYPE,
-            content_type.unwrap_or_else(|| NPM_TARBALL_CONTENT_TYPE.to_string()),
-        )
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap()
-}
 
 /// Build a streaming tarball response from a storage stream.
 fn build_tarball_response_stream(
@@ -1218,10 +1626,178 @@ fn build_json_metadata_response(json_string: String) -> Response {
     build_ok_response("application/json", json_string)
 }
 
-/// Try to parse upstream content as JSON, rewrite tarball URLs, and return the
-/// rewritten metadata. Falls back to a raw passthrough if the content is not
-/// valid JSON. Used by both the remote and virtual metadata paths.
-fn rewrite_and_respond(
+/// Build the tarball filename for an npm package version.
+fn build_npm_tarball_filename(package_name: &str, version: &str) -> String {
+    format!("{}-{}.tgz", npm_tarball_short_name(package_name), version)
+}
+
+/// Short tarball filename prefix for scoped packages (`@angular/core` -> `core`).
+fn npm_tarball_short_name(package_name: &str) -> &str {
+    if package_name.starts_with('@') {
+        package_name.rsplit('/').next().unwrap_or(package_name)
+    } else {
+        package_name
+    }
+}
+
+/// Build upstream tarball path using literal `/` scope separators (B7 / #1377).
+fn build_npm_tarball_upstream_path(package_name: &str, filename: &str) -> String {
+    build_tarball_upstream_path(package_name, filename)
+}
+
+/// Map an age-gate block decision with LKG into upstream path + filename.
+fn npm_lkg_redirect_from_decision(
+    decision: &AgeGateDecision,
+    package_name: &str,
+) -> Option<(String, String)> {
+    if let AgeGateDecision::Block {
+        last_known_good: Some(lkg),
+        ..
+    } = decision
+    {
+        let lkg_filename = build_npm_tarball_filename(package_name, &lkg.version);
+        let lkg_path = build_npm_tarball_upstream_path(package_name, &lkg_filename);
+        Some((lkg_path, lkg_filename))
+    } else {
+        None
+    }
+}
+
+async fn npm_publish_time_for_version(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_name: &str,
+    version: &str,
+) -> Option<chrono::DateTime<Utc>> {
+    if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
+        let encoded_name = encode_package_name_for_upstream(package_name);
+        // Capped like every other buffered packument read (#2181): this runs
+        // on the tarball download path, where an unbounded upstream metadata
+        // body must not be able to balloon memory.
+        if let Ok((content, _)) = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &encoded_name,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
+        {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
+                let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
+                return times.get(version).copied();
+            }
+        }
+    }
+    None
+}
+
+async fn apply_npm_download_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_name: &str,
+    filename: &str,
+) -> Result<Option<(String, String)>, Response> {
+    let svc = match state.age_gate_service.as_ref() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let params = proxy_helpers::age_gate_params(repo);
+    if !AgeGateService::is_applicable(&params) {
+        return Ok(None);
+    }
+
+    let short_name = npm_tarball_short_name(package_name);
+    let version =
+        crate::formats::npm::NpmHandler::extract_version_from_filename(filename, short_name)
+            .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
+
+    let published_at = npm_publish_time_for_version(state, repo, package_name, &version).await;
+    let decision = svc
+        .check(&params, package_name, &version, published_at)
+        .await
+        .map_err(|e| e.into_response())?;
+    match decision {
+        AgeGateDecision::Allow => Ok(None),
+        AgeGateDecision::Block {
+            review_id: _,
+            last_known_good: Some(_),
+        } => Ok(npm_lkg_redirect_from_decision(&decision, package_name)),
+        AgeGateDecision::Block {
+            review_id,
+            last_known_good: None,
+        } => {
+            let requested_age_days =
+                published_at.map(|p| AgeGateService::package_age_days(p, Utc::now()));
+            Err(proxy_helpers::age_gate_blocked_response(
+                review_id,
+                package_name,
+                &version,
+                repo.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_and_respond_with_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    package_name: &str,
+    content: Bytes,
+    content_type: Option<String>,
+    base_url: &str,
+    repo_key: &str,
+    want_abbreviated: bool,
+) -> Result<Response, Response> {
+    rewrite_and_respond_with_age_gate_params(
+        state,
+        &proxy_helpers::age_gate_params(repo),
+        package_name,
+        content,
+        content_type,
+        base_url,
+        repo_key,
+        want_abbreviated,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_and_respond_with_age_gate_params(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package_name: &str,
+    content: Bytes,
+    content_type: Option<String>,
+    base_url: &str,
+    repo_key: &str,
+    want_abbreviated: bool,
+) -> Result<Response, Response> {
+    let mut filtered = content.clone();
+    if let (Some(svc), Ok(mut json)) = (
+        state.age_gate_service.as_ref(),
+        serde_json::from_slice::<serde_json::Value>(&content),
+    ) {
+        if AgeGateService::is_applicable(params) {
+            svc.filter_npm_packument(params, package_name, &mut json)
+                .await
+                .map_err(|e| e.into_response())?;
+            filtered = Bytes::from(serde_json::to_vec(&json).unwrap_or_default());
+        }
+    }
+    Ok(rewrite_and_respond_inner(
+        filtered,
+        content_type,
+        base_url,
+        repo_key,
+        want_abbreviated,
+    ))
+}
+
+fn rewrite_and_respond_inner(
     content: Bytes,
     content_type: Option<String>,
     base_url: &str,
@@ -1374,17 +1950,47 @@ async fn serve_tarball(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, _content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path)
-                    .await?;
+            let mut fetch_path = upstream_path.clone();
+            let mut response_filename = filename.to_string();
+            if let Some((lkg_path, lkg_filename)) =
+                apply_npm_download_age_gate(state, &repo, package_name, filename).await?
+            {
+                fetch_path = lkg_path;
+                response_filename = lkg_filename;
+            }
+
+            // #2192 / #1608 Phase 4c: an npm tarball is a package BLOB, not
+            // metadata. The buffered fallback (#2181) capped it at
+            // LARGE_METADATA_MAX_BYTES and 502'd a tarball larger than the cap
+            // even though other download paths already stream. Stream it (teed
+            // into the proxy cache under `fetch_path`) so a large tarball
+            // succeeds with 200 and subsequent pulls are served warm.
+            let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                proxy,
+                repo.id,
+                repo_key,
+                upstream_url,
+                &fetch_path,
+                &fetch_path,
+            )
+            .await?;
 
             // The upstream registry may return application/octet-stream for
             // npm tarballs, which also gets persisted by the proxy cache.
             // Correct the cached artifact record so that SBOM generation and
             // security scanners can identify the file as a gzip archive.
-            correct_cached_tarball_content_type(&state.db, repo.id, &upstream_path).await;
+            correct_cached_tarball_content_type(&state.db, repo.id, &fetch_path).await;
 
-            return Ok(build_tarball_response(content, filename, None));
+            // Force the outbound Content-Type to application/gzip regardless of
+            // what the upstream advertised — parity with the buffered path
+            // (build_tarball_response(None)) and the virtual path
+            // (npm_virtual_tarball_content_type).
+            return Ok(build_tarball_response_stream(
+                result.body,
+                &response_filename,
+                npm_virtual_tarball_content_type(result.content_type),
+                result.content_length,
+            ));
         }
         return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
     }
@@ -1423,6 +2029,57 @@ async fn serve_tarball(
         } else {
             state.proxy_service.as_deref()
         };
+
+        // #2066: enforce each gated Remote member's download age gate before
+        // resolving the virtual tarball. Virtual metadata is already filtered
+        // per-member (see the metadata branch), so an ordinary `npm install`
+        // cannot resolve a young version — but a client that already knows the
+        // exact young tarball URL (a pinned lockfile) would otherwise stream it
+        // straight through `resolve_virtual_download`. Only runs when the name
+        // is not locally owned (`proxy_for_virtual` is `Some`); a locally-owned
+        // name is served from the local member and is never age-gated. The
+        // shared `resolve_virtual_download` helper is left untouched so no
+        // other format (maven/hex/...) is affected.
+        if let Some(proxy) = proxy_for_virtual {
+            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(ref member_upstream) = member.upstream_url else {
+                    continue;
+                };
+                let member_info = proxy_helpers::repo_info_from_member(member);
+                // `apply_npm_download_age_gate` early-returns `Ok(None)` for a
+                // member whose gate is not applicable (disabled / non-npm), so
+                // ungated members are unaffected. An aged version -> `Ok(None)`;
+                // a withheld young version with a last-known-good -> serve the
+                // LKG tarball from this member; without one -> `Err(451)` via `?`.
+                match apply_npm_download_age_gate(state, &member_info, package_name, filename)
+                    .await?
+                {
+                    None => {}
+                    Some((lkg_path, lkg_filename)) => {
+                        let lkg = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            member_upstream,
+                            &lkg_path,
+                            &lkg_path,
+                        )
+                        .await?;
+                        correct_cached_tarball_content_type(&state.db, member.id, &lkg_path).await;
+                        return Ok(build_tarball_response_stream(
+                            lkg.body,
+                            &lkg_filename,
+                            npm_virtual_tarball_content_type(lkg.content_type),
+                            lkg.content_length,
+                        ));
+                    }
+                }
+            }
+        }
 
         let result = proxy_helpers::resolve_virtual_download(
             &state.db,
@@ -1897,6 +2554,8 @@ async fn publish_package(
     .execute(&state.db)
     .await;
 
+    invalidate_packument_caches(state, repo.id, repo_key, package_name).await;
+
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
     ))
@@ -1925,6 +2584,8 @@ async fn dist_tags_get(
     if !resp.status().is_success() {
         return Ok(resp);
     }
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: capped-metadata read (upstream index/advisory/packument, not an artifact blob); bounded response buffered; tracked under #1608
     let body_bytes = axum::body::to_bytes(resp.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|e| {
@@ -2011,6 +2672,8 @@ async fn dist_tags_put(
     .await
     .map_err(map_db_err)?;
 
+    invalidate_packument_caches(&state, repo.id, &repo_key, &package).await;
+
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
     ))
@@ -2050,6 +2713,8 @@ async fn dist_tags_delete(
     .execute(&state.db)
     .await
     .map_err(map_db_err)?;
+
+    invalidate_packument_caches(&state, repo.id, &repo_key, &package).await;
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
@@ -2210,6 +2875,8 @@ fn respond_with_packument(value: serde_json::Value, want_abbreviated: bool) -> R
     )
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2779,7 +3446,10 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             repo_type: "hosted".to_string(),
             upstream_url: None,
+            format: "generic".to_string(),
             promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
@@ -3358,6 +4028,51 @@ mod tests {
         assert_eq!(normalized, "@openai/codex");
         let for_upstream = encode_package_name_for_upstream(&normalized);
         assert_eq!(for_upstream, "@openai%2Fcodex");
+    }
+
+    #[test]
+    fn test_npm_tarball_short_name_scoped_and_unscoped() {
+        assert_eq!(npm_tarball_short_name("@angular/core"), "core");
+        assert_eq!(npm_tarball_short_name("express"), "express");
+    }
+
+    #[test]
+    fn test_npm_lkg_redirect_uses_literal_slash_path() {
+        use crate::services::age_gate_service::LastKnownGood;
+
+        let decision = AgeGateDecision::Block {
+            review_id: uuid::Uuid::new_v4(),
+            last_known_good: Some(LastKnownGood {
+                version: "16.0.0".to_string(),
+                artifact_path: "ignored".to_string(),
+            }),
+        };
+        let (path, filename) = npm_lkg_redirect_from_decision(&decision, "@angular/core").unwrap();
+        assert_eq!(filename, "core-16.0.0.tgz");
+        assert_eq!(path, "@angular/core/-/core-16.0.0.tgz");
+        assert!(!path.contains("%2F"));
+    }
+
+    #[test]
+    fn test_npm_lkg_redirect_none_without_last_known_good() {
+        // Allow and Block-without-LKG decisions produce no redirect target.
+        assert!(npm_lkg_redirect_from_decision(&AgeGateDecision::Allow, "express").is_none());
+        let blocked_no_lkg = AgeGateDecision::Block {
+            review_id: uuid::Uuid::new_v4(),
+            last_known_good: None,
+        };
+        assert!(npm_lkg_redirect_from_decision(&blocked_no_lkg, "express").is_none());
+    }
+
+    #[test]
+    fn test_extract_version_from_scoped_tarball_uses_short_name() {
+        let filename = "core-17.0.0.tgz";
+        let version = crate::formats::npm::NpmHandler::extract_version_from_filename(
+            filename,
+            npm_tarball_short_name("@angular/core"),
+        )
+        .unwrap();
+        assert_eq!(version, "17.0.0");
     }
 
     // -----------------------------------------------------------------------
@@ -4078,6 +4793,104 @@ mod tests {
             .expect("read body");
         assert_eq!(&body_bytes[..], tarball_bytes.as_ref());
 
+        cleanup().await;
+    }
+
+    // #2192 / #1608 Phase 4c: an npm tarball larger than the old buffered cap
+    // (LARGE_METADATA_MAX_BYTES = 16 MiB) must now STREAM with 200 instead of
+    // 502, the outbound Content-Type must still be forced to application/gzip,
+    // and the second request must be served WARM from the teed proxy cache
+    // without a second upstream round-trip.
+    #[tokio::test]
+    async fn test_remote_proxy_streams_large_tarball_and_warms_cache() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        // 17 MiB > 16 MiB LARGE_METADATA_MAX_BYTES: 502s on the buffered path.
+        let mut tarball_bytes = vec![0x1fu8, 0x8b, 0x08];
+        tarball_bytes.resize(17 * 1024 * 1024, 0x7e);
+
+        Mock::given(method("GET"))
+            .and(path("/bigpkg/-/bigpkg-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(tarball_bytes.clone()),
+            )
+            // Warm-cache proof: fetched from upstream at most once across the
+            // two requests below.
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        for i in 0..2 {
+            // Before the second request, wait for the streaming write-back to
+            // commit so the cache is deterministically WARM.
+            if i == 1 {
+                tdh::wait_for_cache_commit(&fx.storage_dir, tarball_bytes.len() as u64).await;
+            }
+            let result = super::download_tarball(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    fx.repo_key.clone(),
+                    "bigpkg".to_string(),
+                    "bigpkg-1.0.0.tgz".to_string(),
+                )),
+            )
+            .await;
+
+            let response = match result {
+                Ok(r) => r,
+                Err(r) => {
+                    let status = r.status();
+                    cleanup().await;
+                    panic!("large tarball must stream with 200, got {status}");
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(NPM_TARBALL_CONTENT_TYPE),
+                "outbound tarball content type must be forced to application/gzip"
+            );
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read streamed body");
+            assert_eq!(body_bytes.len(), tarball_bytes.len());
+        }
+
+        // `.expect(1)` on the mock is verified on server drop.
+        drop(mock_server);
         cleanup().await;
     }
 
@@ -4927,8 +5740,186 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Computed-packument cache helpers (#2162)
+    // -----------------------------------------------------------------------
+
+    fn accept_encoding_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn test_accepts_gzip_detection() {
+        assert!(accepts_gzip(&accept_encoding_headers("gzip, deflate, br")));
+        assert!(accepts_gzip(&accept_encoding_headers("br, GZIP")));
+        assert!(accepts_gzip(&accept_encoding_headers("*")));
+        assert!(accepts_gzip(&accept_encoding_headers("gzip;q=0.8")));
+        assert!(!accepts_gzip(&accept_encoding_headers("br, deflate")));
+        assert!(!accepts_gzip(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn test_classify_packument_cache_age_gate() {
+        use crate::models::repository::RepositoryFormat;
+        use crate::services::age_gate_service::AgeGateRepoParams;
+
+        let params = |repo_type: RepositoryType, enabled: bool| {
+            AgeGateRepoParams::from_parts(
+                uuid::Uuid::new_v4(),
+                "cache-bypass-test",
+                repo_type,
+                RepositoryFormat::Npm,
+                enabled,
+                7,
+            )
+        };
+
+        // Without the service, nothing bypasses — even a gated remote.
+        assert_eq!(
+            classify_packument_cache_age_gate(false, &params(RepositoryType::Remote, true)),
+            PackumentCacheAgeGateCheck::Cacheable
+        );
+        // A gated remote bypasses directly.
+        assert_eq!(
+            classify_packument_cache_age_gate(true, &params(RepositoryType::Remote, true)),
+            PackumentCacheAgeGateCheck::Bypass
+        );
+        // An ungated remote stays cacheable.
+        assert_eq!(
+            classify_packument_cache_age_gate(true, &params(RepositoryType::Remote, false)),
+            PackumentCacheAgeGateCheck::Cacheable
+        );
+        // A virtual repo is never gated directly (is_applicable is
+        // remote-only); with the service present its members decide.
+        assert_eq!(
+            classify_packument_cache_age_gate(true, &params(RepositoryType::Virtual, true)),
+            PackumentCacheAgeGateCheck::CheckVirtualMembers
+        );
+        assert_eq!(
+            classify_packument_cache_age_gate(true, &params(RepositoryType::Virtual, false)),
+            PackumentCacheAgeGateCheck::CheckVirtualMembers
+        );
+    }
+
+    #[test]
+    fn test_is_cacheable_packument_content_type() {
+        assert!(is_cacheable_packument_content_type("application/json"));
+        assert!(is_cacheable_packument_content_type(
+            "application/json; charset=utf-8"
+        ));
+        assert!(is_cacheable_packument_content_type(
+            NPM_ABBREVIATED_CONTENT_TYPE
+        ));
+        assert!(!is_cacheable_packument_content_type("application/gzip"));
+        assert!(!is_cacheable_packument_content_type("text/html"));
+        assert!(!is_cacheable_packument_content_type(""));
+    }
+
+    #[test]
+    fn test_gzip_encode_round_trips() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let original = br#"{"name":"widget","versions":{}}"#;
+        let encoded = gzip_encode(original).expect("gzip encode");
+        assert_ne!(encoded.as_slice(), original.as_ref());
+        let mut decoder = GzDecoder::new(&encoded[..]);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).expect("gzip decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_cached_packument_response_headers() {
+        let gz = CachedPackument {
+            bytes: Bytes::from_static(b"gz"),
+            content_type: NPM_ABBREVIATED_CONTENT_TYPE.to_string(),
+            content_encoding: Some("gzip".to_string()),
+        };
+        let response = cached_packument_response(&gz);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            NPM_ABBREVIATED_CONTENT_TYPE
+        );
+        // Pre-encoded hits must declare both cache-key request dimensions:
+        // tower-http only adds Vary when IT compresses.
+        assert_eq!(response.headers()[VARY], "Accept, Accept-Encoding");
+
+        let identity = CachedPackument {
+            bytes: Bytes::from_static(b"{}"),
+            content_type: "application/json".to_string(),
+            content_encoding: None,
+        };
+        let response = cached_packument_response(&identity);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get(CONTENT_ENCODING).is_none(),
+            "identity entries must not claim a content encoding"
+        );
+        assert_eq!(response.headers()[VARY], "Accept, Accept-Encoding");
+    }
+
+    #[test]
+    fn test_cached_packument_response_survives_corrupt_header_values() {
+        // A corrupt shared-cache entry (invalid header characters) must
+        // degrade to safe defaults, never panic the request path.
+        let corrupt = CachedPackument {
+            bytes: Bytes::from_static(b"{}"),
+            content_type: "bad\r\nvalue".to_string(),
+            content_encoding: Some("also\nbad".to_string()),
+        };
+        let response = cached_packument_response(&corrupt);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        assert!(response.headers().get(CONTENT_ENCODING).is_none());
+    }
+
+    #[test]
+    fn test_is_definitive_missing_status() {
+        assert!(is_definitive_missing_status(StatusCode::NOT_FOUND));
+        assert!(is_definitive_missing_status(StatusCode::GONE));
+        // Transient failures must NOT evict: stale entries keep serving
+        // through upstream blips.
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::UNAUTHORIZED,
+        ] {
+            assert!(
+                !is_definitive_missing_status(status),
+                "{status} must not evict"
+            );
+        }
+    }
+
+    #[test]
+    fn test_npm_package_name_from_artifact_path() {
+        assert_eq!(
+            npm_package_name_from_artifact_path("lodash/4.17.21/lodash-4.17.21.tgz"),
+            Some("lodash")
+        );
+        assert_eq!(
+            npm_package_name_from_artifact_path("@scope/pkg/1.0.0/pkg-1.0.0.tgz"),
+            Some("@scope/pkg")
+        );
+        // Malformed paths must be rejected, not mis-derived.
+        assert_eq!(npm_package_name_from_artifact_path("lodash"), None);
+        assert_eq!(npm_package_name_from_artifact_path("lodash/4.17.21"), None);
+        assert_eq!(npm_package_name_from_artifact_path(""), None);
+        assert_eq!(npm_package_name_from_artifact_path("//file.tgz"), None);
+    }
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -4950,6 +5941,876 @@ mod db_cov_tests {
             let app = fx.router_with_auth(super::router());
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
+        fx.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Age-gate packument-cache bypass: virtual member lookup
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_virtual_has_age_gated_member_lookup() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (virtual_id, _vkey, _vdir) = tdh::create_repo(&pool, "virtual", "npm").await;
+        let (member_id, _mkey, _mdir) = tdh::create_repo(&pool, "remote", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(&pool)
+        .await
+        .expect("add virtual member");
+
+        assert!(
+            !super::virtual_has_age_gated_member(&pool, virtual_id).await,
+            "ungated member must not force a cache bypass"
+        );
+
+        sqlx::query("UPDATE repositories SET age_gate_enabled = true WHERE id = $1")
+            .bind(member_id)
+            .execute(&pool)
+            .await
+            .expect("enable member age gate");
+
+        assert!(
+            super::virtual_has_age_gated_member(&pool, virtual_id).await,
+            "age-gated member must force a cache bypass"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Computed-packument cache (#2162)
+    // -----------------------------------------------------------------------
+
+    /// Fetch a packument through the cache-fronted path and parse it.
+    async fn fetch_packument_json(
+        state: &crate::api::SharedState,
+        repo_key: &str,
+        package: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let response = super::get_package_metadata_cached(
+            state,
+            repo_key,
+            package,
+            "http://localhost",
+            &axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|error_response| error_response);
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read packument body");
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// Minimal `npm publish` body for one version.
+    fn publish_body(package: &str, version: &str) -> bytes::Bytes {
+        use base64::Engine;
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": package,
+                "versions": { version: { "name": package, "version": version } },
+                "_attachments": {
+                    format!("{package}-{version}.tgz"): { "data": tarball_b64 }
+                }
+            }))
+            .expect("serialize publish body"),
+        )
+    }
+
+    /// End-to-end #2162: a second packument request must be served by the
+    /// computed-packument cache. After the first request the upstream is
+    /// re-pointed at an unroutable address AND the proxy's raw metadata cache
+    /// is wiped, so only the computed-response cache can answer — and the
+    /// wiremock `expect(1)` proves upstream was hit exactly once.
+    #[tokio::test]
+    async fn test_remote_packument_second_request_served_from_computed_cache() {
+        use axum::http::StatusCode;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let upstream_packument = serde_json::json!({
+            "name": "cache-widget",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "cache-widget",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball":
+                            "https://registry.example.test/cache-widget/-/cache-widget-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/cache-widget"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&upstream_packument))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let (status_first, first) =
+            fetch_packument_json(&state, &fx.repo_key, "cache-widget").await;
+
+        // Break every non-cache path: unroutable upstream + wiped raw proxy
+        // cache. Only the computed-packument cache can serve the next request.
+        sqlx::query("UPDATE repositories SET upstream_url = 'http://127.0.0.1:1' WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("break upstream_url");
+        std::fs::remove_dir_all(&fx.storage_dir).expect("wipe proxy cache");
+        std::fs::create_dir_all(&fx.storage_dir).expect("recreate storage dir");
+
+        let (status_second, second) =
+            fetch_packument_json(&state, &fx.repo_key, "cache-widget").await;
+
+        fx.teardown().await;
+
+        assert_eq!(status_first, StatusCode::OK, "first request must proxy");
+        assert_eq!(
+            status_second,
+            StatusCode::OK,
+            "second request must be served by the computed-packument cache"
+        );
+        assert_eq!(
+            first, second,
+            "cache must serve the identical computed body"
+        );
+        let tarball = second["versions"]["1.0.0"]["dist"]["tarball"]
+            .as_str()
+            .expect("tarball url");
+        assert!(
+            tarball.contains(&format!("/npm/{}/cache-widget/-/", fx.repo_key)),
+            "cached body must keep the rewritten tarball URL, got {tarball}"
+        );
+        // Dropping the mock server verifies `expect(1)`: exactly one
+        // upstream fetch across both requests.
+    }
+
+    // -----------------------------------------------------------------------
+    // #2066: age-gate enforcement on VIRTUAL npm tarball downloads
+    // -----------------------------------------------------------------------
+
+    /// A gated Remote member of a virtual npm repo must block a YOUNG version's
+    /// tarball (451) even on the pinned-URL download path (metadata is already
+    /// filtered), while an AGED version still streams through the virtual (200).
+    #[tokio::test]
+    async fn test_serve_tarball_virtual_gated_member_blocks_young_allows_old() {
+        use chrono::Utc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "gated-pkg";
+        let now = Utc::now().to_rfc3339();
+        let old = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+
+        let upstream = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": package,
+            "dist-tags": {"latest": "1.0.0"},
+            "time": { "1.0.0": old, "9.9.9": now },
+            "versions": {
+                "1.0.0": {"name": package, "version": "1.0.0",
+                          "dist": {"tarball":
+                              format!("{}/{}/-/{}-1.0.0.tgz", upstream.uri(), package, package)}},
+                "9.9.9": {"name": package, "version": "9.9.9",
+                          "dist": {"tarball":
+                              format!("{}/{}/-/{}-9.9.9.tgz", upstream.uri(), package, package)}},
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+            .mount(&upstream)
+            .await;
+        let tgz: &[u8] = b"\x1f\x8b\x08 aged-npm-tarball";
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{package}-1.0.0.tgz")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz))
+            .mount(&upstream)
+            .await;
+
+        let (member_id, _mkey, member_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, is_public = true, \
+             age_gate_enabled = true, age_gate_min_age_days = 30 WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let young = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            package,
+            &format!("{package}-9.9.9.tgz"),
+        )
+        .await;
+        let aged = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            package,
+            &format!("{package}-1.0.0.tgz"),
+        )
+        .await;
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        let young_status = young.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(
+            young_status,
+            axum::http::StatusCode::from_u16(451).unwrap(),
+            "young version of a gated virtual npm member must be blocked (451)"
+        );
+        let aged_status = aged.map(|r| r.status()).unwrap_or_else(|e| e.status());
+        assert_eq!(
+            aged_status,
+            axum::http::StatusCode::OK,
+            "aged version of a gated virtual npm member must still stream (200)"
+        );
+    }
+
+    /// Attach a freshly created local npm repo as a member of the fixture's
+    /// virtual repo. Returns the member's `(id, key, storage_dir)`.
+    async fn attach_local_member(fx: &tdh::Fixture) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (member_id, member_key, member_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach virtual member");
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        (member_id, member_key, member_dir)
+    }
+
+    /// Drop everything [`attach_local_member`] created.
+    async fn cleanup_member(
+        fx: &tdh::Fixture,
+        member_id: uuid::Uuid,
+        member_dir: &std::path::Path,
+    ) {
+        for sql in [
+            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+            "DELETE FROM artifact_metadata WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = $1)",
+            "DELETE FROM npm_dist_tags WHERE repository_id = $1",
+            "DELETE FROM role_assignments WHERE repository_id = $1",
+            "DELETE FROM artifacts WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(member_id).execute(&fx.pool).await;
+        }
+        let _ = std::fs::remove_dir_all(member_dir);
+    }
+
+    /// End-to-end #2162: local writes must invalidate the virtual repos that
+    /// include the written repo (only remote/virtual packuments are cached).
+    /// The middle step proves the virtual entry actually serves from cache (a
+    /// row seeded behind its back stays invisible); the publish and dist-tag
+    /// steps prove both write paths propagate the invalidation.
+    #[tokio::test]
+    async fn test_publish_and_dist_tag_invalidate_virtual_packument_cache() {
+        use axum::extract::{Path, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::Extension;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) = attach_local_member(&fx).await;
+        let auth = || Some(tdh::make_auth(fx.user_id, &fx.username));
+
+        let published = super::publish_package(
+            &fx.state,
+            auth(),
+            &member_key,
+            "cachepkg",
+            &HeaderMap::new(),
+            publish_body("cachepkg", "1.0.0"),
+        )
+        .await;
+        assert!(published.is_ok(), "publish 1.0.0 must succeed");
+
+        // Warm the virtual repo's computed-packument cache.
+        let (status, warm) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        // Seed a version directly in the member's tables, bypassing the
+        // publish path: a virtual cache HIT must not see it.
+        let member_repo = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member_repo,
+            "npm/cachepkg/9.9.9/cachepkg-9.9.9.tgz",
+            "cachepkg/9.9.9/cachepkg-9.9.9.tgz",
+            "cachepkg",
+            "9.9.9",
+            "application/gzip",
+            bytes::Bytes::from_static(b"tgz"),
+            fx.user_id,
+        )
+        .await;
+        let (_, cached) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        assert!(
+            cached["versions"]["9.9.9"].is_null(),
+            "a fresh virtual cache hit must serve the cached packument, not recompute; \
+             got {cached:?}"
+        );
+
+        // Publish 2.0.0 to the MEMBER: the virtual repo's cache must be
+        // invalidated, so the next read recomputes and now sees BOTH
+        // out-of-band versions.
+        let republished = super::publish_package(
+            &fx.state,
+            auth(),
+            &member_key,
+            "cachepkg",
+            &HeaderMap::new(),
+            publish_body("cachepkg", "2.0.0"),
+        )
+        .await;
+        assert!(republished.is_ok(), "publish 2.0.0 must succeed");
+        let (_, after_publish) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+        assert!(
+            after_publish["versions"]["2.0.0"].is_object()
+                && after_publish["versions"]["9.9.9"].is_object(),
+            "a member publish must invalidate the virtual computed-packument cache; \
+             got {after_publish:?}"
+        );
+
+        // Dist-tag add on the member must invalidate the virtual entry too.
+        let tagged = super::dist_tags_put(
+            State(fx.state.clone()),
+            Extension(auth()),
+            Path((
+                member_key.clone(),
+                "cachepkg".to_string(),
+                "beta".to_string(),
+            )),
+            HeaderMap::new(),
+            bytes::Bytes::from_static(b"\"1.0.0\""),
+        )
+        .await;
+        assert!(tagged.is_ok(), "dist-tag add must succeed");
+        let (_, after_tag) = fetch_packument_json(&fx.state, &fx.repo_key, "cachepkg").await;
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            after_tag["dist-tags"]["beta"].as_str(),
+            Some("1.0.0"),
+            "a member dist-tag add must invalidate the virtual computed-packument cache; \
+             got {after_tag:?}"
+        );
+    }
+
+    /// REST artifact delete (`DELETE /api/v1/repositories/{key}/artifacts/..`)
+    /// must invalidate the computed-packument cache like the format-native
+    /// write paths do: after deleting the member's only version, the virtual
+    /// repo must stop serving the cached packument immediately.
+    #[tokio::test]
+    async fn test_rest_artifact_delete_invalidates_packument_cache() {
+        use axum::extract::{Path, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::Extension;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) = attach_local_member(&fx).await;
+        // Admin: the REST delete path refuses non-admin deletes of released
+        // (immutable) versions; this test targets cache invalidation, not the
+        // immutability gate.
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = true;
+
+        let published = super::publish_package(
+            &fx.state,
+            Some(auth.clone()),
+            &member_key,
+            "delpkg",
+            &HeaderMap::new(),
+            publish_body("delpkg", "1.0.0"),
+        )
+        .await;
+        assert!(published.is_ok(), "publish must succeed");
+
+        // Warm the virtual repo's cache.
+        let (status, warm) = fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        // Delete the only version through the REST handler.
+        let deleted = crate::api::handlers::repositories::delete_artifact(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path((
+                member_key.clone(),
+                "delpkg/1.0.0/delpkg-1.0.0.tgz".to_string(),
+            )),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            deleted.is_ok(),
+            "REST artifact delete must succeed: {deleted:?}"
+        );
+
+        // Without invalidation the virtual repo would keep serving the cached
+        // packument for the whole fresh window; with it, the recompute finds
+        // no versions and the package is gone.
+        let (status_after, after) = fetch_packument_json(&fx.state, &fx.repo_key, "delpkg").await;
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status_after,
+            StatusCode::NOT_FOUND,
+            "REST delete must invalidate the computed-packument cache; got {after:?}"
+        );
+    }
+
+    /// Build a state like [`tdh::build_state`] but with a proxy service and a
+    /// custom fresh TTL for the packument cache, so staleness is reachable
+    /// without sleeping.
+    fn build_state_with_fresh_ttl(
+        fx: &tdh::Fixture,
+        fresh_ttl_secs: u64,
+    ) -> crate::api::SharedState {
+        std::sync::Arc::new(build_app_state_with_fresh_ttl(fx, fresh_ttl_secs))
+    }
+
+    /// Un-shared variant of [`build_state_with_fresh_ttl`] for tests that
+    /// need to swap state fields (e.g. the packument cache) before use.
+    fn build_app_state_with_fresh_ttl(
+        fx: &tdh::Fixture,
+        fresh_ttl_secs: u64,
+    ) -> crate::api::AppState {
+        let mut config = crate::config::Config::test_config();
+        config.storage_path = fx.storage_dir.to_string_lossy().into_owned();
+        config.npm_packument_cache_fresh_ttl_secs = fresh_ttl_secs;
+        let storage: std::sync::Arc<dyn crate::storage::StorageBackend> = std::sync::Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(&config.storage_path),
+        );
+        let registry = std::sync::Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let mut state = crate::api::AppState::new(config, fx.pool.clone(), storage, registry);
+        state.set_proxy_service(tdh::build_proxy_service_with_fs(
+            fx.pool.clone(),
+            fx.storage_dir.to_str().unwrap(),
+        ));
+        state
+    }
+
+    /// Upstream packument body for the wiremock server.
+    fn upstream_packument(package: &str, version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": package,
+                    "version": version,
+                    "dist": {
+                        "tarball": format!(
+                            "https://registry.example.test/{package}/-/{package}-{version}.tgz"
+                        )
+                    }
+                }
+            }
+        })
+    }
+
+    /// Point the fixture's remote repo at `upstream` and drop the proxy's raw
+    /// metadata cache, so the next fetch really consults the (new) upstream.
+    async fn repoint_upstream_and_wipe_proxy_cache(fx: &tdh::Fixture, upstream: &str) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+        std::fs::remove_dir_all(&fx.storage_dir).expect("wipe proxy cache");
+        std::fs::create_dir_all(&fx.storage_dir).expect("recreate storage dir");
+    }
+
+    /// End-to-end #2162 stale-while-revalidate on a remote repo: with a zero
+    /// fresh window every warm hit classifies as stale, so the handler must
+    /// serve the cached body immediately (no inline upstream fetch) and
+    /// refresh in the background — observable because the upstream flips from
+    /// v1 to v2 and the stale hit still serves v1 before the refresh lands v2.
+    #[tokio::test]
+    async fn test_stale_packument_serves_immediately_and_refreshes_in_background() {
+        use axum::http::StatusCode;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/swrpkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_packument("swrpkg", "1.0.0")),
+            )
+            .mount(&mock_server)
+            .await;
+        repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
+        let state = build_state_with_fresh_ttl(&fx, 0);
+
+        // Miss: computes v1 and stores it.
+        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
+
+        // Upstream moves to v2; the raw proxy cache is wiped so the refresh
+        // really refetches.
+        mock_server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/swrpkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_packument("swrpkg", "2.0.0")),
+            )
+            .mount(&mock_server)
+            .await;
+        repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
+
+        // Stale hit: the OLD body is served immediately while the refresh
+        // runs in the background.
+        let (status, stale) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            stale["versions"]["1.0.0"].is_object() && stale["versions"]["2.0.0"].is_null(),
+            "a stale hit must serve the cached body without an inline upstream fetch; \
+             got {stale:?}"
+        );
+
+        // The background refresh eventually stores the recomputed entry.
+        let mut refreshed = stale;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let (_, current) = fetch_packument_json(&state, &fx.repo_key, "swrpkg").await;
+            refreshed = current;
+            if refreshed["versions"]["2.0.0"].is_object() {
+                break;
+            }
+        }
+
+        fx.teardown().await;
+
+        assert!(
+            refreshed["versions"]["2.0.0"].is_object(),
+            "the background refresh must replace the stale entry; got {refreshed:?}"
+        );
+    }
+
+    /// Backend wrapper reporting the cross-replica refresh lease as held by
+    /// another replica (#2248), storage delegated to a real in-process map.
+    /// Denials are counted so the test can synchronize on "the spawned
+    /// refresh consulted the lease" instead of sleeping.
+    struct LeaseDeniedBackend {
+        store: crate::services::npm_packument_cache::InProcessPackumentCache,
+        denials: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::npm_packument_cache::PackumentCacheBackend for LeaseDeniedBackend {
+        async fn get(&self, key: &str) -> Option<crate::services::npm_packument_cache::CacheHit> {
+            self.store.get(key).await
+        }
+        async fn set(
+            &self,
+            key: &str,
+            prefix: &str,
+            entry: crate::services::npm_packument_cache::CachedPackument,
+        ) {
+            self.store.set(key, prefix, entry).await
+        }
+        async fn invalidate_prefix(&self, prefix: &str) {
+            self.store.invalidate_prefix(prefix).await
+        }
+        async fn try_acquire_refresh_lease(
+            &self,
+            _flight_key: &str,
+            _ttl: std::time::Duration,
+        ) -> Option<crate::services::npm_packument_cache::RefreshLease> {
+            self.denials
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// #2248: when another replica already holds the cross-replica refresh
+    /// lease, a stale hit must serve the cached body WITHOUT spawning its own
+    /// upstream refresh (the holder's result reaches this replica through the
+    /// shared cache). The raw proxy cache is wiped after the first fetch, so
+    /// a wrongly-spawned refresh would be observable as a second upstream
+    /// request.
+    #[tokio::test]
+    async fn test_swr_refresh_skipped_when_lease_held_by_another_replica() {
+        use axum::http::StatusCode;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/leasepkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_packument("leasepkg", "1.0.0")),
+            )
+            .mount(&mock_server)
+            .await;
+        repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
+
+        // Zero fresh window (every warm hit classifies stale) over a backend
+        // whose refresh lease is always held elsewhere.
+        let backend = std::sync::Arc::new(LeaseDeniedBackend {
+            store: crate::services::npm_packument_cache::InProcessPackumentCache::new(
+                std::time::Duration::from_secs(3600),
+            ),
+            denials: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut app_state = build_app_state_with_fresh_ttl(&fx, 0);
+        app_state.npm_packument_cache = Some(std::sync::Arc::new(
+            crate::services::npm_packument_cache::NpmPackumentCache::new(
+                backend.clone(),
+                std::time::Duration::ZERO,
+            ),
+        ));
+        let state = std::sync::Arc::new(app_state);
+
+        // Miss: computes v1 inline — the one permitted upstream request.
+        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
+
+        // Drop the raw proxy cache so a (wrongly spawned) refresh could not
+        // be satisfied locally and would have to hit the upstream.
+        repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
+
+        // Stale hit: served from cache; the refresh must be lease-skipped.
+        let (status, stale) = fetch_packument_json(&state, &fx.repo_key, "leasepkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(stale["versions"]["1.0.0"].is_object(), "got {stale:?}");
+
+        // Deterministic synchronization: wait until the spawned refresh has
+        // consulted (and been denied) the lease. A regression that runs the
+        // compute without consulting the lease never increments the counter
+        // and falls through to the assertion after the full window, by which
+        // point its upstream request has landed and fails the count below.
+        for _ in 0..500 {
+            if backend.denials.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let upstream_hits = mock_server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .len();
+
+        fx.teardown().await;
+
+        assert_eq!(
+            upstream_hits, 1,
+            "a denied cross-replica lease must skip the background refresh; \
+             the miss-compute is the only permitted upstream request"
+        );
+    }
+
+    /// Definitive-miss eviction (#2162): when the upstream starts answering
+    /// 404 for a cached packument, the background refresh must EVICT the
+    /// entry — not keep serving the ghost until the stale window ends — so
+    /// unpublishes and takedowns propagate promptly. Transient failures keep
+    /// serving stale (that is the point of SWR); only 404/410 evict.
+    #[tokio::test]
+    async fn test_stale_entry_evicted_when_upstream_returns_404() {
+        use axum::http::StatusCode;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ghostpkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_packument("ghostpkg", "1.0.0")),
+            )
+            .mount(&mock_server)
+            .await;
+        repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
+        let state = build_state_with_fresh_ttl(&fx, 0);
+
+        // Warm the cache with the live packument.
+        let (status, first) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(first["versions"]["1.0.0"].is_object(), "got {first:?}");
+
+        // The package is unpublished upstream: every request now 404s (a
+        // reset wiremock answers 404 to everything). Wipe the raw proxy
+        // cache so the refresh consults the upstream for real.
+        mock_server.reset().await;
+        repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
+
+        // The first request may still serve the stale entry (SWR), but the
+        // refresh it triggers observes the authoritative 404 and evicts, so
+        // requests must converge on 404 rather than the ghost packument.
+        let mut final_status = StatusCode::OK;
+        for _ in 0..50 {
+            let (status, _) = fetch_packument_json(&state, &fx.repo_key, "ghostpkg").await;
+            final_status = status;
+            if final_status == StatusCode::NOT_FOUND {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        fx.teardown().await;
+
+        assert_eq!(
+            final_status,
+            StatusCode::NOT_FOUND,
+            "an authoritative upstream 404 must evict the cached packument"
+        );
+    }
+
+    /// A gzip-accepting client gets the pre-encoded gzip variant back from
+    /// the cache: `Content-Encoding: gzip` set by the handler (so the
+    /// compression layer passes it through), `Vary` declaring both request
+    /// dimensions, and a body that gunzips to the same packument an identity
+    /// client sees.
+    #[tokio::test]
+    async fn test_gzip_variant_served_pre_encoded() {
+        use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, VARY};
+        use axum::http::{HeaderMap, StatusCode};
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gzpkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(upstream_packument("gzpkg", "1.0.0")),
+            )
+            .mount(&mock_server)
+            .await;
+        repoint_upstream_and_wipe_proxy_cache(&fx, &mock_server.uri()).await;
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip".parse().unwrap());
+        // Twice: the first request stores both variants, the second is a
+        // warm gzip hit.
+        for pass in ["cold", "warm"] {
+            let response = super::get_package_metadata_cached(
+                &state,
+                &fx.repo_key,
+                "gzpkg",
+                "http://localhost",
+                &headers,
+            )
+            .await
+            .unwrap_or_else(|error_response| error_response);
+            assert_eq!(response.status(), StatusCode::OK, "{pass} request failed");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+                Some("gzip"),
+                "{pass}: gzip-accepting clients must get the pre-encoded variant"
+            );
+            assert_eq!(
+                response.headers().get(VARY).and_then(|v| v.to_str().ok()),
+                Some("Accept, Accept-Encoding"),
+                "{pass}: pre-encoded responses must declare Vary themselves"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("read body");
+            let mut decoded = Vec::new();
+            GzDecoder::new(&body[..])
+                .read_to_end(&mut decoded)
+                .expect("gunzip cached body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&decoded).expect("parse gunzipped packument");
+            assert!(
+                json["versions"]["1.0.0"].is_object(),
+                "{pass}: gunzipped body must be the packument, got {json:?}"
+            );
+        }
+
         fx.teardown().await;
     }
 }

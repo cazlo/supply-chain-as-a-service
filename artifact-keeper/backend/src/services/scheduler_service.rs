@@ -11,8 +11,10 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::config::Config;
+use crate::services::age_gate_service::AgeGateService;
 use crate::services::analytics_service::AnalyticsService;
 use crate::services::backup_service::{BackupService, BackupType, CreateBackupRequest};
+use crate::services::event_bus::EventBus;
 use crate::services::health_monitor_service::{HealthMonitorService, MonitorConfig};
 use crate::services::lifecycle_service::LifecycleService;
 use crate::services::metrics_service;
@@ -51,6 +53,7 @@ pub fn spawn_all(
     _primary_storage: Arc<dyn crate::storage::StorageBackend>,
     storage_registry: Arc<crate::storage::StorageRegistry>,
     smtp_service: Option<Arc<SmtpService>>,
+    event_bus: Arc<EventBus>,
 ) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
@@ -403,18 +406,64 @@ pub fn spawn_all(
                     }
                 }
 
-                match service.run_blob_gc(blob_gc_dry_run_this_tick).await {
+                // Two-phase mark-and-sweep (#1660). Phase A marks aged orphan
+                // candidates (`pending_delete_at`, a pure row update with no
+                // storage I/O) every tick; Phase B sweeps blobs marked at
+                // least `blob_gc_sweep_grace_secs` ago that are still orphan,
+                // deleting storage then row under the same push-path row lock.
+                // Splitting the phases keeps storage deletion out of the
+                // commit-then-delete TOCTOU: a re-push in the mark->sweep
+                // window resurrects the blob (clears the marker under the lock)
+                // so the sweep skips it. Both phases honour the dry-run /
+                // readiness gate above — in dry-run neither writes nor clears a
+                // marker and nothing is deleted.
+                match service.run_blob_gc_mark(blob_gc_dry_run_this_tick).await {
                     Ok(result) => {
                         if result.dry_run && result.storage_keys_deleted > 0 {
                             tracing::info!(
-                                "Blob GC (dry-run): would reclaim {} blob objects, {} bytes \
+                                "Blob GC (dry-run): would mark {} orphan blobs pending deletion \
+                                 (set BLOB_GC_ENABLED=true to enable mark-and-sweep)",
+                                result.storage_keys_deleted,
+                            );
+                        } else if !result.dry_run && result.storage_keys_deleted > 0 {
+                            tracing::info!(
+                                "Blob GC: marked {} orphan blobs pending deletion",
+                                result.storage_keys_deleted,
+                            );
+                        }
+                        if !result.errors.is_empty() {
+                            tracing::warn!(
+                                "Blob GC mark completed with {} errors",
+                                result.errors.len()
+                            );
+                            for err in &result.errors {
+                                tracing::warn!(gc_error = %err, "Blob GC mark error");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Blob GC mark pass failed: {}", e);
+                    }
+                }
+
+                match service
+                    .run_blob_gc_sweep(
+                        blob_gc_dry_run_this_tick,
+                        config_clone.blob_gc_sweep_grace_secs as i64,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        if result.dry_run && result.storage_keys_deleted > 0 {
+                            tracing::info!(
+                                "Blob GC (dry-run): would sweep {} marked blob objects, {} bytes \
                                  (set BLOB_GC_ENABLED=true to delete)",
                                 result.storage_keys_deleted,
                                 result.bytes_freed
                             );
                         } else if !result.dry_run && result.storage_keys_deleted > 0 {
                             tracing::info!(
-                                "Blob GC: deleted {} blob objects, freed {} bytes",
+                                "Blob GC: swept {} blob objects, freed {} bytes",
                                 result.storage_keys_deleted,
                                 result.bytes_freed
                             );
@@ -424,14 +473,17 @@ pub fn spawn_all(
                             );
                         }
                         if !result.errors.is_empty() {
-                            tracing::warn!("Blob GC completed with {} errors", result.errors.len());
+                            tracing::warn!(
+                                "Blob GC sweep completed with {} errors",
+                                result.errors.len()
+                            );
                             for err in &result.errors {
-                                tracing::warn!(gc_error = %err, "Blob GC error");
+                                tracing::warn!(gc_error = %err, "Blob GC sweep error");
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Blob garbage collection failed: {}", e);
+                        tracing::warn!("Blob GC sweep pass failed: {}", e);
                     }
                 }
             }
@@ -642,8 +694,43 @@ pub fn spawn_all(
         });
     }
 
+    // Age-gate auto-approval sweep (every 5 minutes).
+    //
+    // The npm packument / PyPI simple-index filters intentionally do NOT flip a
+    // pending review to `approved` when its version crosses the age threshold —
+    // that would be a write on a cacheable metadata GET. Instead this sweep does
+    // the bookkeeping off the request path: one UPDATE per tick approves every
+    // pending review whose version has aged past its repo's threshold. Serving is
+    // unaffected in the interim (the filters decide directly from the publish
+    // timestamp), so this only keeps the review queue's persisted status accurate.
+    // The UPDATE is idempotent and row-locked, so running it on multiple replicas
+    // is safe; startup jitter de-synchronizes replicas' first tick.
+    {
+        let db = db.clone();
+        let event_bus = event_bus.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(75)).await;
+            let service = AgeGateService::new(db, event_bus);
+            let mut ticker = interval(Duration::from_secs(300)); // 5 minutes
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+                match service.auto_approve_aged_reviews().await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("Age-gate sweep: auto-approved {} aged review(s)", n);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Age-gate auto-approval sweep failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval"
     );
 }
 
@@ -872,6 +959,8 @@ async fn run_curation_sync_cycle(
                 }
                 match primary_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
+                        #[allow(clippy::disallowed_methods)]
+                        // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
                         let bytes = resp.bytes().await?;
                         let xml = if primary_path.ends_with(".gz") {
                             use std::io::Read;
@@ -903,6 +992,8 @@ async fn run_curation_sync_cycle(
                 }
                 match packages_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
+                        #[allow(clippy::disallowed_methods)]
+                        // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
                         let bytes = resp.bytes().await?;
                         use std::io::Read;
                         let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);

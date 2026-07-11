@@ -38,10 +38,12 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
 use crate::formats::debian::{DebControl, DebianHandler};
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::signing_key::SigningKey;
 use crate::services::artifact_service::ArtifactService;
+use crate::services::cache_classifier;
 use crate::services::package_service::PackageService;
+use crate::services::proxy_service::{ProxyService, DEFAULT_DISTS_INDEX_TTL_SECS};
 use crate::services::signing_service::SigningService;
 
 const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
@@ -538,6 +540,7 @@ impl<'a> DebianProxy<'a> {
                 self.state,
                 repo.id,
                 self.repo_key,
+                self.distribution,
                 &upstream_path,
                 content_type,
             )
@@ -556,20 +559,31 @@ impl<'a> DebianProxy<'a> {
             _ => return Ok(()),
         };
         let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
-        let (content, upstream_ct) =
-            proxy_helpers::proxy_fetch(proxy, repo.id, self.repo_key, upstream_url, &upstream_path)
-                .await?;
+
+        // Epoch-based lazy invalidation: if the cached file is older
+        // than the release epoch, invalidate it so the streaming fetch
+        // treats it as a cache miss and re-fetches from upstream.
+        maybe_invalidate_by_epoch(proxy, self.repo_key, self.distribution, &upstream_path).await;
+
+        let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
+            proxy,
+            repo.id,
+            self.repo_key,
+            upstream_url,
+            &upstream_path,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await?;
         Err(build_dists_response(content, upstream_ct, content_type))
     }
 
-    /// Variant of `dists` that also detects whether the upstream content
-    /// changed since the last cached copy. When it has, sibling Packages
-    /// caches under the same distribution are invalidated so subsequent
-    /// `apt-get update` requests refetch them and the Release SHA-256
-    /// list matches what apt sees (#1147).
+    /// Variant of `dists` that uses TTL + conditional-request +
+    /// epoch-based lazy invalidation for Release/InRelease files.
     ///
-    /// Used by the Release / InRelease handlers, where stale Packages
-    /// caches manifest as `Hash Sum mismatch` errors on the client.
+    /// Sibling files compare their own `cached_at` against the release
+    /// epoch timestamp to decide freshness at read time.
+    ///
+    /// Used by the Release / InRelease handlers.
     async fn dists_detecting_change(
         &self,
         suffix: &str,
@@ -578,10 +592,7 @@ impl<'a> DebianProxy<'a> {
     ) -> Result<(), Response> {
         let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
 
-        // Virtual: iterate Remote members. Whichever member serves the
-        // Release also owns the sibling Packages caches we may need to
-        // invalidate, so we run the change-detection probe against that
-        // specific member before returning.
+        // Virtual: iterate Remote members.
         if repo.repo_type == RepositoryType::Virtual {
             if let Some(resp) = try_virtual_dists_detecting_change(
                 self.state,
@@ -608,14 +619,16 @@ impl<'a> DebianProxy<'a> {
 
         let pseudo_repo = proxy_helpers::build_remote_repo(repo.id, self.repo_key, upstream_url);
         let (content, upstream_ct, changed) = proxy
-            .fetch_dists_detecting_change(&pseudo_repo, &upstream_path)
+            .fetch_dists_with_revalidation(
+                &pseudo_repo,
+                &upstream_path,
+                self.distribution,
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
             .await
             .map_err(map_proxy_err)?;
 
-        if let Some(text) = release_invalidation_payload(changed, &content) {
-            proxy
-                .invalidate_dist_packages_cache(self.repo_key, self.distribution, text)
-                .await;
+        if changed {
             // Drop any signed-Release entries for this dist; the next
             // InRelease / Release.gpg fetch will re-sign against the new
             // content (#1236).
@@ -657,19 +670,6 @@ fn remote_member_upstream(member: &crate::models::repository::Repository) -> Opt
     member.upstream_url.as_deref()
 }
 
-/// Pure helper that decides whether an upstream Release body should
-/// trigger sibling-Packages cache invalidation (#1147). Returns the
-/// decoded UTF-8 body when the caller should invalidate, `None` when
-/// the body either didn't change or isn't valid UTF-8. Factoring this
-/// out makes the change-detection branch testable without a real
-/// proxy fetch.
-fn release_invalidation_payload(changed: bool, content: &[u8]) -> Option<&str> {
-    if !changed {
-        return None;
-    }
-    std::str::from_utf8(content).ok()
-}
-
 // ---------------------------------------------------------------------------
 // Signed-Release cache helpers (#1236)
 //
@@ -678,8 +678,8 @@ fn release_invalidation_payload(changed: bool, content: &[u8]) -> Option<&str> {
 // by SHA-256(unsigned Release || key fingerprint). The fingerprint is in the
 // key so that a key rotation naturally invalidates the prior signature, and
 // the content prefix means any Release flip rotates the key without needing
-// an explicit invalidation pass — though we also evict eagerly from the
-// change-detect path to keep the cache from growing unboundedly.
+// an explicit invalidation pass — though we also evict from the revalidation
+// path to keep the cache from growing unboundedly.
 // ---------------------------------------------------------------------------
 
 /// Variant tag included in cache keys so InRelease and Release.gpg cannot
@@ -753,9 +753,9 @@ async fn signed_release_cache_put(
 }
 
 /// Evict all signed-Release entries belonging to the given
-/// `(repo_key, distribution)`. Called from the change-detection paths so
-/// that an upstream Release flip drops the matching signed copies in
-/// lock-step with the sibling-Packages eviction in `proxy_service`.
+/// `(repo_key, distribution)`. Called from the revalidation path so
+/// that an upstream Release flip drops the matching signed copies
+/// when content changes.
 async fn signed_release_cache_invalidate(state: &SharedState, repo_key: &str, distribution: &str) {
     let key = (repo_key.to_string(), distribution.to_string());
     let drained = {
@@ -795,11 +795,24 @@ async fn require_active_signing_key(
 }
 
 /// Iterate the virtual repo's Remote members for `upstream_path` and
-/// return the first successful response.
+/// return the first successful response. Checks the release epoch for
+/// lazy invalidation before attempting the streaming fetch.
+///
+/// Error propagation:
+///   * `404 / NotFound` — the member genuinely doesn't have this file;
+///     continue to the next member.
+///   * Non-404 (502 cap-exceeded, 503 upstream-down, etc.) — record the
+///     first occurrence but **continue** to the next member so a
+///     transient failure on a higher-priority mirror doesn't block a
+///     healthy lower-priority one. If all members fail, the first
+///     non-404 error is returned so the client sees the real cause. If
+///     every member returned 404, `Ok(None)` lets the caller fall through
+///     to the local-DB path (hosted repos).
 async fn try_virtual_dists(
     state: &SharedState,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
+    distribution: &str,
     upstream_path: &str,
     default_content_type: &'static str,
 ) -> Result<Option<Response>, Response> {
@@ -808,12 +821,24 @@ async fn try_virtual_dists(
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
     };
+    let mut first_err: Option<Response> = None;
     for member in &members {
         let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
         };
-        match proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, upstream_path)
-            .await
+
+        // Epoch-based lazy invalidation for this member's cache entry
+        maybe_invalidate_by_epoch(proxy, &member.key, distribution, upstream_path).await;
+
+        match proxy_helpers::proxy_fetch_capped(
+            proxy,
+            member.id,
+            &member.key,
+            upstream_url,
+            upstream_path,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
         {
             Ok((content, upstream_ct)) => {
                 return Ok(Some(build_dists_response(
@@ -822,19 +847,62 @@ async fn try_virtual_dists(
                     default_content_type,
                 )));
             }
-            Err(_) => {
-                // Try the next member.
-                continue;
+            Err(resp) => {
+                if resp.status() == StatusCode::NOT_FOUND {
+                    continue;
+                }
+                first_err.get_or_insert(resp);
             }
         }
     }
-    Ok(None)
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
 }
 
-/// Change-detection variant of [`try_virtual_dists`]. Used for
-/// Release/InRelease so that any upstream change invalidates the matching
-/// member's sibling `Packages*` caches before the client tries to fetch
-/// them (#1147).
+/// Check the release epoch and invalidate the cache entry if stale.
+/// Dependent files are invalidated on demand when next requested,
+/// not eagerly when Release changes.
+async fn maybe_invalidate_by_epoch(
+    proxy: &ProxyService,
+    repo_key: &str,
+    distribution: &str,
+    path: &str,
+) {
+    // Immutable paths (by-hash, pool/) never need epoch invalidation —
+    // their content is pinned, so a Release change cannot affect them.
+    if cache_classifier::classify(&RepositoryFormat::Debian, path).is_immutable() {
+        return;
+    }
+
+    let metadata_key = match ProxyService::cache_metadata_key(repo_key, path) {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    let metadata = match proxy.load_cache_metadata_pub(&metadata_key).await {
+        Some(m) => m,
+        None => return,
+    };
+
+    if proxy
+        .is_dists_epoch_expired(repo_key, distribution, metadata.cached_at)
+        .await
+    {
+        let _ = proxy.invalidate_cache_by_key(repo_key, path).await;
+    }
+}
+
+/// Change-detection variant of [`try_virtual_dists`]. Uses TTL +
+/// conditional-request + epoch-based lazy invalidation for virtual repo
+/// members' Release/InRelease files.
+///
+/// Error propagation mirrors [`try_virtual_dists`]:
+///   * `NotFound` (404) — continue to the next member.
+///   * Non-404 — record the first occurrence but continue; return it
+///     only if no member succeeds. This preserves multi-mirror failover
+///     while still surfacing real failures (502, 503, etc.) instead of
+///     silently falling through to an empty local DB.
 async fn try_virtual_dists_detecting_change(
     state: &SharedState,
     virtual_repo_id: uuid::Uuid,
@@ -848,20 +916,23 @@ async fn try_virtual_dists_detecting_change(
     let Some(proxy) = state.proxy_service.as_deref() else {
         return Ok(None);
     };
+    let mut first_err: Option<Response> = None;
     for member in &members {
         let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
         };
         let pseudo_repo = proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
         match proxy
-            .fetch_dists_detecting_change(&pseudo_repo, upstream_path)
+            .fetch_dists_with_revalidation(
+                &pseudo_repo,
+                upstream_path,
+                distribution,
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
             .await
         {
             Ok((content, upstream_ct, changed)) => {
-                if let Some(text) = release_invalidation_payload(changed, &content) {
-                    proxy
-                        .invalidate_dist_packages_cache(&member.key, distribution, text)
-                        .await;
+                if changed {
                     signed_release_cache_invalidate(state, &member.key, distribution).await;
                 }
                 return Ok(Some(build_dists_response(
@@ -870,10 +941,18 @@ async fn try_virtual_dists_detecting_change(
                     default_content_type,
                 )));
             }
-            Err(_) => continue,
+            Err(e) => {
+                if matches!(e, crate::error::AppError::NotFound(_)) {
+                    continue;
+                }
+                first_err.get_or_insert(map_proxy_err(e));
+            }
         }
     }
-    Ok(None)
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
 }
 
 fn map_proxy_err(e: crate::error::AppError) -> Response {
@@ -882,7 +961,7 @@ fn map_proxy_err(e: crate::error::AppError) -> Response {
 }
 
 /// Pure helper that decides the HTTP status and message for an
-/// `AppError` returned from `ProxyService::fetch_dists_detecting_change`.
+/// `AppError` returned from `ProxyService::fetch_dists_with_revalidation`.
 /// Factored out of [`map_proxy_err`] so the mapping table can be unit
 /// tested without constructing an `axum::Response`.
 fn proxy_err_status_and_message(e: &crate::error::AppError) -> (StatusCode, String) {
@@ -989,8 +1068,8 @@ async fn release_gpg(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     // Release.gpg is the detached signature of Release. We do not need
-    // change-detection here because the matching Release fetch (called
-    // by apt before Release.gpg) already drove invalidation.
+    // revalidation here because the matching Release fetch (called
+    // by apt before Release.gpg) already drove epoch invalidation.
     proxy
         .dists("Release.gpg", "application/pgp-signature", &repo)
         .await?;
@@ -1271,6 +1350,7 @@ async fn dists_proxy_catchall(
             &state,
             repo.id,
             &repo_key,
+            &distribution,
             &upstream_path,
             "text/plain; charset=utf-8",
         )
@@ -1287,8 +1367,19 @@ async fn dists_proxy_catchall(
         _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
     };
 
-    let (content, upstream_ct) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path).await?;
+    // Epoch-based lazy invalidation for mutable dists/ paths.
+    // Immutable paths (by-hash) are skipped by maybe_invalidate_by_epoch.
+    maybe_invalidate_by_epoch(proxy, &repo_key, &distribution, &upstream_path).await;
+
+    let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
+        proxy,
+        repo.id,
+        &repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await?;
 
     let content_type = upstream_ct.unwrap_or_else(|| content_type_for_dists_path(&dists_path));
 
@@ -1992,6 +2083,8 @@ mod tests {
             curation_default_action: "allow".to_string(),
             curation_sync_interval_secs: 0,
             curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2026,40 +2119,6 @@ mod tests {
     fn test_remote_member_upstream_returns_url_for_valid_remote() {
         let m = test_member(RepositoryType::Remote, Some("https://deb.debian.org"));
         assert_eq!(remote_member_upstream(&m), Some("https://deb.debian.org"));
-    }
-
-    // -----------------------------------------------------------------------
-    // release_invalidation_payload (#1147)
-    //
-    // Pure helper that gates sibling-Packages cache invalidation on both
-    // the change flag AND UTF-8 decodability of the body.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_release_invalidation_payload_skips_when_unchanged() {
-        // Even a perfectly valid Release body must not trigger cache
-        // invalidation when the upstream content was identical to the
-        // cached copy. Otherwise apt-get update would needlessly
-        // churn sibling caches on every poll.
-        let release = b"SHA256:\n abc 100 main/binary-amd64/Packages\n";
-        assert!(release_invalidation_payload(false, release).is_none());
-    }
-
-    #[test]
-    fn test_release_invalidation_payload_returns_text_when_changed() {
-        let release = b"SHA256:\n abc 100 main/binary-amd64/Packages\n";
-        let got = release_invalidation_payload(true, release);
-        assert!(got.is_some());
-        assert!(got.unwrap().contains("main/binary-amd64/Packages"));
-    }
-
-    #[test]
-    fn test_release_invalidation_payload_skips_non_utf8_body() {
-        // A malicious or corrupted upstream that serves binary garbage
-        // under the `Release` URL must not crash the handler; the
-        // invalidation step is silently skipped.
-        let garbage: &[u8] = &[0xff, 0xfe, 0xfd, 0xfc];
-        assert!(release_invalidation_payload(true, garbage).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -2789,21 +2848,6 @@ mod tests {
         assert!(parse_packages_request("main/binary-amd64/Release").is_none());
     }
 
-    #[test]
-    fn test_release_invalidation_payload_changed() {
-        // Non-empty bytes + changed -> Some(snippet) so the caller emits
-        // a webhook payload. Empty bytes still returns Some but with the
-        // empty string.
-        let payload = release_invalidation_payload(true, b"foo bar baz");
-        assert!(payload.is_some());
-    }
-
-    #[test]
-    fn test_release_invalidation_payload_unchanged_is_none() {
-        // changed = false -> None; no webhook fires.
-        assert!(release_invalidation_payload(false, b"any content").is_none());
-    }
-
     // ---------------------------------------------------------------------
     // signed_release_cache_key (#1236)
     //
@@ -3068,5 +3112,331 @@ mod upload_db_tests {
         assert!(release.contains("main/binary-amd64/Packages.xz\n"));
 
         f.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual `dists/` member-iteration error propagation + large-index cap (#2267,
+// #2278). These exercise `try_virtual_dists`:
+//   * a >8 MiB Packages.xz now succeeds (LARGE_METADATA_MAX_BYTES ceiling) and
+//     is served/cached instead of tripping the old 8 MiB DEFAULT cap (502);
+//   * a genuine non-404 upstream failure is SURFACED to the client rather than
+//     swallowed via `Err(_) => continue` into an `Ok(None)` that fell through
+//     to an empty local-DB 200 (`apt`'s "File has unexpected size");
+//   * a 404 member is still skipped so the caller can fall through to the
+//     local-DB (hosted) path or the next mirror.
+#[cfg(test)]
+mod virtual_dists_cap_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const DIST: &str = "trixie";
+    const PKG_PATH: &str = "dists/trixie/main/binary-amd64/Packages.xz";
+
+    /// Insert a Remote Debian repo pointing at `upstream_url` and enrol it as a
+    /// member of a fresh Virtual repo. Returns `(virtual_id, virtual_key,
+    /// member_id)`; callers clean up via [`cleanup`].
+    async fn virtual_with_remote_member(
+        pool: &sqlx::PgPool,
+        storage_path: &str,
+        upstream_url: &str,
+    ) -> (Uuid, String, Uuid) {
+        let member_id = Uuid::new_v4();
+        let member_key = format!("dbg-mem-{}", member_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url) \
+             VALUES ($1, $2, $3, $4, 'remote'::repository_type, 'debian'::repository_format, $5)",
+        )
+        .bind(member_id)
+        .bind(&member_key)
+        .bind(&member_key)
+        .bind(storage_path)
+        .bind(upstream_url)
+        .execute(pool)
+        .await
+        .expect("insert remote member");
+
+        let virtual_id = Uuid::new_v4();
+        let virtual_key = format!("dbg-virt-{}", virtual_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'debian'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(storage_path)
+        .execute(pool)
+        .await
+        .expect("insert virtual repo");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("insert virtual member");
+        (virtual_id, virtual_key, member_id)
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, virtual_id: Uuid, member_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![virtual_id, member_id])
+            .execute(pool)
+            .await;
+    }
+
+    // A 9 MiB Packages.xz — above the 8 MiB DEFAULT ceiling that used to 502 —
+    // is fetched, served 200, and cached (second call issues no second upstream
+    // request). Proves the DEFAULT->LARGE (128 MiB) tier switch for dists.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // to_bytes on a bounded in-memory test body
+    async fn large_packages_index_above_default_cap_succeeds_and_caches() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = vec![0x5au8; 9 * 1024 * 1024];
+        assert!(
+            body.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES
+                && body.len() < proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            "fixture must straddle DEFAULT and LARGE so success implies the LARGE tier",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{PKG_PATH}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-cap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let first = try_virtual_dists(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            PKG_PATH,
+            "application/octet-stream",
+        )
+        .await;
+        let second = try_virtual_dists(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            PKG_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let hits = server.received_requests().await.unwrap().len();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let resp = first
+            .expect("large index must not error")
+            .expect("large index must resolve via the remote member");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(got.len(), body.len(), "full 9 MiB body must be served");
+        assert!(
+            second.is_ok_and(|o| o.is_some()),
+            "second read must still resolve",
+        );
+        assert_eq!(hits, 1, "second read must be served warm from cache");
+    }
+
+    // A genuine non-404 upstream failure (here a 5xx that folds to 502/503) must
+    // SURFACE as an Err so the client sees the real cause — not be swallowed into
+    // `Ok(None)` and rendered as an empty 200 (the #2278 `apt` size-mismatch bug).
+    #[tokio::test]
+    async fn upstream_failure_surfaces_instead_of_empty_200() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{PKG_PATH}")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-502-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let out = try_virtual_dists(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            PKG_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let resp = out.expect_err(
+            "a genuine upstream failure must surface as Err, not be masked into Ok(None)/empty-200",
+        );
+        assert!(
+            resp.status().is_server_error(),
+            "the real upstream failure status must reach the client, got {}",
+            resp.status(),
+        );
+    }
+
+    // A member that 404s for the path is skipped (the file genuinely is not
+    // there), so the dispatcher returns Ok(None) and the caller falls through to
+    // the local-DB / next-mirror path. This is the arm that must NOT be treated
+    // as a hard failure — the discriminator only surfaces non-404 errors.
+    #[tokio::test]
+    async fn missing_member_file_falls_through_to_none() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{PKG_PATH}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-404-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let out = try_virtual_dists(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            PKG_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            matches!(out, Ok(None)),
+            "a 404 member must fall through to Ok(None), got {:?}",
+            out.map(|o| o.map(|r| r.status())),
+        );
+    }
+
+    // The change-detecting variant (Release/InRelease revalidation path) applies
+    // the same NotFound-vs-real-error discrimination: a 5xx upstream surfaces as
+    // an Err instead of `Ok(None)` (which would have fallen through to an empty
+    // signed Release), while a 404 member is skipped.
+    const INRELEASE_PATH: &str = "dists/trixie/InRelease";
+
+    #[tokio::test]
+    async fn detecting_change_upstream_failure_surfaces() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{INRELEASE_PATH}")))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-dc502-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let out = try_virtual_dists_detecting_change(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            INRELEASE_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let resp = out.expect_err("a 5xx upstream must surface as Err, not empty Ok(None)");
+        assert!(
+            resp.status().is_server_error(),
+            "real upstream failure status must reach the client, got {}",
+            resp.status(),
+        );
+    }
+
+    #[tokio::test]
+    async fn detecting_change_missing_member_falls_through_to_none() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{INRELEASE_PATH}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("dbg-dc404-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (virtual_id, virtual_key, member_id) =
+            virtual_with_remote_member(&pool, root, &server.uri()).await;
+
+        let out = try_virtual_dists_detecting_change(
+            &state,
+            virtual_id,
+            &virtual_key,
+            DIST,
+            INRELEASE_PATH,
+            "application/octet-stream",
+        )
+        .await;
+
+        cleanup(&pool, virtual_id, member_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            matches!(out, Ok(None)),
+            "a 404 member must fall through to Ok(None), got {:?}",
+            out.map(|o| o.map(|r| r.status())),
+        );
     }
 }

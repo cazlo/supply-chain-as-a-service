@@ -1333,7 +1333,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(auth.require_admin().is_ok());
     }
@@ -1348,7 +1349,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         let err = auth.require_admin().unwrap_err();
         assert!(
@@ -1368,7 +1370,8 @@ mod tests {
             is_api_token: true,
             is_service_account: false,
             scopes: Some(vec!["read".to_string(), "write".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(auth.require_admin().is_err());
     }
@@ -1383,7 +1386,8 @@ mod tests {
             is_api_token: true,
             is_service_account: false,
             scopes: Some(vec!["admin".to_string()]),
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(auth.require_admin().is_ok());
     }
@@ -1398,7 +1402,8 @@ mod tests {
             is_api_token: false,
             is_service_account: true,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(auth.require_admin().is_err());
     }
@@ -1417,7 +1422,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(!auth.is_admin);
         // Exercises the real guard used by `get_identity` (auth.require_admin()).
@@ -1441,7 +1447,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         };
         assert!(auth.is_admin);
         // Exercises the real guard used by `get_identity` (auth.require_admin()).
@@ -1636,7 +1643,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 
@@ -1650,7 +1658,8 @@ mod tests {
             is_api_token: false,
             is_service_account: false,
             scopes: None,
-            allowed_repo_ids: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
         }
     }
 

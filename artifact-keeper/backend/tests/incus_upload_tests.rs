@@ -8,6 +8,7 @@
 //!   cargo test --test incus_upload_tests -- --ignored
 //! ```
 
+#![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -59,6 +60,8 @@ fn test_config(storage_path: &str) -> Config {
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
         guest_access_enabled: true,
+        expose_detailed_health: false,
+        grpc_reflection_enabled: false,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         peer_instance_name: "test".into(),
@@ -70,6 +73,7 @@ fn test_config(storage_path: &str) -> Config {
         otel_service_name: "test".into(),
         gc_schedule: "0 0 * * * *".into(),
         blob_gc_enabled: false,
+        blob_gc_sweep_grace_secs: 3600,
         lifecycle_check_interval_secs: 60,
         stuck_scan_threshold_secs: 1800,
         stuck_scan_check_interval_secs: 600,
@@ -94,6 +98,8 @@ fn test_config(storage_path: &str) -> Config {
         rate_limit_password_change_per_window: 5,
         rate_limit_password_change_window_secs: 900,
         rate_limit_login_global_per_window: 8192,
+        rate_limit_login_per_window: 10,
+        rate_limit_login_window_secs: 900,
         rate_limit_window_secs: 60,
         rate_limit_exempt_usernames: Vec::new(),
         rate_limit_exempt_service_accounts: false,
@@ -116,12 +122,19 @@ fn test_config(storage_path: &str) -> Config {
         password_min_strength: 0,
         presigned_downloads_enabled: false,
         presigned_download_expiry_secs: 300,
+        proxy_singleflight_advisory_locks_enabled: false,
+        proxy_singleflight_lock_poll_interval_ms: 200,
+        proxy_singleflight_lock_wait_timeout_secs: 65,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,
         smtp_password: None,
         smtp_from_address: "noreply@artifact-keeper.local".to_string(),
         smtp_tls_mode: "starttls".to_string(),
+        npm_packument_cache_enabled: true,
+        npm_packument_cache_fresh_ttl_secs: 300,
+        npm_packument_cache_stale_max_secs: 86_400,
+        npm_packument_cache_redis_url: None,
     }
 }
 

@@ -14,7 +14,7 @@ use axum::{
 // 400 VALIDATION_ERROR (structured envelope) instead of Axum's stock 422
 // + plain-text body. Drop-in for both request extraction and responses
 // (#1783 LOW: POST /auth/login returned 422 for missing `username`).
-use crate::api::extractors::Json;
+use crate::api::extractors::{request_scheme_is_https, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
@@ -22,7 +22,10 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
+use crate::services::audit_service::{
+    api_token_audit_entry, audit_fire_and_forget, AuditAction, AuditEntry, AuditService,
+    ResourceType,
+};
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_service::AuthService;
 use std::sync::atomic::Ordering;
@@ -43,9 +46,14 @@ async fn audit_auth(
 }
 
 /// Build a login/refresh response with auth cookies set.
+///
+/// `client_is_https` carries the per-request HTTPS signal (see
+/// [`request_scheme_is_https`]) so the cookie `Secure` flag auto-follows a
+/// TLS-terminating reverse proxy.
 fn login_response(
     tokens: &crate::services::auth_service::TokenPair,
     must_change_password: bool,
+    client_is_https: bool,
 ) -> Response {
     let body = LoginResponse {
         access_token: tokens.access_token.clone(),
@@ -62,6 +70,7 @@ fn login_response(
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
+        client_is_https,
     );
     response
 }
@@ -262,8 +271,10 @@ async fn enforce_local_login_sso_policy(
 )]
 pub async fn login(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
     // The bcrypt-bound auth-concurrency cap (#991, #1088) is enforced
     // inside `AuthService::verify_password` itself, so every entry point
     // that runs bcrypt (local login, API-token verify, basic-auth
@@ -327,7 +338,11 @@ pub async fn login(
     }
     audit_auth(&state, AuditAction::Login, Some(user.id), login_details).await;
 
-    Ok(login_response(&tokens, user.must_change_password))
+    Ok(login_response(
+        &tokens,
+        user.must_change_password,
+        client_is_https,
+    ))
 }
 
 /// Logout current session
@@ -379,7 +394,7 @@ pub async fn logout(
     }
 
     let mut response = ().into_response();
-    clear_auth_cookies(response.headers_mut());
+    clear_auth_cookies(response.headers_mut(), request_scheme_is_https(&headers));
     Ok(response)
 }
 
@@ -418,7 +433,11 @@ pub async fn refresh_token(
     )
     .await;
 
-    Ok(login_response(&tokens, user.must_change_password))
+    Ok(login_response(
+        &tokens,
+        user.must_change_password,
+        request_scheme_is_https(&headers),
+    ))
 }
 
 /// Get current user info
@@ -514,6 +533,18 @@ pub async fn create_api_token(
         )
         .await?;
 
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            auth.user_id,
+            id,
+            Some(&payload.name),
+            "user_self",
+        ),
+    )
+    .await;
+
     Ok(Json(CreateApiTokenResponse {
         id,
         token,
@@ -534,24 +565,64 @@ pub(crate) fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&
         })
 }
 
-/// Returns the `Secure;` cookie flag unless running in development mode,
-/// where cookies must work over plain HTTP on localhost.
-fn secure_flag() -> &'static str {
-    if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" {
-        ""
-    } else {
+/// Returns the `Secure;` cookie flag for the auth cookies, or `""` when the
+/// cookie must be sent over plain HTTP.
+///
+/// The `Secure` attribute is emitted when the request is NOT in `development`
+/// mode AND either:
+/// * `AK_ENFORCE_HTTPS` is truthy ("true"/"1") — the static override for
+///   proxies that terminate TLS but do NOT set `X-Forwarded-Proto`; or
+/// * `client_is_https` is true — the request reached the trusted edge over
+///   HTTPS, as signalled per-request by `X-Forwarded-Proto: https` (see
+///   [`request_scheme_is_https`]).
+///
+/// This auto-detects HTTPS behind a TLS-terminating reverse proxy (#2233
+/// follow-up): the app receives requests over internal HTTP but honours the
+/// SAME `X-Forwarded-Proto` signal that base-URL construction already trusts,
+/// so `Secure` cookies work without remembering to set a static flag. A plain
+/// HTTP request (no header, no flag) still yields non-`Secure` cookies so a
+/// default deployment works out of the box; `#2233` made this impossible over
+/// HTTP when any non-`development` ENVIRONMENT unconditionally emitted `Secure`
+/// (login 200 → /auth/me 401). Development mode remains non-`Secure`
+/// regardless (backwards compat: dev works on localhost HTTP).
+///
+/// SECURITY: trusting `X-Forwarded-Proto` is the SAME trust posture the
+/// base-URL logic already has — it assumes a trusted proxy that OVERWRITES
+/// (not appends) client-supplied `X-Forwarded-Proto`. A client spoofing
+/// `X-Forwarded-Proto: https` over a real HTTP connection only makes their OWN
+/// cookie `Secure` (which the browser then won't resend over that HTTP
+/// connection) — self-defeating, not a privilege escalation. Operators
+/// terminating TLS at a proxy MUST have the proxy overwrite `X-Forwarded-Proto`.
+fn secure_flag(client_is_https: bool) -> &'static str {
+    let is_development = std::env::var("ENVIRONMENT").unwrap_or_default() == "development";
+    let enforce_https = matches!(
+        std::env::var("AK_ENFORCE_HTTPS")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "true" | "1"
+    );
+    if !is_development && (enforce_https || client_is_https) {
         " Secure;"
+    } else {
+        ""
     }
 }
 
 /// Set httpOnly auth cookies on a response.
+///
+/// `client_is_https` is the per-request HTTPS signal (see
+/// [`request_scheme_is_https`]); it feeds [`secure_flag`] so the `Secure`
+/// attribute auto-follows a TLS-terminating reverse proxy. `HttpOnly` and
+/// `SameSite=Strict` are always set.
 pub(crate) fn set_auth_cookies(
     headers: &mut HeaderMap,
     access_token: &str,
     refresh_token: &str,
     expires_in: u64,
+    client_is_https: bool,
 ) {
-    let flag = secure_flag();
+    let flag = secure_flag(client_is_https);
     let access_cookie = format!(
         "ak_access_token={}; HttpOnly;{} SameSite=Strict; Path=/; Max-Age={}",
         access_token, flag, expires_in
@@ -566,8 +637,12 @@ pub(crate) fn set_auth_cookies(
 }
 
 /// Clear auth cookies by setting Max-Age=0.
-fn clear_auth_cookies(headers: &mut HeaderMap) {
-    let flag = secure_flag();
+///
+/// The cleared cookies carry the same attributes as the ones they replace, so
+/// `client_is_https` gates their `Secure` flag identically to
+/// [`set_auth_cookies`].
+fn clear_auth_cookies(headers: &mut HeaderMap, client_is_https: bool) {
+    let flag = secure_flag(client_is_https);
     let clear_access = format!(
         "ak_access_token=; HttpOnly;{} SameSite=Strict; Path=/; Max-Age=0",
         flag
@@ -606,6 +681,18 @@ pub async fn revoke_api_token(
     auth_service
         .revoke_api_token(token_id, auth.user_id)
         .await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        api_token_audit_entry(
+            AuditAction::ApiTokenRevoked,
+            auth.user_id,
+            token_id,
+            None,
+            "user_self",
+        ),
+    )
+    .await;
 
     Ok(())
 }
@@ -824,6 +911,8 @@ pub async fn create_download_ticket(
 )]
 pub struct AuthApiDoc;
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,7 +1366,7 @@ mod tests {
     #[test]
     fn test_set_auth_cookies_adds_two_cookies() {
         let mut headers = HeaderMap::new();
-        set_auth_cookies(&mut headers, "access_tok", "refresh_tok", 3600);
+        set_auth_cookies(&mut headers, "access_tok", "refresh_tok", 3600, false);
         let cookies: Vec<_> = headers.get_all(SET_COOKIE).iter().collect();
         assert_eq!(cookies.len(), 2);
     }
@@ -1285,7 +1374,7 @@ mod tests {
     #[test]
     fn test_set_auth_cookies_access_token_format() {
         let mut headers = HeaderMap::new();
-        set_auth_cookies(&mut headers, "myaccess", "myrefresh", 3600);
+        set_auth_cookies(&mut headers, "myaccess", "myrefresh", 3600, false);
         let cookies: Vec<_> = headers
             .get_all(SET_COOKIE)
             .iter()
@@ -1305,7 +1394,7 @@ mod tests {
     #[test]
     fn test_set_auth_cookies_refresh_token_path() {
         let mut headers = HeaderMap::new();
-        set_auth_cookies(&mut headers, "acc", "ref", 1800);
+        set_auth_cookies(&mut headers, "acc", "ref", 1800, false);
         let cookies: Vec<_> = headers
             .get_all(SET_COOKIE)
             .iter()
@@ -1322,13 +1411,221 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // secure_flag / cookie Secure gating (#2233 + X-Forwarded-Proto follow-up)
+    //
+    // The `Secure` attribute is emitted when NOT in `development` AND either
+    // `AK_ENFORCE_HTTPS` is truthy (static override) OR the per-request
+    // `client_is_https` signal (from `X-Forwarded-Proto: https`) is set. This
+    // keeps a default plain-HTTP deployment logged in while auto-hardening
+    // cookies behind a TLS-terminating proxy. Env is process-global, so the
+    // env-dependent tests serialize on a local mutex and set-and-restore
+    // ENVIRONMENT + AK_ENFORCE_HTTPS around each case.
+    // -----------------------------------------------------------------------
+
+    /// Serializes env-dependent secure_flag tests (env is process-global).
+    static SECURE_FLAG_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set-and-restore helper: applies the given ENVIRONMENT / AK_ENFORCE_HTTPS
+    /// values (None = unset), runs `f`, then restores the prior values.
+    fn with_secure_env(environment: Option<&str>, enforce_https: Option<&str>, f: impl FnOnce()) {
+        let _guard = SECURE_FLAG_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_env = std::env::var("ENVIRONMENT").ok();
+        let prev_https = std::env::var("AK_ENFORCE_HTTPS").ok();
+        let apply = |key: &str, val: Option<&str>| match val {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        };
+        apply("ENVIRONMENT", environment);
+        apply("AK_ENFORCE_HTTPS", enforce_https);
+
+        f();
+
+        apply("ENVIRONMENT", prev_env.as_deref());
+        apply("AK_ENFORCE_HTTPS", prev_https.as_deref());
+    }
+
+    #[test]
+    fn test_secure_flag_default_no_env_is_not_secure() {
+        // Default HTTP-safe deployment: neither flag set (and a realistic
+        // non-development ENVIRONMENT) must NOT emit Secure, so the browser
+        // resends the cookie over plain HTTP.
+        with_secure_env(None, None, || {
+            assert_eq!(secure_flag(false), "");
+        });
+        with_secure_env(Some("production"), None, || {
+            assert_eq!(secure_flag(false), "");
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_enforce_https_enables_secure() {
+        for truthy in ["true", "TRUE", "1"] {
+            with_secure_env(Some("production"), Some(truthy), || {
+                assert_eq!(
+                    secure_flag(false),
+                    " Secure;",
+                    "AK_ENFORCE_HTTPS={truthy} must enable Secure"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_secure_flag_development_never_secure() {
+        // Development stays non-Secure even if HTTPS enforcement is requested
+        // (localhost HTTP), preserving backwards-compatible dev behavior.
+        with_secure_env(Some("development"), None, || {
+            assert_eq!(secure_flag(false), "");
+        });
+        with_secure_env(Some("development"), Some("true"), || {
+            assert_eq!(secure_flag(false), "");
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_falsey_values_not_secure() {
+        for falsey in ["false", "0", "", "no"] {
+            with_secure_env(Some("production"), Some(falsey), || {
+                assert_eq!(
+                    secure_flag(false),
+                    "",
+                    "AK_ENFORCE_HTTPS={falsey} must not enable Secure"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_set_auth_cookies_secure_gated_by_enforce_https() {
+        // End-to-end through set_auth_cookies: HttpOnly + SameSite=Strict are
+        // always present; Secure follows the AK_ENFORCE_HTTPS toggle.
+        with_secure_env(Some("production"), None, || {
+            let mut headers = HeaderMap::new();
+            set_auth_cookies(&mut headers, "a", "r", 3600, false);
+            for v in headers.get_all(SET_COOKIE).iter() {
+                let c = v.to_str().unwrap();
+                assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
+                assert!(
+                    c.contains("SameSite=Strict"),
+                    "SameSite=Strict must be present: {c}"
+                );
+                assert!(
+                    !c.contains("Secure"),
+                    "default deploy must be non-Secure: {c}"
+                );
+            }
+        });
+        with_secure_env(Some("production"), Some("true"), || {
+            let mut headers = HeaderMap::new();
+            set_auth_cookies(&mut headers, "a", "r", 3600, false);
+            for v in headers.get_all(SET_COOKIE).iter() {
+                let c = v.to_str().unwrap();
+                assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
+                assert!(
+                    c.contains("SameSite=Strict"),
+                    "SameSite=Strict must be present: {c}"
+                );
+                assert!(
+                    c.contains("Secure"),
+                    "AK_ENFORCE_HTTPS=true must be Secure: {c}"
+                );
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // X-Forwarded-Proto auto-detection (follow-up to #2233)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_secure_flag_forwarded_https_enables_secure_without_flag() {
+        // Behind a TLS-terminating proxy (X-Forwarded-Proto: https) the cookie
+        // is Secure even when AK_ENFORCE_HTTPS is unset.
+        with_secure_env(Some("production"), None, || {
+            assert_eq!(
+                secure_flag(true),
+                " Secure;",
+                "X-Forwarded-Proto: https must enable Secure without the flag"
+            );
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_no_forwarded_no_flag_is_not_secure() {
+        // Plain HTTP: no X-Forwarded-Proto and no flag stays non-Secure so the
+        // browser resends the cookie over HTTP.
+        with_secure_env(Some("production"), None, || {
+            assert_eq!(secure_flag(false), "");
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_enforce_https_overrides_missing_forwarded() {
+        // AK_ENFORCE_HTTPS=true forces Secure regardless of the per-request
+        // scheme (for proxies that terminate TLS but don't set the header).
+        with_secure_env(Some("production"), Some("true"), || {
+            assert_eq!(secure_flag(false), " Secure;");
+            assert_eq!(secure_flag(true), " Secure;");
+        });
+    }
+
+    #[test]
+    fn test_secure_flag_development_never_secure_even_with_forwarded_https() {
+        // Development stays non-Secure even when the client is HTTPS, so local
+        // dev over localhost keeps working.
+        with_secure_env(Some("development"), None, || {
+            assert_eq!(secure_flag(true), "");
+        });
+        with_secure_env(Some("development"), Some("true"), || {
+            assert_eq!(secure_flag(true), "");
+        });
+    }
+
+    #[test]
+    fn test_set_auth_cookies_secure_follows_forwarded_proto() {
+        // End-to-end through set_auth_cookies: client_is_https=true yields
+        // Secure (no flag needed); false yields non-Secure. HttpOnly +
+        // SameSite=Strict are always present in both cases.
+        with_secure_env(Some("production"), None, || {
+            let mut secure_headers = HeaderMap::new();
+            set_auth_cookies(&mut secure_headers, "a", "r", 3600, true);
+            for v in secure_headers.get_all(SET_COOKIE).iter() {
+                let c = v.to_str().unwrap();
+                assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
+                assert!(
+                    c.contains("SameSite=Strict"),
+                    "SameSite=Strict must be present: {c}"
+                );
+                assert!(
+                    c.contains("Secure"),
+                    "X-Forwarded-Proto: https must be Secure: {c}"
+                );
+            }
+
+            let mut plain_headers = HeaderMap::new();
+            set_auth_cookies(&mut plain_headers, "a", "r", 3600, false);
+            for v in plain_headers.get_all(SET_COOKIE).iter() {
+                let c = v.to_str().unwrap();
+                assert!(c.contains("HttpOnly"), "HttpOnly must be present: {c}");
+                assert!(
+                    c.contains("SameSite=Strict"),
+                    "SameSite=Strict must be present: {c}"
+                );
+                assert!(!c.contains("Secure"), "plain HTTP must be non-Secure: {c}");
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // clear_auth_cookies
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_clear_auth_cookies_sets_max_age_zero() {
         let mut headers = HeaderMap::new();
-        clear_auth_cookies(&mut headers);
+        clear_auth_cookies(&mut headers, false);
         let cookies: Vec<_> = headers
             .get_all(SET_COOKIE)
             .iter()
@@ -1347,7 +1644,7 @@ mod tests {
     #[test]
     fn test_clear_auth_cookies_empties_values() {
         let mut headers = HeaderMap::new();
-        clear_auth_cookies(&mut headers);
+        clear_auth_cookies(&mut headers, false);
         let cookies: Vec<_> = headers
             .get_all(SET_COOKIE)
             .iter()
@@ -1686,5 +1983,132 @@ mod admin_scope_policy_tests {
         );
 
         cleanup(&pool, user_id).await;
+    }
+
+    // ── #1617 Phase 1: token-lifecycle audit coverage ───────────────────
+
+    async fn audit_count(pool: &sqlx::PgPool, token_id: Uuid, action: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2",
+        )
+        .bind(token_id)
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .expect("audit_log count query")
+    }
+
+    /// Minting an API token must emit an `API_TOKEN_CREATED` audit event
+    /// attributed to the acting user, carrying the token id (never the secret).
+    #[tokio::test]
+    async fn mint_api_token_emits_audit_created_event() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_app(state, auth);
+
+        let body = json!({
+            "name": "audit-mint",
+            "scopes": ["read:artifacts"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "mint failed: {}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            audit_count(&pool, token_id, "API_TOKEN_CREATED").await,
+            1,
+            "mint MUST write exactly one API_TOKEN_CREATED audit row"
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// Revoking an API token must emit an `API_TOKEN_REVOKED` audit event.
+    #[tokio::test]
+    async fn revoke_api_token_emits_audit_revoked_event() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+
+        // Mint first.
+        let body = json!({
+            "name": "audit-revoke",
+            "scopes": ["read:artifacts"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(build_app(state.clone(), auth.clone()), req).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let token_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
+
+        // Now revoke.
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/tokens/{}", token_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(build_app(state, auth), req).await;
+        assert!(status.is_success(), "revoke should succeed, got {status}");
+
+        assert_eq!(
+            audit_count(&pool, token_id, "API_TOKEN_REVOKED").await,
+            1,
+            "revoke MUST write exactly one API_TOKEN_REVOKED audit row"
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// The fire-and-forget invariant: a failed audit write (here forced by an
+    /// orphan actor id that violates the audit_log→users FK) must be swallowed,
+    /// never panicking or propagating, and must not persist a row.
+    #[tokio::test]
+    async fn audit_fire_and_forget_swallows_write_failure() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let orphan_actor = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let entry = api_token_audit_entry(
+            AuditAction::ApiTokenCreated,
+            orphan_actor,
+            token_id,
+            Some("orphan"),
+            "user_self",
+        );
+
+        // Must complete without panic even though the INSERT fails.
+        audit_fire_and_forget(pool.clone(), entry).await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE user_id = $1")
+            .bind(orphan_actor)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "FK-violating audit write must not persist a row");
     }
 }

@@ -159,3 +159,28 @@ RUN mkdir /results \
 
 FROM scratch AS coverage-results
 COPY --from=coverage /results/ /
+
+# Upstream-parity lint gate (the `Check Rust` job in upstream ci.yml):
+# cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings.
+# SQLX_OFFLINE=true (set in `source`) keeps macro checks on the committed
+# .sqlx cache, so no database or migrate step is needed. Shares the cargo/
+# target cache mounts with the test stages, so a warm-cache clippy pass is
+# cheap. Added after upstream PR #2415's first push failed clippy: the
+# coverage lane runs tests but had no fmt/clippy parity, so clippy-only
+# breakage stayed invisible until upstream CI.
+FROM source AS lint
+# The rust:*-bookworm base ships the minimal rustup profile — rustfmt and
+# clippy are NOT preinstalled (run 532: "'cargo-fmt' is not installed for
+# the toolchain"). Installed here rather than in `toolchain` so the shared,
+# long-cached toolchain layer (nextest/binstall downloads) is not
+# invalidated for the test stages.
+RUN rustup component add rustfmt clippy
+RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
+    --mount=type=cache,id=ak-quality-target,target=/target \
+    bash -o pipefail -c \
+      'bash /work/ci/local-ci/run.sh lint 2>&1 | tee /tmp/lint.log'
+
+RUN mkdir /results && cp /tmp/lint.log /results/
+
+FROM scratch AS lint-results
+COPY --from=lint /results/ /

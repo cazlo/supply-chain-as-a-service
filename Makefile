@@ -1,4 +1,4 @@
-.PHONY: ci-publish source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose backend-quality-ci vendor-check vendor-status vendor-update vendor-sync local-ci-build local-test local-coverage local-integration local-ci-down
+.PHONY: ci-publish source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose backend-quality-ci vendor-check vendor-status vendor-update vendor-sync local-ci-build local-lint local-test local-coverage local-integration local-ci-down
 
 LOCAL_CI := docker compose -f ci/local-ci/docker-compose.yml
 
@@ -50,6 +50,9 @@ vendor-sync:
 # ci/local-ci/README.md.
 local-ci-build:
 	$(LOCAL_CI) build
+
+local-lint:
+	$(LOCAL_CI) run --rm ci bash /work/ci/local-ci/run.sh lint
 
 local-test:
 	$(LOCAL_CI) run --rm ci bash /work/ci/local-ci/run.sh test

@@ -2,6 +2,10 @@
 # Entry point inside the local-ci container. Mirrors upstream
 # artifact-keeper/.github/workflows/ci.yml:
 #
+#   lint        -> the `Check Rust` job
+#                    cargo fmt --check + cargo clippy --workspace
+#                    --all-targets -- -D warnings, on the committed .sqlx
+#                    cache (SQLX_OFFLINE); needs no database.
 #   test        -> the `test-backend-unit` job
 #                    sqlx migrate run + cargo test --workspace --lib (DB-backed)
 #   coverage    -> the `coverage` job
@@ -12,8 +16,8 @@
 #                    Upstream runs these in its nightly/e2e lanes; use
 #                    TEST=<name> to select a hermetic target.
 #
-# Run via the repo-root Makefile: `make local-test` / `make local-coverage` /
-# `make local-integration`.
+# Run via the repo-root Makefile: `make local-lint` / `make local-test` /
+# `make local-coverage` / `make local-integration`.
 set -euo pipefail
 
 # cargo rewrites Cargo.lock's workspace version field during the build (the
@@ -25,6 +29,19 @@ trap restore_lock EXIT
 
 MODE="${1:-coverage}"
 cd /work/artifact-keeper
+
+# Lint needs no database (SQLX_OFFLINE macro checks ride the committed .sqlx
+# cache), so it exits before the migrate step every other mode shares. Added
+# after upstream PR #2415's first push failed clippy: the coverage lane runs
+# tests but had no fmt/clippy parity, so clippy-only breakage stayed
+# invisible until upstream's Check Rust job.
+if [ "${MODE}" = "lint" ]; then
+  echo "==> cargo fmt --check"
+  cargo fmt --check
+  echo "==> cargo clippy --workspace --all-targets -- -D warnings"
+  cargo clippy --workspace --all-targets -- -D warnings
+  exit $?
+fi
 
 echo "==> applying migrations (sqlx migrate run)"
 sqlx migrate run --source backend/migrations

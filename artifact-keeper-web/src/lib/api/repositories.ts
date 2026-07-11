@@ -160,6 +160,10 @@ function adaptRepository(sdk: RepositoryResponse): Repository {
     ),
     repo_type: narrowEnum(sdk.repo_type, REPO_TYPES, 'local'),
     is_public: sdk.is_public,
+    // `versioning_enabled` (artifact-keeper#2367) is now carried on the
+    // generated SDK type; `?? false` stays defensive against a backend that
+    // predates #2367 and omits the flag at runtime.
+    versioning_enabled: sdk.versioning_enabled ?? false,
     storage_used_bytes: sdk.storage_used_bytes,
     quota_bytes: sdk.quota_bytes ?? undefined,
     upstream_url: sdk.upstream_url ?? undefined,
@@ -232,12 +236,15 @@ export const repositoriesApi = {
   },
 
   update: async (key: string, input: Partial<CreateRepositoryRequest>): Promise<Repository> => {
+    // `versioning_enabled` (artifact-keeper#2367) is now on the generated SDK
+    // request type. When omitted the backend leaves the flag unchanged.
     const body: SdkUpdateRepositoryRequest = {
       name: input.name,
       description: input.description,
       is_public: input.is_public,
       quota_bytes: input.quota_bytes,
       key: input.key,
+      versioning_enabled: input.versioning_enabled,
     };
     const { data, error } = await updateRepository({ path: { key }, body });
     if (error) throw error;

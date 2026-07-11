@@ -1,4 +1,4 @@
-.PHONY: ci-publish source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose backend-quality-ci vendor-check vendor-status vendor-update vendor-sync local-ci-build local-lint local-test local-coverage local-integration local-ci-down
+.PHONY: ci-publish source-check source-check-backend source-check-chart source-check-web source-smoke source-smoke-compose backend-quality-ci web-e2e-ci vendor-check vendor-status vendor-update vendor-sync local-ci-build local-lint local-test local-coverage local-integration local-ci-down
 
 LOCAL_CI := docker compose -f ci/local-ci/docker-compose.yml
 
@@ -19,6 +19,11 @@ source-smoke-compose:
 # Runner-native DB integration + coverage lane (rootless BuildKit + ak-smoke).
 backend-quality-ci:
 	QUALITY_MODE=$(or $(MODE),coverage) ci/backend-quality-k8s.sh
+
+# K8s-native Playwright web E2E lane: isolated per-run chart install driven
+# by a Playwright Job (env-driven; see ci/web-e2e-k8s.sh header).
+web-e2e-ci:
+	ci/web-e2e-k8s.sh
 
 source-check-backend:
 	ci/check-clean-snapshots.sh backend

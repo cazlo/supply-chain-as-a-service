@@ -4,13 +4,13 @@
 # the signed staging images deployed by the chart. Built with rootless
 # BuildKit on the daemonless runners (see ci/web-e2e-image-build.sh).
 #
-# The base image tag must match @playwright/test in
+# The base image version must match @playwright/test in
 # artifact-keeper-web/package-lock.json, otherwise the preinstalled browsers
-# are rejected at runtime; ci/web-e2e-image-build.sh derives the version from
-# the lockfile and passes it here. Pin the base by digest after the first
-# green canary, per the runner-image policy.
-ARG PLAYWRIGHT_VERSION
-FROM mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble
+# are rejected at runtime. ci/web-e2e-image-build.sh checks the lockfile
+# against its pinned version/digest pair and passes the digest-pinned ref
+# here, per the runner-image policy.
+ARG PLAYWRIGHT_IMAGE
+FROM ${PLAYWRIGHT_IMAGE}
 
 WORKDIR /work
 

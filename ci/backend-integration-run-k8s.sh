@@ -70,8 +70,14 @@ spec:
             - { name: POSTGRES_USER, value: registry }
             - { name: POSTGRES_PASSWORD, value: registry }
             - { name: POSTGRES_DB, value: artifact_registry }
+          # Probe over TCP (-h 127.0.0.1), not the default unix socket: the
+          # postgres image's initdb runs a TEMPORARY socket-only server that
+          # pg_isready happily answers, so a socket probe can mark the pod
+          # Ready during the init double-start window while the real TCP
+          # server is still coming up ("the database system is starting up"
+          # seen by the migrate step in runs 525/525-rerun).
           readinessProbe:
-            exec: { command: [pg_isready, -U, registry, -d, artifact_registry] }
+            exec: { command: [pg_isready, -h, 127.0.0.1, -U, registry, -d, artifact_registry] }
             periodSeconds: 2
             timeoutSeconds: 2
             failureThreshold: 30
@@ -119,7 +125,22 @@ spec:
           command: ["bash", "-o", "pipefail", "-c"]
           args:
             - |
-              sqlx migrate run --source backend/migrations
+              # Fail the Job rather than run tests against an unmigrated
+              # database (pre-fix, a failed migrate fell through and every
+              # test died with 42P01 relation-missing). The retry rides out
+              # any residual startup window the TCP readiness probe misses.
+              set -eu
+              for attempt in \$(seq 1 10); do
+                if sqlx migrate run --source backend/migrations; then
+                  break
+                fi
+                if [ "\${attempt}" -eq 10 ]; then
+                  echo "sqlx migrate run failed after \${attempt} attempts" >&2
+                  exit 1
+                fi
+                echo "migrate attempt \${attempt} failed; retrying" >&2
+                sleep 3
+              done
               exec "/test-bin/${test_target}" --ignored --test-threads=1
           env:
             - name: DATABASE_URL

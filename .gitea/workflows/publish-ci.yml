@@ -161,6 +161,35 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
 
+  # Upstream-parity lint gate (upstream ci.yml's `Check Rust`): fmt --check +
+  # clippy --workspace --all-targets -D warnings, SQLX_OFFLINE, no database.
+  # Exists because the coverage lane runs tests but not clippy — upstream PR
+  # #2415's first push failed clippy on breakage this lane had validated
+  # green.
+  backend-lint:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: artifact-keeper-builder
+    steps:
+      - name: Check out the vendored sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.gate.outputs.checkout_ref }}
+
+      - name: Run upstream-equivalent lint gate (fmt + clippy)
+        run: ci/backend-lint.sh
+        env:
+          QUALITY_RESULTS_DIR: /tmp/artifact-keeper-lint
+
+      - name: Retain lint log
+        if: always()
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        with:
+          name: backend-lint-${{ needs.gate.outputs.checkout_ref }}
+          path: /tmp/artifact-keeper-lint/
+          if-no-files-found: warn
+          retention-days: 14
+
   backend-coverage:
     needs: gate
     if: needs.gate.outputs.run == 'true'

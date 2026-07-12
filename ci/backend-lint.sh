@@ -18,7 +18,7 @@ docker buildx build \
   --progress plain \
   --file "${root}/ci/local-ci/Dockerfile.runner" \
   --target lint-results \
-  --no-cache-filter lint \
+  --build-arg "CACHE_BUST=${GITEA_RUN_NUMBER:-${GITHUB_RUN_NUMBER:-0}}-$(date +%s)" \
   --output "type=local,dest=${results_dir}" \
   "${root}"
 

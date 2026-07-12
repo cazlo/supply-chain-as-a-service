@@ -107,10 +107,17 @@ COPY . /work
 FROM source AS integration
 ARG TEST
 ENV TEST=${TEST}
+# CACHE_BUST (a fresh value per CI run) forces this RUN to re-execute as a
+# normal cache miss. The previous --no-cache-filter approach also RESET the
+# cargo/target cache mounts at every solve (BuildKit treats no-cache'd RUNs
+# as ignore-cache-mounts too), which is why every lane recompiled the full
+# crate graph every run. Tests must always execute; the dep cache must not
+# die for it.
+ARG CACHE_BUST=0
 RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
     --mount=type=cache,id=ak-quality-target,target=/target \
     bash -o pipefail -c \
-      'bash /work/ci/local-ci/run.sh integration 2>&1 | tee /tmp/integration.log'
+      'echo "cache-bust ${CACHE_BUST}"; bash /work/ci/local-ci/run.sh integration 2>&1 | tee /tmp/integration.log'
 
 RUN mkdir /results && cp /tmp/integration.log /results/
 
@@ -149,10 +156,12 @@ ls -la /test-bin
 EOF
 
 FROM source AS coverage
+# See the integration stage: per-run cache miss WITHOUT resetting the mounts.
+ARG CACHE_BUST=0
 RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
     --mount=type=cache,id=ak-quality-target,target=/target \
     bash -o pipefail -c \
-      'bash /work/ci/local-ci/run.sh coverage 2>&1 | tee /tmp/coverage.log'
+      'echo "cache-bust ${CACHE_BUST}"; bash /work/ci/local-ci/run.sh coverage 2>&1 | tee /tmp/coverage.log'
 
 RUN mkdir /results \
  && cp /tmp/coverage.log /tmp/lcov.info /results/
@@ -175,10 +184,12 @@ FROM source AS lint
 # long-cached toolchain layer (nextest/binstall downloads) is not
 # invalidated for the test stages.
 RUN rustup component add rustfmt clippy
+# See the integration stage: per-run cache miss WITHOUT resetting the mounts.
+ARG CACHE_BUST=0
 RUN --mount=type=cache,id=ak-quality-cargo,target=/cargo \
     --mount=type=cache,id=ak-quality-target,target=/target \
     bash -o pipefail -c \
-      'bash /work/ci/local-ci/run.sh lint 2>&1 | tee /tmp/lint.log'
+      'echo "cache-bust ${CACHE_BUST}"; bash /work/ci/local-ci/run.sh lint 2>&1 | tee /tmp/lint.log'
 
 RUN mkdir /results && cp /tmp/lint.log /results/
 

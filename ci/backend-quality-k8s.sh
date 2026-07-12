@@ -110,7 +110,10 @@ build_args=(
   --progress plain
   --file "${root}/ci/local-ci/Dockerfile.runner"
   --target "${mode}-results"
-  --no-cache-filter "${mode}"
+  # A fresh CACHE_BUST per run re-executes the test stage as a normal cache
+  # miss. --no-cache-filter also reset the cargo/target cache mounts every
+  # solve (full crate re-download + recompile per run); see Dockerfile.runner.
+  --build-arg "CACHE_BUST=${run_suffix}-$(date +%s)"
   --build-arg "DATABASE_URL=postgresql://registry:registry@${name}.${namespace}.svc.cluster.local:5432/artifact_registry"
   --build-arg "COVERAGE_BASE=${coverage_base}"
   --build-arg "NEW_CODE_MIN=${NEW_CODE_MIN:-70}"

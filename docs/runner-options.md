@@ -75,9 +75,9 @@ important reusable details are:
 - Keep the local volume cache and registry cache as separate layers. The volume
   cache is the hot path; the Harbor cache image is the durable and cross-runner
   warm-start path.
-- Keep the Kubernetes smoke ServiceAccount narrowly scoped. A fixed smoke
-  namespace with namespaced admin rights is simpler and safer than granting
-  cluster-wide namespace creation to CI.
+- Keep the manual Kubernetes chart-smoke ServiceAccount narrowly scoped. The PR
+  publish path should use the repository-scoped Compose runner with no
+  Kubernetes token, pulling only the builder's verified immutable digest.
 - Put registry push credentials, cosign keys, and sync-bot credentials in
   repository Actions secrets. Do not pass them as runner-wide environment.
 - Treat bot-authored upstream-sync PRs as validate-only unless a maintainer

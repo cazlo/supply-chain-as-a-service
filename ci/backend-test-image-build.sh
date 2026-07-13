@@ -3,7 +3,7 @@
 # result to Harbor, so backend-integration's matrix legs can each pull the
 # same image and just run their one target instead of recompiling the whole
 # dev-dependency graph per leg (see ci/local-ci/Dockerfile.runner's
-# test-artifacts stage and ci/backend-integration-run-k8s.sh).
+# test-artifacts stage and ci/backend-integration-run-compose.sh).
 set -euo pipefail
 
 readonly root="$(git rev-parse --show-toplevel)"

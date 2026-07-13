@@ -30,6 +30,7 @@ started_at="$(date +%s)"
 
 mkdir -p "${results_dir}"
 rm -f "${results_dir}"/*
+rm -rf "${DOCKER_CONFIG}"
 mkdir -p "${DOCKER_CONFIG}"
 chmod 700 "${DOCKER_CONFIG}"
 if [[ -f "${runner_docker_config}/config.json" ]]; then

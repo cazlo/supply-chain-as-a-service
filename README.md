@@ -116,11 +116,13 @@ make source-check-web
 make source-check
 ```
 
-[make source-smoke](Makefile) runs the Kubernetes-native smoke gate: it installs
-the vendored chart into a test namespace, points the backend at a freshly built
-image, and runs native package-client Jobs for PyPI, npm, and Cargo.
-[make source-smoke-compose](Makefile) keeps a cluster-free smoke path for local
-iteration.
+[make source-smoke](Makefile) retains the manually dispatched Kubernetes/chart
+smoke path: it installs the vendored chart into a test namespace and runs
+native package-client Jobs for PyPI, npm, and Cargo. PR publish CI instead hands
+the builder's verified immutable backend digest to the isolated Compose runner,
+which executes the same pypi/npm/cargo native-client semantics without rebuilding
+the backend. [make source-smoke-compose](Makefile) remains the cluster-free
+workstation entry point.
 
 ### 3. Build, Scan, Sign, and Smoke
 
@@ -129,7 +131,8 @@ CI implementation. Human-authored PRs and explicit dispatches run the publish
 path:
 
 ```text
-build -> push scratch image -> scan -> sign -> verify -> smoke -> promote to staging
+builder: build -> push scratch image -> scan -> sign -> verify
+compose: pull exact digest -> pypi/npm/cargo smoke -> promote to staging
 ```
 
 Bot-authored upstream-sync PRs run a validate-only path with no registry or

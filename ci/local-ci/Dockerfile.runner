@@ -128,7 +128,7 @@ COPY --from=integration /results/ /
 # unit tests) exactly ONCE, then copy each executable out of the cargo
 # target cache mount into a plain image layer under /test-bin. Pushed once
 # per CI run (ci/backend-test-image-build.sh) and reused by every
-# backend-integration matrix leg (ci/backend-integration-run-k8s.sh), which
+# backend-integration matrix leg (ci/backend-integration-run-compose.sh), which
 # just runs one already-built binary against its own Postgres instead of
 # recompiling the whole dev-dependency graph N times. No DATABASE_URL is
 # needed here: nothing runs yet, only compiles.

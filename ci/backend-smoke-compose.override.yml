@@ -1,0 +1,28 @@
+services:
+  postgres:
+    container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-db
+  backend:
+    image: ${BACKEND_IMAGE_REF:?BACKEND_IMAGE_REF is required}
+    container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-backend
+  trivy:
+    container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-trivy
+  pki:
+    container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-pki
+  setup:
+    container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-setup
+    # The vendored setup script keeps its healthcheck sentinel alive when this
+    # explicit compatibility flag is set. Docker supplies /.dockerenv; Podman
+    # supplies /run/.containerenv instead, so filesystem autodetection alone
+    # would let this one-shot container exit 0 during `compose up --wait`.
+    environment:
+      DOCKER_CONTAINER: "1"
+  pypi-test:
+    container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-pypi
+  npm-test:
+    container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-npm
+  cargo-test:
+    container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-cargo
+
+networks:
+  e2e-test-network:
+    name: ${SMOKE_NETWORK_NAME:?SMOKE_NETWORK_NAME is required}

@@ -17,7 +17,7 @@ upstream release
   -> controlled runner build
   -> registry scratch project
   -> scan + sign + verify
-  -> Kubernetes smoke
+  -> isolated Compose native-client smoke
   -> staging project
   -> merge to main
   -> release project

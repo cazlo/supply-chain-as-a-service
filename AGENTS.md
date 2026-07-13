@@ -49,9 +49,12 @@ Vendoring (subtrees):
 Source checks, smoke, and publish:
 - `make source-check-chart` — lint/render the vendored chart without touching
   the subtrees. Also `source-check-backend` / `source-check-web` / `source-check`.
-- `make source-smoke` — k8s-native PR smoke gate: ephemeral `helm install` of
-  the chart + vendored pypi/npm/cargo client Jobs. Needs kubectl + helm + a
-  cluster. `make source-smoke-compose` is the cluster-free Compose equivalent.
+- `make source-smoke` — manually dispatched k8s-native chart smoke: ephemeral
+  `helm install` + vendored pypi/npm/cargo client Jobs. PR publish CI splits
+  backend build/scan/sign/verify onto `artifact-keeper-builder` from runtime
+  smoke on `artifact-keeper-compose`, consuming the exact signed digest with no
+  Podman-side build. `make source-smoke-compose` remains the workstation entry
+  point.
 - `make ci-publish` — local equivalent of the `publish-ci` workflow; requires
   `HARBOR_REGISTRY`/`HARBOR_USERNAME`/`HARBOR_PASSWORD` (keep these in Gitea
   Actions secrets, never in source).

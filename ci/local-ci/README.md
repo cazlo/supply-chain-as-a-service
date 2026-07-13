@@ -20,18 +20,16 @@ every integration-test binary exactly once (`test-artifacts` stage of
 each compiled executable is copied out of the cargo target cache mount into
 `/test-bin/<name>`) and pushes the result to Harbor
 (`ci/backend-test-image-build.sh`). `backend-integration`'s matrix then has
-one leg per target, each running `ci/backend-integration-run-k8s.sh`: stand
-up an ephemeral Postgres deployment (named after the target so concurrent
-legs don't collide in `ak-smoke`), run a k8s Job that pulls the
-already-built image and executes exactly one pre-built binary
-(`/test-bin/<name> --ignored`), then tear both down. The test-runner is an
-unsigned, short-lived CI artifact, and consumers receive its immutable Harbor
-digest rather than relying on its mutable short-SHA tag. No per-leg compile,
-so Kubernetes legs run with much higher matrix concurrency than a
-BuildKit-per-leg design could afford. A Compose shadow runs selected targets
-against an isolated Postgres on `artifact-keeper-compose` while retaining the
-Kubernetes matrix for paired semantic and timing evidence. See the integration
-jobs' header comments in
+one leg per target, each running `ci/backend-integration-run-compose.sh` on
+the capacity-one `artifact-keeper-compose` runner. Each leg starts an isolated
+Postgres service, pulls the already-built image, executes exactly one pre-built
+binary (`/test-bin/<name> --ignored`), records timing and cleanup evidence, and
+tears down its entire Compose project. The test-runner is an unsigned,
+short-lived CI artifact, and consumers receive its immutable Harbor digest
+rather than relying on its mutable short-SHA tag. There is no per-leg compile.
+The former Kubernetes matrix was removed after paired all-nine and repeat
+Compose runs proved equivalent results with substantially less runner time and
+noise. See the integration job's header comments in
 `.gitea/workflows/publish-ci.yml` for the current target list and what's
 deliberately excluded. Each leg uploads its `integration.log` as a
 `backend-integration-<target>-*` artifact.
@@ -39,6 +37,8 @@ deliberately excluded. Each leg uploads its `integration.log` as a
 `ci/backend-quality-k8s.sh QUALITY_MODE=integration` (the original
 compile-and-run-in-one-BuildKit-build path) still works standalone for
 manual/ad-hoc runs — it's just no longer what Gitea CI itself calls.
+`ci/backend-integration-run-k8s.sh` is likewise retained as a manual rollback
+tool, but the publish workflow does not invoke it.
 
 The runner variant uses eight compiler jobs, incremental compilation,
 `cargo llvm-cov --no-clean`, and eight nextest threads (the lab builders have

@@ -77,7 +77,9 @@ important reusable details are:
   warm-start path.
 - Keep the manual Kubernetes chart-smoke ServiceAccount narrowly scoped. The PR
   publish path should use the repository-scoped Compose runner with no
-  Kubernetes token, pulling only the builder's verified immutable digest.
+  Kubernetes token, pulling only builder-produced immutable digests. Keep
+  compilation, scanning, and signing on BuildKit; use the Compose pool only for
+  native-client, database-integration, and Playwright runtime phases.
 - Put registry push credentials, cosign keys, and sync-bot credentials in
   repository Actions secrets. Do not pass them as runner-wide environment.
 - Treat bot-authored upstream-sync PRs as validate-only unless a maintainer

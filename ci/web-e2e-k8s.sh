@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# K8s-native Playwright web E2E lane.
+# K8s-native Playwright web E2E rollback/manual lane. The publish workflow uses
+# ci/web-e2e-run-compose.sh for its runtime.
 #
 # Installs an isolated, uniquely named full-stack release (postgres + backend +
 # web, heavy optional services disabled) of the vendored chart in the shared

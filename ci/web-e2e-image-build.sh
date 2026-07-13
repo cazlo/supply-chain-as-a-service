@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build and push the Playwright web-E2E runner image (ci/web-e2e/Dockerfile)
-# so ci/web-e2e-k8s.sh can run the vendored web test suites as a Kubernetes
-# Job. Mirrors ci/backend-test-image-build.sh: rootless BuildKit, Harbor
-# registry cache, and only the resolved image ref on stdout.
+# so ci/web-e2e-run-compose.sh can run the vendored web test suites without
+# compiling or building on Podman. Mirrors ci/backend-test-image-build.sh:
+# rootless BuildKit, Harbor registry cache, and only the immutable image ref
+# on stdout.
 set -euo pipefail
 
 readonly root="$(git rev-parse --show-toplevel)"
@@ -13,6 +14,7 @@ readonly cache_project="${HARBOR_CACHE_PROJECT:-artifact-keeper-cache}"
 readonly image="${registry}/${project}/artifact-keeper-web-e2e-runner"
 readonly tag="${revision}"
 readonly cache_ref="${registry}/${cache_project}/artifact-keeper-web-e2e-runner:buildcache"
+readonly metadata_file="${TMPDIR:-/tmp}/ak-web-e2e-${revision}-${GITEA_RUN_ID:-$$}.json"
 
 [[ -n "${HARBOR_USERNAME:-}" ]] || { echo "HARBOR_USERNAME is required" >&2; exit 2; }
 [[ -n "${HARBOR_PASSWORD:-}" ]] || { echo "HARBOR_PASSWORD is required" >&2; exit 2; }
@@ -34,8 +36,11 @@ if [[ "${pw_version}" != "${pinned_pw_version}" ]]; then
 fi
 readonly base_image="mcr.microsoft.com/playwright:v${pinned_pw_version}-noble@${pinned_pw_digest}"
 
-logout() { docker logout "${registry}" >/dev/null 2>&1 || true; }
-trap logout EXIT
+cleanup() {
+  rm -f "${metadata_file}"
+  docker logout "${registry}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 printf '%s' "${HARBOR_PASSWORD}" |
   docker login "${registry}" --username "${HARBOR_USERNAME}" --password-stdin >&2
@@ -47,10 +52,13 @@ docker buildx build \
   --build-arg "PLAYWRIGHT_IMAGE=${base_image}" \
   --cache-from "type=registry,ref=${cache_ref}" \
   --cache-to "type=registry,ref=${cache_ref},mode=max" \
+  --metadata-file "${metadata_file}" \
   --tag "${image}:${tag}" \
   --push \
   "${root}" >&2
 
-# Only the resolved image ref goes to stdout; everything else above is
-# routed to stderr so callers can safely capture `image=$(this script)`.
-echo "${image}:${tag}"
+digest="$(jq -er '."containerimage.digest"' "${metadata_file}")"
+
+# The runner is an unsigned, short-lived CI artifact. Its immutable digest is
+# therefore the consumer integrity boundary instead of its mutable short tag.
+echo "${image}@${digest}"

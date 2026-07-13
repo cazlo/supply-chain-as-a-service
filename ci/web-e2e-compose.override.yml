@@ -1,0 +1,28 @@
+services:
+  backend:
+    image: ${BACKEND_IMAGE_REF:?BACKEND_IMAGE_REF is required}
+
+  web:
+    image: ${WEB_IMAGE_REF:?WEB_IMAGE_REF is required}
+    build: null
+
+  playwright:
+    image: ${E2E_RUNNER_IMAGE:?E2E_RUNNER_IMAGE is required}
+    depends_on:
+      web:
+        condition: service_healthy
+    working_dir: /work
+    environment:
+      CI: "true"
+      PLAYWRIGHT_BASE_URL: http://web:3000
+      ADMIN_PASSWORD: TestRunner!2026secure
+    # The Podman service runs without a private cgroup/IPC hierarchy inside
+    # the outer user-namespaced Pod. Match the proven canary: inherit that Pod
+    # IPC namespace rather than asking Docker to create and resize /dev/shm.
+    ipc: host
+    networks:
+      - e2e
+
+networks:
+  e2e:
+    name: ${E2E_NETWORK_NAME:?E2E_NETWORK_NAME is required}

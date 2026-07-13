@@ -133,7 +133,14 @@ path:
 ```text
 builder: build -> push scratch image -> scan -> sign -> verify
 compose: pull exact digest -> pypi/npm/cargo smoke -> promote to staging
+compose: pull exact backend/web/test digests -> focused Playwright E2E
 ```
+
+Backend integration and web E2E likewise build their reusable test images once
+on the BuildKit fleet and run only the runtime phase on the repository-scoped
+Compose pool. The pool is capacity four across Jarvis and Skynet; every Pod is
+capacity one, so independent jobs run concurrently without sharing one Podman
+engine.
 
 Bot-authored upstream-sync PRs run a validate-only path with no registry or
 signing secrets. A maintainer can explicitly authorize a smoke deployment with

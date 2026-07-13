@@ -41,7 +41,7 @@ flowchart TB
   scratch@{ shape: cyl, label: "Harbor scratch<br/>artifact-keeper-ci" }
   evidence@{ shape: tag-doc, label: "Build record<br/>SBOM + provenance" }
   verify@{ shape: hex, label: "Trivy + cosign<br/>verify before smoke" }
-  smoke@{ shape: fr-rect, label: "Kubernetes<br/>package smoke" }
+  smoke@{ shape: fr-rect, label: "Isolated Compose<br/>runtime gates" }
   staging@{ shape: datastore, label: "Staging<br/>same digest" }
   release@{ shape: datastore, label: "Release<br/>same digest" }
   flux@{ shape: curv-trap, label: "Flux deploy<br/>repo:tag@sha256" }
@@ -78,8 +78,10 @@ flowchart TB
   Dockerfile and lockfile hashes, runner identity, cache reference, scan report,
   and timestamp.
 - Signing: cosign signatures by digest using an operator-owned trust root.
-- Smoke environment: an isolated Kubernetes namespace or disposable cluster where
-  the vendored chart is installed and exercised by package clients.
+- PR runtime gates: repository-scoped Compose runners with no Kubernetes token;
+  they consume verified immutable images for native-client smoke and browser E2E.
+- Deployment validation: an isolated Kubernetes namespace or disposable cluster
+  remains available for explicit chart-install and release-gate testing.
 - GitOps deployment: Flux or Argo CD rendering the vendored chart and overriding
   image repositories/tags with release digest pins.
 

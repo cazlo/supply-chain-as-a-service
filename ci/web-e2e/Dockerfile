@@ -1,5 +1,5 @@
 # Playwright test-runner image for the private web E2E lane
-# (ci/web-e2e-k8s.sh). It carries only the vendored web repo's test source
+# (ci/web-e2e-run-compose.sh). It carries only the vendored web repo's test source
 # and dependencies -- no application build; the application itself runs from
 # the signed staging images deployed by the chart. Built with rootless
 # BuildKit on the daemonless runners (see ci/web-e2e-image-build.sh).

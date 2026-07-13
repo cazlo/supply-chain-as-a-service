@@ -55,6 +55,9 @@ Source checks, smoke, and publish:
   smoke on `artifact-keeper-compose`, consuming the exact signed digest with no
   Podman-side build. `make source-smoke-compose` remains the workstation entry
   point.
+- `make web-e2e-ci` — runtime-only Playwright Compose lane. It requires exact
+  backend, web, and E2E-runner digest refs produced by the builder jobs.
+  `make web-e2e-k8s-ci` retains the old chart/Job path for manual rollback.
 - `make ci-publish` — local equivalent of the `publish-ci` workflow; requires
   `HARBOR_REGISTRY`/`HARBOR_USERNAME`/`HARBOR_PASSWORD` (keep these in Gitea
   Actions secrets, never in source).

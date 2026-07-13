@@ -44,6 +44,9 @@ jobs:
       - name: Check out the gate implementation
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: Guard the persistent Rust cache contract
+        run: ci/check-rust-cache-contract.sh
+
       - name: Decide publish vs validate-only
         id: decide
         env:
@@ -311,6 +314,66 @@ jobs:
         with:
           name: backend-integration-${{ matrix.test }}-${{ needs.gate.outputs.checkout_ref }}
           path: /tmp/artifact-keeper-integration-${{ matrix.test }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Compose shadow: consume backend-integration-build's exact image digest on
+  # the isolated Podman runner while the complete Kubernetes matrix above
+  # remains present and blocking. The initial two-target proof passed in run
+  # 602; keep the exact all-nine list here for paired acceptance evidence.
+  backend-integration-compose-shadow:
+    needs: [gate, backend-integration-build]
+    if: needs.gate.outputs.run == 'true' && needs.gate.outputs.publish == 'true'
+    runs-on: artifact-keeper-compose
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        test:
+          - lifecycle_policy_tests
+          - api_token_cache_flush_tests
+          - grpc_sbom_tests
+          - search_reindex_tests
+          - scan_convert_to_reused_tests
+          - stuck_scan_janitor_tests
+          - virtual_members_atomicity_test
+          - virtual_members_duplicate_test
+          - oci_chunked_upload_cross_repo_tests
+    steps:
+      - name: Check out the vendored sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.gate.outputs.checkout_ref }}
+
+      - name: Run ${{ matrix.test }} on Compose shadow
+        run: ci/backend-integration-run-compose.sh
+        env:
+          TEST: ${{ matrix.test }}
+          TEST_RUNNER_IMAGE: ${{ needs.backend-integration-build.outputs.image }}
+          QUALITY_RESULTS_DIR: /tmp/artifact-keeper-integration-compose-${{ matrix.test }}
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Print Compose timing and cleanup evidence
+        if: always()
+        run: |
+          results="/tmp/artifact-keeper-integration-compose-${{ matrix.test }}"
+          for file in timings.env runtime-before.txt runtime-after-cleanup.txt; do
+            echo "==> ${file}"
+            if [[ -f "${results}/${file}" ]]; then
+              cat "${results}/${file}"
+            else
+              echo "missing"
+            fi
+          done
+
+      - name: Retain Compose integration log and runtime evidence
+        if: always()
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        with:
+          name: backend-integration-compose-${{ matrix.test }}-${{ needs.gate.outputs.checkout_ref }}
+          path: /tmp/artifact-keeper-integration-compose-${{ matrix.test }}/
           if-no-files-found: warn
           retention-days: 14
 

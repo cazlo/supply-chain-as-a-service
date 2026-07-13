@@ -24,9 +24,14 @@ one leg per target, each running `ci/backend-integration-run-k8s.sh`: stand
 up an ephemeral Postgres deployment (named after the target so concurrent
 legs don't collide in `ak-smoke`), run a k8s Job that pulls the
 already-built image and executes exactly one pre-built binary
-(`/test-bin/<name> --ignored`), then tear both down. No per-leg compile, so
-legs run with much higher matrix concurrency than a BuildKit-per-leg design
-could afford. See `backend-integration`'s header comment in
+(`/test-bin/<name> --ignored`), then tear both down. The test-runner is an
+unsigned, short-lived CI artifact, and consumers receive its immutable Harbor
+digest rather than relying on its mutable short-SHA tag. No per-leg compile,
+so Kubernetes legs run with much higher matrix concurrency than a
+BuildKit-per-leg design could afford. A Compose shadow runs selected targets
+against an isolated Postgres on `artifact-keeper-compose` while retaining the
+Kubernetes matrix for paired semantic and timing evidence. See the integration
+jobs' header comments in
 `.gitea/workflows/publish-ci.yml` for the current target list and what's
 deliberately excluded. Each leg uploads its `integration.log` as a
 `backend-integration-<target>-*` artifact.

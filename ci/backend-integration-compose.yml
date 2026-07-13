@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U registry -d artifact_registry"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  test:
+    image: ${TEST_RUNNER_IMAGE:?TEST_RUNNER_IMAGE is required}
+    working_dir: /work/artifact-keeper
+    environment:
+      DATABASE_URL: postgresql://registry:registry@db:5432/artifact_registry
+      TEST_TARGET: ${TEST_TARGET:?TEST_TARGET is required}
+    command: ["bash", "/work/ci/backend-integration-test-entrypoint.sh"]
+
+volumes:
+  postgres-data:

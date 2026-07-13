@@ -1,14 +1,18 @@
 services:
   postgres:
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
     container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-db
   backend:
     image: ${BACKEND_IMAGE_REF:?BACKEND_IMAGE_REF is required}
     container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-backend
   trivy:
+    image: ghcr.io/aquasecurity/trivy:0.69.3@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
     container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-trivy
   pki:
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19@sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1
     container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-pki
   setup:
+    image: ghcr.io/artifact-keeper/ci-mirror/alpine:3.19@sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1
     container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-setup
     # The vendored setup script keeps its healthcheck sentinel alive when this
     # explicit compatibility flag is set. Docker supplies /.dockerenv; Podman
@@ -17,11 +21,16 @@ services:
     environment:
       DOCKER_CONTAINER: "1"
   pypi-test:
+    image: ghcr.io/artifact-keeper/ci-mirror/python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
     container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-pypi
   npm-test:
+    image: ghcr.io/artifact-keeper/ci-mirror/node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
     container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-npm
   cargo-test:
+    image: ghcr.io/artifact-keeper/ci-mirror/rust:1.75-slim@sha256:70c2a016184099262fd7cee46f3d35fec3568c45c62f87e37f7f665f766b1f74
     container_name: ${SMOKE_CONTAINER_PREFIX:?SMOKE_CONTAINER_PREFIX is required}-cargo
+  proxy-virtual-test:
+    image: ghcr.io/artifact-keeper/ci-mirror/node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
 
 networks:
   e2e-test-network:

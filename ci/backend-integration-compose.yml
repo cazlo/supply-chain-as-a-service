@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: ${INTEGRATION_POSTGRES_IMAGE:?INTEGRATION_POSTGRES_IMAGE is required}
     environment:
       POSTGRES_USER: registry
       POSTGRES_PASSWORD: registry

@@ -3,16 +3,16 @@
 #
 # Two modes, decided by the `gate` job:
 #   * publish  (humans / workflow_dispatch): build -> push -> Trivy scan ->
-#     cosign sign -> verify-before-smoke -> k8s smoke. Harbor + cosign secrets
-#     are referenced only by these steps.
+#     cosign sign -> verify -> runtime-only Compose gates. Harbor + cosign
+#     secrets are referenced only by these steps.
 #   * validate (bot-authored PRs, e.g. the upstream-sync bot): secretless build
 #     and chart-lint only. Untrusted/auto-generated source never receives Harbor
 #     push/signing secrets and is never deployed without human review.
 #   * ChatOps publish: `/deploy smoke` resolves the PR's immutable head SHA and
 #     reruns the publish path after checking that the commenter has write access.
 #
-# Backend and web are independent jobs so the two repository-scoped runners build
-# in parallel; only the backend job continues into the registry smoke.
+# Backend and web build independently; their verified immutable digests feed the
+# native-client smoke and browser E2E runtime jobs on the Compose pool.
 
 name: publish-ci
 
@@ -328,7 +328,7 @@ jobs:
     runs-on: artifact-keeper-compose
     strategy:
       fail-fast: false
-      # Four capacity-one Compose runners are balanced across Jarvis/Skynet.
+      # Four capacity-one Compose runners are balanced across worker nodes.
       max-parallel: 4
       matrix:
         test:

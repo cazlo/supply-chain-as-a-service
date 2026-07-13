@@ -32,7 +32,7 @@ flowchart TB
   cache@{ shape: cyl, label: "Harbor cache image<br/>mode=max" }
   publish@{ shape: lin-rect, label: "Build + push<br/>backend / web" }
   sign@{ shape: hex, label: "Scan + sign<br/>verify" }
-  smoke@{ shape: win-pane, label: "Scoped smoke<br/>namespace" }
+  smoke@{ shape: win-pane, label: "Isolated Compose<br/>runtime gate" }
 
   pr --> gate
   gate -- no --> validate
@@ -57,6 +57,10 @@ flowchart TB
 
 The homelab implementation uses repository-scoped Gitea Actions runners. The
 important reusable details are:
+
+The complete runtime-sidecar contract, security boundaries, implementation
+checklist, and sanitized manifests are in
+[Podman Compose runner design](podman-compose-runner.md).
 
 - Use repository-scoped labels such as `artifact-keeper-builder`; do not expose
   these runners as a general `ubuntu-latest` pool.
@@ -107,6 +111,13 @@ ARC can autoscale build capacity while keeping this repository's expensive image
 builds away from generic shared runners. It is a good fit for organizations that
 want the same vendored deployment pattern but use GitHub as the source authority
 instead of Gitea.
+
+For runtime-only Compose jobs, use a separate ARC runner scale set with the
+custom Podman sidecar pattern described in
+[Podman Compose runner design](podman-compose-runner.md). Do not conflate that
+scale set with ARC's built-in `dind` or `kubernetes` container modes: the
+Podman pattern deliberately supplies its own Docker-compatible API and does not
+grant the runner Kubernetes workload-creation permissions.
 
 ## Cache and Storage Notes
 

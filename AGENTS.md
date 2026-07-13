@@ -32,9 +32,9 @@ the chart's lab values.
 - **Prefer the CI runners over local builds** — the runners have the BuildKit
   cache and Harbor push/sign secrets; the local box is slow and unprivileged.
 - `publish-ci` runs automatically on every PR (and on manual dispatch). Human/
-  dispatch PRs build → scan (Trivy) → sign (cosign) → verify → k8s smoke and
-  push to Harbor; bot-authored PRs (the upstream-sync bot) are validate-only and
-  never receive secrets or get deployed.
+  dispatch PRs build → scan (Trivy) → sign (cosign) → verify → Compose runtime
+  gates and push to Harbor; bot-authored PRs (the upstream-sync bot) are
+  validate-only and never receive secrets or get deployed.
 
 ## Common commands
 

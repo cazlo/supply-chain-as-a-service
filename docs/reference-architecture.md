@@ -7,7 +7,10 @@ registry projects by immutable digest.
 
 ## Trust Model
 
-The trusted path is intentionally narrow:
+The trusted path is intentionally narrow. Backend staging follows native-client
+smoke; web staging follows signature verification. Browser E2E consumes the
+exact verified backend, web, and test-runner digests and gates the PR/merge, but
+does not delay the web component's staging copy:
 
 ```text
 upstream release
@@ -17,8 +20,10 @@ upstream release
   -> controlled runner build
   -> registry scratch project
   -> scan + sign + verify
-  -> isolated Compose native-client smoke
-  -> staging project
+  -> backend: isolated Compose native-client smoke -> staging project
+  -> web: staging project
+  -> exact verified digests: isolated Compose browser E2E
+  -> required checks green
   -> merge to main
   -> release project
   -> GitOps digest pin
@@ -41,15 +46,21 @@ flowchart TB
   scratch@{ shape: cyl, label: "Harbor scratch<br/>artifact-keeper-ci" }
   evidence@{ shape: tag-doc, label: "Build record<br/>SBOM + provenance" }
   verify@{ shape: hex, label: "Trivy + cosign<br/>verify before smoke" }
-  smoke@{ shape: fr-rect, label: "Isolated Compose<br/>runtime gates" }
+  smoke@{ shape: fr-rect, label: "Backend Compose<br/>package smoke" }
+  browser@{ shape: fr-rect, label: "Compose<br/>browser E2E" }
   staging@{ shape: datastore, label: "Staging<br/>same digest" }
+  green@{ shape: hex, label: "Required checks<br/>green" }
   release@{ shape: datastore, label: "Release<br/>same digest" }
   flux@{ shape: curv-trap, label: "Flux deploy<br/>repo:tag@sha256" }
 
   upstream --> hold --> pr --> human --> fork
   fork --> backend --> scratch
   fork --> web --> scratch
-  scratch --> evidence --> verify --> smoke --> staging --> release --> flux
+  scratch --> evidence --> verify
+  verify -->|backend| smoke --> staging
+  verify -->|web| staging
+  verify --> browser --> green
+  staging --> green --> release --> flux
 
   classDef source fill:#dff3ff,stroke:#277da1,stroke-width:2px,color:#102a43,font-size:18px
   classDef policy fill:#fff1c7,stroke:#d99a00,stroke-width:2px,color:#3b2f12,font-size:18px
@@ -57,7 +68,7 @@ flowchart TB
   classDef registry fill:#e9defa,stroke:#7c3aed,stroke-width:2px,color:#27133f,font-size:18px
   classDef deploy fill:#dff7e7,stroke:#238636,stroke-width:2px,color:#12351f,font-size:18px
   class upstream,pr source
-  class hold,human,verify,smoke policy
+  class hold,human,verify,smoke,browser,green policy
   class fork,backend,web,evidence build
   class scratch,staging,release registry
   class flux deploy
@@ -80,6 +91,8 @@ flowchart TB
 - Signing: cosign signatures by digest using an operator-owned trust root.
 - PR runtime gates: repository-scoped Compose runners with no Kubernetes token;
   they consume verified immutable images for native-client smoke and browser E2E.
+  See [Podman Compose runner design](podman-compose-runner.md) for Gitea and
+  GitHub ARC implementations of this boundary.
 - Deployment validation: an isolated Kubernetes namespace or disposable cluster
   remains available for explicit chart-install and release-gate testing.
 - GitOps deployment: Flux or Argo CD rendering the vendored chart and overriding
@@ -93,7 +106,7 @@ Use separate registry projects so credentials and retention can be scoped:
 | --- | --- | --- | --- | --- |
 | `artifact-keeper-cache` | BuildKit layer cache | bounded by registry GC policy | CI builders | CI builders |
 | `artifact-keeper-ci` | per-PR scratch images | short, for example 7 days | CI publish lane | CI smoke lane |
-| `artifact-keeper-staging` | signed images from green PRs | medium | CI promote step | release promotion |
+| `artifact-keeper-staging` | signed component images; backend entries are native-smoke-passed, while PR-wide merge gates remain separate | medium | CI promote step | release promotion |
 | `artifact-keeper-release` | deployable signed images | durable | release promotion | GitOps cluster |
 
 Use different robot accounts for push-capable CI and pull-only deployment. The

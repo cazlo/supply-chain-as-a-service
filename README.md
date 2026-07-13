@@ -2,9 +2,10 @@
 
 Reference architecture and working implementation for operating a vendored
 Artifact Keeper deployment as a supply-chain hardening system. The repository
-vendors Artifact Keeper source, web, and IaC snapshots; builds and signs local
-runtime images; scans them; smokes the vendored chart; and promotes immutable
-digests into a release registry that a GitOps cluster can consume.
+vendors Artifact Keeper source, web, and IaC snapshots; builds, scans, and signs
+local runtime images; exercises them through isolated Compose gates; retains a
+manual chart-smoke path; and promotes immutable digests into a release registry
+that a GitOps cluster can consume.
 
 This repo has two jobs:
 
@@ -38,6 +39,8 @@ The current pattern includes:
   large and warm caches materially change feedback time.
 - Trivy scanning, cosign signing by digest, verify-before-smoke, and retained
   build records.
+- Digest-pinned application, test-runner, database, search, and native-client
+  images in the Compose runtime gates.
 - Staging and release promotion by digest, without rebuilding on merge.
 - A scheduled upstream-sync bot that imports upstream releases only after a
   configurable software-age hold, then opens a review PR.
@@ -87,7 +90,9 @@ See [docs/reference-architecture.md](docs/reference-architecture.md) for the
 architecture and trust model, [docs/gitops-deployment-example.md](docs/gitops-deployment-example.md)
 for the sanitized Flux deployment pattern, and
 [docs/runner-options.md](docs/runner-options.md) for Gitea and GitHub ARC runner
-options. The [package-manager mTLS survey](docs/package-manager-mtls-support.md)
+options. [docs/podman-compose-runner.md](docs/podman-compose-runner.md) provides
+the detailed, public-safe Podman sidecar design and its ARC scale-set mapping.
+The [package-manager mTLS survey](docs/package-manager-mtls-support.md)
 compares client-certificate support across major ecosystems and describes an
 Artifact Keeper deployment protected by Teleport Application Access.
 
@@ -138,9 +143,9 @@ compose: pull exact backend/web/test digests -> focused Playwright E2E
 
 Backend integration and web E2E likewise build their reusable test images once
 on the BuildKit fleet and run only the runtime phase on the repository-scoped
-Compose pool. The pool is capacity four across Jarvis and Skynet; every Pod is
-capacity one, so independent jobs run concurrently without sharing one Podman
-engine.
+Compose pool. The example pool has four runners spread across worker nodes;
+every Pod is capacity one, so independent jobs run concurrently without
+sharing one Podman engine.
 
 Bot-authored upstream-sync PRs run a validate-only path with no registry or
 signing secrets. A maintainer can explicitly authorize a smoke deployment with

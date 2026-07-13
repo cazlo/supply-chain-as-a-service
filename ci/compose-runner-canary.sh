@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Upstream-parity Docker Compose + focused Playwright proof for the dedicated
-# artifact-keeper-compose runner. This lane deliberately consumes no publishing
-# credentials and does not replace the Kubernetes-native web E2E lane.
+# artifact-keeper-compose runner. This maintenance diagnostic deliberately
+# consumes no publishing credentials; the publish workflow uses prebuilt,
+# digest-pinned images rather than this canary's small compatibility builds.
 set -euo pipefail
 
 readonly root="$(git rev-parse --show-toplevel)"

@@ -1,4 +1,10 @@
 services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+
+  meilisearch:
+    image: docker.io/getmeili/meilisearch:v1.12@sha256:c9fac23131cca4db95173d41cc50fd5639121ee381795528fdd7522d7978a7b8
+
   backend:
     image: ${BACKEND_IMAGE_REF:?BACKEND_IMAGE_REF is required}
 

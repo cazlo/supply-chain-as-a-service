@@ -24,7 +24,10 @@ one leg per target, each running `ci/backend-integration-run-compose.sh` on
 the capacity-one `artifact-keeper-compose` runner. Each leg starts an isolated
 Postgres service, pulls the already-built image, executes exactly one pre-built
 binary (`/test-bin/<name> --ignored`), records timing and cleanup evidence, and
-tears down its entire Compose project. The test-runner is an unsigned,
+tears down its entire Compose project. Shared lifecycle handling bounds every
+teardown command, removes registry credentials before cleanup, and turns a
+passing test into a failed job if any container, volume, or project network
+remains. The test-runner is an unsigned,
 short-lived CI artifact, and consumers receive its immutable Harbor digest
 rather than relying on its mutable short-SHA tag. There is no per-leg compile.
 The former Kubernetes matrix was removed after paired all-nine and repeat

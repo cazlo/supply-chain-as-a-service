@@ -21,98 +21,40 @@ readonly timeout_seconds="${COMPOSE_E2E_TIMEOUT_SECONDS:-1500}"
 readonly revision="$(git rev-parse --short=8 HEAD)"
 readonly run_suffix="${GITEA_RUN_NUMBER:-${GITHUB_RUN_NUMBER:-0}}"
 readonly runner_docker_config="${DOCKER_CONFIG:-${HOME}/.docker}"
+readonly cleanup_timeout_seconds="${COMPOSE_CLEANUP_COMMAND_TIMEOUT_SECONDS:-30}"
 
-export COMPOSE_PROJECT_NAME="ak-web-e2e-${revision}-${run_suffix}"
+run_id="${GITEA_RUN_ID:-${GITHUB_RUN_ID:-${run_suffix}}}"
+run_attempt="${GITEA_RUN_ATTEMPT:-${GITHUB_RUN_ATTEMPT:-1}}"
+export COMPOSE_PROJECT_NAME="ak-web-e2e-${revision}-${run_id}-${run_attempt}"
 export E2E_NETWORK_NAME="${COMPOSE_PROJECT_NAME}-network"
 export BACKEND_IMAGE_REF="${backend_image}"
 export WEB_IMAGE_REF="${web_image}"
 export E2E_RUNNER_IMAGE="${runner_image}"
-export DOCKER_CONFIG="${TMPDIR:-/tmp}/${COMPOSE_PROJECT_NAME}-docker-config"
 
 readonly test_container="${COMPOSE_PROJECT_NAME}-playwright"
-child_pid=""
-watchdog_pid=""
-started_at="$(date +%s)"
+readonly docker_config="${TMPDIR:-/tmp}/${COMPOSE_PROJECT_NAME}-docker-config"
 
-rm -rf "${DOCKER_CONFIG}"
-mkdir -p "${results_dir}" "${DOCKER_CONFIG}"
-rm -rf "${results_dir:?}"/*
-chmod 700 "${DOCKER_CONFIG}"
-if [[ -f "${runner_docker_config}/config.json" ]]; then
-  cp "${runner_docker_config}/config.json" "${DOCKER_CONFIG}/config.json"
-fi
-if [[ -d "${runner_docker_config}/cli-plugins" ]]; then
-  ln -s "${runner_docker_config}/cli-plugins" "${DOCKER_CONFIG}/cli-plugins"
-fi
-
-compose() {
-  docker compose --file "${compose_file}" --file "${override_file}" "$@"
-}
-
-runtime_snapshot() {
-  local destination="$1"
-  {
-    printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'containers=%s\n' "$(docker ps -aq | wc -l | tr -d ' ')"
-    printf 'volumes=%s\n' "$(docker volume ls -q | wc -l | tr -d ' ')"
-    printf 'e2e_networks=%s\n' \
-      "$(docker network ls --format '{{.Name}}' | grep -c "^${E2E_NETWORK_NAME}$" || true)"
-    docker system df
-  } >"${destination}" 2>&1
-}
+COMPOSE_RUNTIME_RESULTS_DIR="${results_dir}"
+COMPOSE_RUNTIME_DOCKER_CONFIG="${docker_config}"
+COMPOSE_RUNTIME_RUNNER_DOCKER_CONFIG="${runner_docker_config}"
+COMPOSE_RUNTIME_TEST_CONTAINER="${test_container}"
+COMPOSE_RUNTIME_NETWORK_PATTERN="^${E2E_NETWORK_NAME}$"
+COMPOSE_RUNTIME_CLEANUP_COMMAND_TIMEOUT_SECONDS="${cleanup_timeout_seconds}"
+COMPOSE_RUNTIME_COMPOSE_ARGS=(--file "${compose_file}" --file "${override_file}")
+# shellcheck source=ci/compose-runtime-lib.sh
+source "${root}/ci/compose-runtime-lib.sh"
+compose_runtime_init
 
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
-  set +e
-  [[ -z "${watchdog_pid}" ]] || kill "${watchdog_pid}" >/dev/null 2>&1 || true
-  docker rm -f "${test_container}" >/dev/null 2>&1 || true
-  compose ps --all >"${results_dir}/compose-ps.txt" 2>&1
-  compose logs --no-color >"${results_dir}/compose.log" 2>&1
-  down_started="$(date +%s)"
-  compose down --volumes --remove-orphans >"${results_dir}/compose-down.log" 2>&1
-  down_finished="$(date +%s)"
-  runtime_snapshot "${results_dir}/runtime-after-cleanup.txt"
-  docker logout "${harbor_registry}" >/dev/null 2>&1 || true
-  rm -rf "${DOCKER_CONFIG}"
-  {
-    printf 'started_epoch=%s\n' "${started_at}"
-    printf 'cleanup_started_epoch=%s\n' "${down_started}"
-    printf 'cleanup_finished_epoch=%s\n' "${down_finished}"
-    printf 'total_seconds=%s\n' "$(( down_finished - started_at ))"
-    printf 'cleanup_seconds=%s\n' "$(( down_finished - down_started ))"
-  } >>"${results_dir}/timings.env"
-  exit "${rc}"
+  compose_runtime_finalize "${rc}"
+  exit $?
 }
 trap cleanup EXIT
 
-on_signal() {
-  local signal="$1" rc=143
-  [[ "${signal}" != INT ]] || rc=130
-  echo "Received ${signal}; terminating active web E2E command" >&2
-  if [[ -n "${child_pid}" ]]; then
-    kill -TERM "${child_pid}" >/dev/null 2>&1 || true
-    for _ in $(seq 1 20); do
-      kill -0 "${child_pid}" >/dev/null 2>&1 || break
-      sleep 0.1
-    done
-    kill -KILL "${child_pid}" >/dev/null 2>&1 || true
-  fi
-  exit "${rc}"
-}
-trap 'on_signal INT' INT
-trap 'on_signal TERM' TERM
-
-run_interruptible() {
-  "$@" &
-  child_pid=$!
-  set +e
-  wait "${child_pid}"
-  local rc=$?
-  set -e
-  child_pid=""
-  return "${rc}"
-}
+trap 'compose_runtime_on_signal INT "web E2E command"' INT
+trap 'compose_runtime_on_signal TERM "web E2E command"' TERM
 
 [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ ]] || {
   echo "COMPOSE_E2E_TIMEOUT_SECONDS must be a positive integer" >&2
@@ -132,8 +74,10 @@ done
 awk '$1 == 0 && $2 > 65535 && $3 >= 65536 { ok=1 } END { exit !ok }' \
   /proc/self/uid_map || { echo "Compose runner lacks the expected Pod user namespace" >&2; exit 1; }
 
-runtime_snapshot "${results_dir}/runtime-before.txt"
-compose config --format json >"${results_dir}/compose-config.json"
+compose_runtime_snapshot "${results_dir}/runtime-before.txt"
+compose_runtime_assert_clean "before startup"
+compose_runtime_compose config --format json >"${results_dir}/compose-config.json"
+compose_runtime_require_digest_images "${results_dir}/compose-config.json"
 for pair in \
   "backend:${backend_image}" \
   "web:${web_image}" \
@@ -148,18 +92,13 @@ for pair in \
   }
 done
 
-printf '%s' "${harbor_password}" |
-  docker login "${harbor_registry}" --username "${harbor_username}" --password-stdin >/dev/null
-
-(
-  sleep "${timeout_seconds}"
-  echo "Web E2E watchdog reached ${timeout_seconds}s; requesting cleanup" >&2
-  kill -TERM "$$"
-) &
-watchdog_pid=$!
+compose_runtime_start_watchdog "${timeout_seconds}" "Web E2E"
+compose_runtime_registry_login \
+  "${harbor_registry}" "${harbor_username}" "${harbor_password}" >/dev/null
 
 pull_started="$(date +%s)"
-run_interruptible compose pull postgres meilisearch backend web playwright
+compose_runtime_run_interruptible compose_runtime_compose pull \
+  postgres meilisearch backend web playwright
 pull_finished="$(date +%s)"
 
 for pair in \
@@ -173,12 +112,13 @@ for pair in \
 done
 
 up_started="$(date +%s)"
-run_interruptible compose up --detach --no-build --wait postgres meilisearch backend web
+compose_runtime_run_interruptible compose_runtime_compose up \
+  --detach --no-build --wait postgres meilisearch backend web
 up_finished="$(date +%s)"
 
 test_started="$(date +%s)"
 set +e
-run_interruptible bash -o pipefail -c \
+compose_runtime_run_interruptible bash -o pipefail -c \
   'docker compose --file "$1" --file "$2" run --name "$3" --no-deps playwright npx playwright test --project="$4" --timeout="$5" "$6" 2>&1 | tee "$7"' \
   _ "${compose_file}" "${override_file}" "${test_container}" "${project}" \
   "${test_timeout_ms}" "${spec}" "${results_dir}/playwright.log"

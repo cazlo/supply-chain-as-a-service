@@ -98,7 +98,7 @@ readonly canary_timeout_seconds="${COMPOSE_CANARY_TIMEOUT_SECONDS:-1500}"
   sleep "${canary_timeout_seconds}"
   echo "Canary watchdog reached ${canary_timeout_seconds}s; requesting cleanup" >&2
   kill -TERM "$$"
-) &
+) >"${results_dir}/watchdog.log" 2>&1 &
 watchdog_pid=$!
 
 [[ "$(id -u)" -ne 0 ]] || {

@@ -10,13 +10,272 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
-use tar::Archive;
 use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
 use crate::models::repository::RepositoryFormat;
+
+// ---------------------------------------------------------------------------
+// P2 (#2460) — Debian remote/mirror proxy filter configuration
+// ---------------------------------------------------------------------------
+//
+// Operator-scoped distribution/component/architecture allowlists for Debian
+// *Remote* (proxy) repositories. This is a PRE-FETCH allow/deny gate only:
+// allowed paths pass through the existing (P1-hardened) proxy path
+// byte-for-byte; denied paths are refused before any upstream fetch. There is
+// NO metadata regeneration (P3) and NO local re-signing (P4) in this release —
+// those strategies are accepted on the enum but rejected with 422 by
+// [`DebianRepositoryConfig::validate_passthrough_only`].
+//
+// Stored as a JSON string under the [`DEBIAN_CONFIG_KEY`] key in the existing
+// generic `repository_config` KV table (no schema migration), the same pattern
+// used by `apt_origin` / `index_upstream_url`.
+
+/// `repository_config` key under which the Debian proxy filter config JSON is
+/// stored for a remote repository.
+pub const DEBIAN_CONFIG_KEY: &str = "debian_config";
+
+/// How metadata (`Packages`/`Release`) is produced for a Debian remote.
+///
+/// Only [`DebianMetadataStrategy::UpstreamPassthrough`] is implemented in
+/// 1.6.0; the other variants are reserved for P3 (filtered generation) / P4
+/// (local re-signing) and are rejected with 422 until then. The enum lands now
+/// so those phases can flip it on without a schema/config-shape change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DebianMetadataStrategy {
+    /// Serve upstream `Release`/`InRelease`/`Release.gpg`/`Packages`
+    /// byte-for-byte (clients keep trusting the distro key). Default.
+    #[default]
+    UpstreamPassthrough,
+    /// P3 (1.7.0): regenerate a filtered, AK-authored (unsigned) index.
+    FilterAndGenerate,
+    /// P4 (1.7.0): regenerate a filtered index and re-sign it with a local key.
+    FilterGenerateAndSign,
+    /// Hosted-repo style generation (AK is the origin). Reserved.
+    HostedGenerate,
+}
+
+/// How package bodies are fetched for a Debian remote.
+///
+/// Only [`DebianPackageFetchStrategy::UpstreamPassthrough`] is implemented in
+/// 1.6.0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DebianPackageFetchStrategy {
+    /// Fetch `.deb` bodies lazily from upstream on demand (pull-through). Default.
+    #[default]
+    UpstreamPassthrough,
+    /// P3 (1.7.0): eagerly mirror the selected subset ahead of requests.
+    Eager,
+}
+
+/// Deserialize a `Vec<String>` where `null` (or an absent field paired with
+/// `#[serde(default)]`) yields an empty vector. Empty and `["*"]` both mean
+/// "select all" for the filter predicates.
+fn deserialize_vec_string_or_null<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<Vec<String>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+/// P2 Debian remote proxy filter config (dist/component/arch allowlists).
+///
+/// Semantics for each allowlist: an empty list OR a list containing `"*"`
+/// selects everything (today's full-proxy behaviour); otherwise only exact
+/// matches are selected. Architecture-independent (`all`) packages are always
+/// permitted regardless of the `architectures` allowlist.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DebianRepositoryConfig {
+    /// Distributions (a.k.a. suites/codenames, e.g. `bookworm`) to proxy.
+    /// Empty or `["*"]` = all.
+    #[serde(
+        default,
+        alias = "distributions",
+        deserialize_with = "deserialize_vec_string_or_null"
+    )]
+    pub distribution_paths: Vec<String>,
+    /// Components (e.g. `main`, `contrib`, `non-free`) to proxy. Empty/`["*"]` = all.
+    #[serde(default, deserialize_with = "deserialize_vec_string_or_null")]
+    pub components: Vec<String>,
+    /// Architectures (e.g. `amd64`, `arm64`) to proxy. Empty/`["*"]` = all.
+    /// `all` (arch-independent) is always permitted.
+    #[serde(default, deserialize_with = "deserialize_vec_string_or_null")]
+    pub architectures: Vec<String>,
+    /// Whether source packages (`Sources`, `.dsc`) are included. Advisory in
+    /// passthrough (upstream metadata is unchanged); honored under P3.
+    #[serde(default)]
+    pub include_source_packages: bool,
+    /// Flat (non-`dists/`) repository layout flag. Accepted but does NOT weaken
+    /// P1's flat/redirect abuse posture in passthrough.
+    #[serde(default)]
+    pub flat_repository: bool,
+    /// Whether to verify the upstream signed `Release` before serving. In P2 the
+    /// P1 integrity gate already enforces index/Release consistency; this flag
+    /// is reserved for P4 trust-anchor verification.
+    #[serde(default)]
+    pub verify_upstream_metadata: bool,
+    /// Upstream GPG key id used to verify upstream metadata (reserved for P4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_gpg_key_id: Option<String>,
+    /// Metadata production strategy. Only `upstream_passthrough` in 1.6.0.
+    #[serde(default)]
+    pub metadata_strategy: DebianMetadataStrategy,
+    /// Package-body fetch strategy. Only `upstream_passthrough` in 1.6.0.
+    #[serde(default)]
+    pub package_fetch_strategy: DebianPackageFetchStrategy,
+    /// Package-name-level queries. NOT honored in passthrough (that needs P3);
+    /// a non-empty value here with `upstream_passthrough` is rejected with 422
+    /// rather than silently advertising content the proxy would then block.
+    #[serde(default, deserialize_with = "deserialize_vec_string_or_null")]
+    pub package_queries: Vec<String>,
+    /// Defense-in-depth (#2562): when `false` (the default) a proxy request
+    /// whose path carries a percent-encoded path separator (`%2f` = `/`,
+    /// `%5c` = `\`, at any decode layer) is rejected with 400 before any
+    /// upstream fetch. APT never percent-encodes path separators, so this only
+    /// ever blocks path-confusion/traversal probes; set it `true` to opt out
+    /// for a nonstandard upstream that genuinely requires encoded separators.
+    #[serde(default)]
+    pub allow_encoded_separators: bool,
+}
+
+/// Partial-update patch for [`DebianRepositoryConfig`]. Fields left absent are
+/// preserved; provided fields (including an explicit empty list) replace the
+/// stored value. Applied on top of the currently stored config, or on top of
+/// the default when none exists yet.
+#[derive(Clone, Debug, Default, Deserialize, utoipa::ToSchema)]
+pub struct DebianConfigPatch {
+    #[serde(default, alias = "distributions")]
+    pub distribution_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub components: Option<Vec<String>>,
+    #[serde(default)]
+    pub architectures: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_source_packages: Option<bool>,
+    #[serde(default)]
+    pub flat_repository: Option<bool>,
+    #[serde(default)]
+    pub verify_upstream_metadata: Option<bool>,
+    #[serde(default)]
+    pub upstream_gpg_key_id: Option<String>,
+    #[serde(default)]
+    pub metadata_strategy: Option<DebianMetadataStrategy>,
+    #[serde(default)]
+    pub package_fetch_strategy: Option<DebianPackageFetchStrategy>,
+    #[serde(default)]
+    pub package_queries: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_encoded_separators: Option<bool>,
+}
+
+impl DebianConfigPatch {
+    /// Merge this patch onto `base`, returning the updated config.
+    pub fn apply_to(self, mut base: DebianRepositoryConfig) -> DebianRepositoryConfig {
+        if let Some(v) = self.distribution_paths {
+            base.distribution_paths = v;
+        }
+        if let Some(v) = self.components {
+            base.components = v;
+        }
+        if let Some(v) = self.architectures {
+            base.architectures = v;
+        }
+        if let Some(v) = self.include_source_packages {
+            base.include_source_packages = v;
+        }
+        if let Some(v) = self.flat_repository {
+            base.flat_repository = v;
+        }
+        if let Some(v) = self.verify_upstream_metadata {
+            base.verify_upstream_metadata = v;
+        }
+        if let Some(v) = self.upstream_gpg_key_id {
+            base.upstream_gpg_key_id = Some(v);
+        }
+        if let Some(v) = self.metadata_strategy {
+            base.metadata_strategy = v;
+        }
+        if let Some(v) = self.package_fetch_strategy {
+            base.package_fetch_strategy = v;
+        }
+        if let Some(v) = self.package_queries {
+            base.package_queries = v;
+        }
+        if let Some(v) = self.allow_encoded_separators {
+            base.allow_encoded_separators = v;
+        }
+        base
+    }
+}
+
+impl DebianRepositoryConfig {
+    /// True when no dimension is filtered (all allowlists empty) — behaves
+    /// exactly like the pre-#2460 full-proxy repository.
+    pub fn is_passthrough_all(&self) -> bool {
+        self.distribution_paths.is_empty()
+            && self.components.is_empty()
+            && self.architectures.is_empty()
+    }
+
+    /// Shared allowlist test: empty list or a `"*"` wildcard selects everything;
+    /// otherwise an exact match is required.
+    fn list_selects(list: &[String], value: &str) -> bool {
+        list.is_empty() || list.iter().any(|v| v == "*" || v == value)
+    }
+
+    /// Whether `distribution` is within the configured allowlist.
+    pub fn distribution_selected(&self, distribution: &str) -> bool {
+        Self::list_selects(&self.distribution_paths, distribution)
+    }
+
+    /// Whether `component` is within the configured allowlist.
+    pub fn component_selected(&self, component: &str) -> bool {
+        Self::list_selects(&self.components, component)
+    }
+
+    /// Whether `arch` is within the configured allowlist. Architecture-
+    /// independent (`all`) packages are always permitted because a
+    /// single-arch client still needs them.
+    pub fn arch_selected(&self, arch: &str) -> bool {
+        arch == "all" || Self::list_selects(&self.architectures, arch)
+    }
+
+    /// Validate that this config only asks for functionality implemented in the
+    /// 1.6.0 passthrough-only release. Returns an error message suitable for a
+    /// 422 response when it asks for metadata regeneration / re-signing, a
+    /// non-passthrough fetch strategy, or an internally inconsistent filter.
+    pub fn validate_passthrough_only(&self) -> std::result::Result<(), String> {
+        if self.metadata_strategy != DebianMetadataStrategy::UpstreamPassthrough {
+            return Err(
+                "metadata_strategy other than 'upstream_passthrough' is not yet supported in this release"
+                    .to_string(),
+            );
+        }
+        if self.package_fetch_strategy != DebianPackageFetchStrategy::UpstreamPassthrough {
+            return Err(
+                "package_fetch_strategy other than 'upstream_passthrough' is not yet supported in this release"
+                    .to_string(),
+            );
+        }
+        // Consistency reject: passthrough serves upstream metadata unchanged, so
+        // it cannot honor package-name-level filtering. Advertising blocked
+        // content would be a correctness footgun — reject rather than lie.
+        if !self.package_queries.is_empty() {
+            return Err(
+                "package_queries requires filtered metadata generation, which is not supported with upstream_passthrough"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
 
 /// Debian format handler
 pub struct DebianHandler;
@@ -85,7 +344,11 @@ impl DebianHandler {
         }
 
         // Pool package
-        if path.starts_with("pool/") || path.ends_with(".deb") || path.ends_with(".udeb") {
+        if path.starts_with("pool/")
+            || path.ends_with(".deb")
+            || path.ends_with(".udeb")
+            || path.ends_with(".ddeb")
+        {
             let filename = path.rsplit('/').next().unwrap_or(path);
             let info = Self::parse_deb_filename(filename)?;
 
@@ -119,6 +382,7 @@ impl DebianHandler {
         let name = filename
             .strip_suffix(".deb")
             .or_else(|| filename.strip_suffix(".udeb"))
+            .or_else(|| filename.strip_suffix(".ddeb"))
             .ok_or_else(|| {
                 AppError::Validation(format!("Invalid Debian package filename: {}", filename))
             })?;
@@ -207,9 +471,17 @@ impl DebianHandler {
         ))
     }
 
-    /// Parse control.tar(.gz) to extract control file
+    /// Parse control.tar(.gz) to extract control file.
+    ///
+    /// The decompressor is selected from the ar member extension and then routed
+    /// through the shared bounded extractor (#2556): the total-byte budget on
+    /// the DECODED stream aborts a gz/xz/bz2/zstd `control.tar` bomb mid-inflate
+    /// (previously the `read_to_string` on `control` inflated unbounded and only
+    /// returned 400 *after* buffering), and the entry-count + per-entry caps
+    /// bound the walk. xz/zstd amplify hardest, so the decoded-stream budget is
+    /// the primary defence.
     fn parse_control_tar(data: &[u8], member_name: &str) -> Result<DebControl> {
-        let reader: Box<dyn Read + '_> = if member_name.ends_with(".gz") {
+        let decoder: Box<dyn Read + '_> = if member_name.ends_with(".gz") {
             Box::new(GzDecoder::new(data))
         } else if member_name.ends_with(".xz") {
             Box::new(XzDecoder::new(data))
@@ -223,32 +495,18 @@ impl DebianHandler {
             Box::new(data)
         };
 
-        let mut archive = Archive::new(reader);
+        let content =
+            crate::util::bounded_archive::read_metadata_from_decoded_tar(decoder, |path| {
+                path.ends_with("control")
+            })?
+            .ok_or_else(|| {
+                AppError::Validation("control file not found in control.tar".to_string())
+            })?;
 
-        for entry in archive
-            .entries()
-            .map_err(|e| AppError::Validation(format!("Invalid control.tar: {}", e)))?
-        {
-            let mut entry =
-                entry.map_err(|e| AppError::Validation(format!("Invalid tar entry: {}", e)))?;
+        let content = String::from_utf8(content)
+            .map_err(|e| AppError::Validation(format!("Failed to read control file: {}", e)))?;
 
-            let path = entry
-                .path()
-                .map_err(|e| AppError::Validation(format!("Invalid path: {}", e)))?;
-
-            if path.ends_with("control") {
-                let mut content = String::new();
-                entry.read_to_string(&mut content).map_err(|e| {
-                    AppError::Validation(format!("Failed to read control file: {}", e))
-                })?;
-
-                return Self::parse_control(&content);
-            }
-        }
-
-        Err(AppError::Validation(
-            "control file not found in control.tar".to_string(),
-        ))
+        Self::parse_control(&content)
     }
 
     /// Parse Debian control file format
@@ -377,7 +635,11 @@ impl FormatHandler for DebianHandler {
 
         // Extract control if this is a package
         if !content.is_empty() && matches!(info.operation, DebianOperation::Package) {
-            if let Ok(control) = Self::extract_control(content) {
+            // #2561: permit-scoped decode; on saturation skip this best-effort
+            // metadata enrichment rather than blocking/queueing.
+            if let Ok(Ok(control)) = crate::util::bounded_archive::with_ingest_extraction(|| {
+                Self::extract_control(content)
+            }) {
                 metadata["control"] = serde_json::to_value(&control)?;
             }
         }
@@ -390,7 +652,10 @@ impl FormatHandler for DebianHandler {
 
         // Validate .deb packages
         if !content.is_empty() && matches!(info.operation, DebianOperation::Package) {
-            let control = Self::extract_control(content)?;
+            // #2561: permit-scoped decode, fast-fail 503 on saturation.
+            let control = crate::util::bounded_archive::with_ingest_extraction(|| {
+                Self::extract_control(content)
+            })??;
 
             // Verify package name matches
             if let Some(path_package) = &info.package {
@@ -595,6 +860,92 @@ pub fn generate_release(
     release
 }
 
+/// Parse the `SHA256:` checksum section of a signed `Release`/`InRelease`
+/// document into a map of dist-relative path -> (sha256_hex, size).
+///
+/// Only the SHA256 section is honoured; the weaker `MD5Sum:` / `SHA1:`
+/// sections are ignored so they can never become a source of truth. A
+/// clearsigned `InRelease` wrapper is handled transparently: the PGP armor
+/// lines and the `Hash:` header do not match a checksum-entry shape, and the
+/// trailing signature block terminates the section like any other top-level
+/// field. Malformed or empty input yields an empty map.
+pub fn parse_release_checksums(release_text: &str) -> HashMap<String, (String, u64)> {
+    let mut out = HashMap::new();
+    let mut in_sha256 = false;
+    for line in release_text.lines() {
+        // Indented continuation lines inside the active section are entries.
+        if in_sha256 && (line.starts_with(' ') || line.starts_with('\t')) {
+            if let Some(h) = parse_release_hash_line(line) {
+                out.insert(h.path, (h.hash, h.size));
+            }
+            continue;
+        }
+        // A non-indented line is a field header; it switches sections.
+        in_sha256 = line.trim_end().eq_ignore_ascii_case("SHA256:");
+    }
+    out
+}
+
+/// Parse a single indented `Release` hash entry (`<hash> <size> <path>`) into
+/// a [`ReleaseHash`]. Returns `None` when the line does not carry exactly the
+/// three whitespace-separated fields or the size is not a number.
+fn parse_release_hash_line(line: &str) -> Option<ReleaseHash> {
+    let mut it = line.split_whitespace();
+    let hash = it.next()?.to_string();
+    let size = it.next()?.parse::<u64>().ok()?;
+    let path = it.next()?.to_string();
+    if it.next().is_some() || hash.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(ReleaseHash { hash, size, path })
+}
+
+/// Parse a `Packages` index into a map of `Filename` -> (sha256_hex, size).
+///
+/// Stanzas are separated by blank lines; a stanza missing any of `Filename`,
+/// `SHA256`, or `Size` (or with a non-numeric size) is skipped. Malformed or
+/// empty input yields an empty map.
+pub fn parse_packages_index(packages_text: &str) -> HashMap<String, (String, u64)> {
+    let mut out = HashMap::new();
+    let mut filename: Option<String> = None;
+    let mut sha256: Option<String> = None;
+    let mut size: Option<u64> = None;
+    for line in packages_text.lines() {
+        if line.trim().is_empty() {
+            insert_package_stanza(&mut out, &mut filename, &mut sha256, &mut size);
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("Filename:") {
+            filename = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("SHA256:") {
+            sha256 = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Size:") {
+            size = v.trim().parse::<u64>().ok();
+        }
+    }
+    insert_package_stanza(&mut out, &mut filename, &mut sha256, &mut size);
+    out
+}
+
+/// Flush a completed `Packages` stanza into `out`, resetting the accumulators.
+/// A stanza that did not collect all three required fields is discarded.
+fn insert_package_stanza(
+    out: &mut HashMap<String, (String, u64)>,
+    filename: &mut Option<String>,
+    sha256: &mut Option<String>,
+    size: &mut Option<u64>,
+) {
+    if let (Some(f), Some(s), Some(z)) = (filename.take(), sha256.take(), size.take()) {
+        if !f.is_empty() && !s.is_empty() {
+            out.insert(f, (s, z));
+        }
+    } else {
+        filename.take();
+        sha256.take();
+        size.take();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +986,15 @@ mod tests {
             DebianHandler::parse_deb_filename("base-installer_1.200_amd64.udeb").unwrap();
         assert_eq!(pkg, "base-installer");
         assert_eq!(ver, "1.200");
+        assert_eq!(arch, "amd64");
+    }
+
+    #[test]
+    fn test_parse_deb_filename_ddeb() {
+        let (pkg, ver, arch) =
+            DebianHandler::parse_deb_filename("systemd-dbgsym_256_amd64.ddeb").unwrap();
+        assert_eq!(pkg, "systemd-dbgsym");
+        assert_eq!(ver, "256");
         assert_eq!(arch, "amd64");
     }
 
@@ -737,6 +1097,13 @@ mod tests {
     #[test]
     fn test_parse_path_direct_udeb_file() {
         let info = DebianHandler::parse_path("base_1.0_amd64.udeb").unwrap();
+        assert!(matches!(info.operation, DebianOperation::Package));
+        assert_eq!(info.package, Some("base".to_string()));
+    }
+
+    #[test]
+    fn test_parse_path_direct_ddeb_file() {
+        let info = DebianHandler::parse_path("base_1.0_amd64.ddeb").unwrap();
         assert!(matches!(info.operation, DebianOperation::Package));
         assert_eq!(info.package, Some("base".to_string()));
     }
@@ -1107,6 +1474,93 @@ Source: full-pkg-src
         assert_eq!(control.architecture, "amd64");
     }
 
+    /// #2561: `validate` and `parse_metadata` on a package path still decode
+    /// the control tar through the permit-scoped decode (uncontended path).
+    #[tokio::test]
+    async fn test_validate_and_parse_metadata_deb_2561() {
+        use std::io::Write;
+
+        let control = "Package: xzpkg\nVersion: 1.0-1\nArchitecture: amd64\n";
+        let tar_bytes = control_tar(control);
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(&tar_bytes).expect("write xz");
+        let deb = deb_with_control_member("control.tar.xz", &encoder.finish().expect("finish xz"));
+
+        let handler = DebianHandler::new();
+        let path = "pool/main/x/xzpkg/xzpkg_1.0-1_amd64.deb";
+        handler
+            .validate(path, &Bytes::from(deb.clone()))
+            .await
+            .expect("matching .deb validates");
+        let meta = handler
+            .parse_metadata(path, &Bytes::from(deb))
+            .await
+            .expect("parse_metadata succeeds");
+        assert_eq!(meta["control"]["package"], "xzpkg");
+    }
+
+    /// Build a `control.tar` whose `control` entry itself inflates past the
+    /// 8 MiB per-metadata cap (repeated bytes, so it compresses to a tiny
+    /// "bomb"). The pre-target *total-byte* budget path is covered by the fast
+    /// `bounded_archive` module tests.
+    fn control_tar_bomb(control_prefix: &str) -> Vec<u8> {
+        let mut control = control_prefix.as_bytes().to_vec();
+        // Comment lines keep it a valid-ish control file while blowing past the
+        // 8 MiB per-metadata cap.
+        control.extend(std::iter::repeat(b'#').take(9 * 1024 * 1024));
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(control.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        builder
+            .append_data(&mut h, "./control", &control[..])
+            .unwrap();
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    /// #2556: a `control.tar.xz` whose `control` inflates past the per-metadata
+    /// cap is rejected mid-inflate (previously unbounded xz `read_to_string`).
+    #[test]
+    fn test_extract_control_xz_bomb_rejected_2556() {
+        use std::io::Write;
+        let tar_bytes = control_tar_bomb("Package: p\nVersion: 1\n");
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 1);
+        encoder.write_all(&tar_bytes).unwrap();
+        let xz = encoder.finish().unwrap();
+        assert!(xz.len() < 1024 * 1024, "xz bomb compresses tiny");
+        let deb = deb_with_control_member("control.tar.xz", &xz);
+        assert!(
+            DebianHandler::extract_control(&deb).is_err(),
+            "xz control bomb must be rejected"
+        );
+    }
+
+    /// #2556: a `control.tar.zst` bomb is likewise rejected.
+    #[test]
+    fn test_extract_control_zst_bomb_rejected_2556() {
+        let tar_bytes = control_tar_bomb("Package: p\nVersion: 1\n");
+        let zst = zstd::encode_all(std::io::Cursor::new(tar_bytes), 1).unwrap();
+        assert!(zst.len() < 1024 * 1024, "zstd bomb compresses tiny");
+        let deb = deb_with_control_member("control.tar.zst", &zst);
+        assert!(
+            DebianHandler::extract_control(&deb).is_err(),
+            "zstd control bomb must be rejected"
+        );
+    }
+
+    /// #2556 regression: a normal `.deb` still parses its control after the
+    /// hardening.
+    #[test]
+    fn test_extract_control_normal_after_hardening_2556() {
+        let control = "Package: normalpkg\nVersion: 2.3.4\nArchitecture: amd64\n";
+        let deb = deb_with_control_member("control.tar", &control_tar(control));
+        let parsed = DebianHandler::extract_control(&deb).expect("normal .deb parses");
+        assert_eq!(parsed.package, "normalpkg");
+        assert_eq!(parsed.version, "2.3.4");
+    }
+
     // ========================================================================
     // generate_packages_entry tests
     // ========================================================================
@@ -1256,5 +1710,324 @@ Source: full-pkg-src
     #[test]
     fn test_debian_handler_default() {
         let _handler = DebianHandler;
+    }
+
+    // ========================================================================
+    // parse_release_checksums tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_release_checksums_sha256_only() {
+        let release = "\
+Origin: Debian
+Suite: bookworm
+Date: Sat, 10 Jun 2023 10:00:00 UTC
+MD5Sum:
+ d41d8cd98f00b204e9800998ecf8427e 1024 main/binary-amd64/Packages
+SHA1:
+ da39a3ee5e6b4b0d3255bfef95601890afd80709 1024 main/binary-amd64/Packages
+SHA256:
+ aaa111 1024 main/binary-amd64/Packages
+ bbb222 512 main/binary-amd64/Packages.gz
+";
+        let table = parse_release_checksums(release);
+        assert_eq!(table.len(), 2);
+        assert_eq!(
+            table.get("main/binary-amd64/Packages"),
+            Some(&("aaa111".to_string(), 1024))
+        );
+        assert_eq!(
+            table.get("main/binary-amd64/Packages.gz"),
+            Some(&("bbb222".to_string(), 512))
+        );
+    }
+
+    #[test]
+    fn test_parse_release_checksums_inrelease_clearsigned() {
+        let inrelease = "\
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: Debian
+Suite: bookworm
+SHA256:
+ cafe01 4096 main/binary-amd64/Packages.xz
+-----BEGIN PGP SIGNATURE-----
+
+iQwertyBase64SignatureBytesabcdef==
+-----END PGP SIGNATURE-----
+";
+        let table = parse_release_checksums(inrelease);
+        assert_eq!(
+            table.get("main/binary-amd64/Packages.xz"),
+            Some(&("cafe01".to_string(), 4096))
+        );
+        // The base64 signature line must not be mistaken for an entry.
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_release_checksums_empty_and_malformed() {
+        assert!(parse_release_checksums("").is_empty());
+        assert!(parse_release_checksums("Suite: bookworm\nDate: today\n").is_empty());
+        // SHA256 header but a malformed (2-field) entry -> skipped.
+        assert!(parse_release_checksums("SHA256:\n deadbeef 1024\n").is_empty());
+    }
+
+    // ========================================================================
+    // parse_packages_index tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_packages_index_multi_stanza() {
+        let packages = "\
+Package: nginx
+Version: 1.24.0-1
+Architecture: amd64
+Filename: pool/main/n/nginx/nginx_1.24.0-1_amd64.deb
+Size: 512000
+MD5sum: 0123456789abcdef0123456789abcdef
+SHA256: 1111aaaa
+
+Package: curl
+Version: 8.0.1-1
+Architecture: amd64
+Filename: pool/main/c/curl/curl_8.0.1-1_amd64.deb
+Size: 250000
+SHA256: 2222bbbb
+";
+        let map = parse_packages_index(packages);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("pool/main/n/nginx/nginx_1.24.0-1_amd64.deb"),
+            Some(&("1111aaaa".to_string(), 512000))
+        );
+        assert_eq!(
+            map.get("pool/main/c/curl/curl_8.0.1-1_amd64.deb"),
+            Some(&("2222bbbb".to_string(), 250000))
+        );
+    }
+
+    #[test]
+    fn test_parse_packages_index_partial_stanza_skipped() {
+        // Missing SHA256 -> stanza dropped.
+        let packages = "\
+Package: broken
+Filename: pool/main/b/broken/broken_1_amd64.deb
+Size: 100
+";
+        assert!(parse_packages_index(packages).is_empty());
+    }
+
+    #[test]
+    fn test_parse_packages_index_empty() {
+        assert!(parse_packages_index("").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 (#2460) filter config predicates + (de)serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_distribution_selected_empty_selects_all() {
+        let cfg = DebianRepositoryConfig::default();
+        assert!(cfg.is_passthrough_all());
+        assert!(cfg.distribution_selected("bookworm"));
+        assert!(cfg.distribution_selected("anything"));
+    }
+
+    #[test]
+    fn test_distribution_selected_wildcard_selects_all() {
+        let cfg = DebianRepositoryConfig {
+            distribution_paths: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.distribution_selected("bookworm"));
+        assert!(cfg.distribution_selected("trixie"));
+    }
+
+    #[test]
+    fn test_distribution_selected_exact_and_case_sensitive() {
+        let cfg = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.distribution_selected("bookworm"));
+        assert!(!cfg.distribution_selected("trixie"));
+        // Debian codenames are lowercase; matching is exact (case-sensitive).
+        assert!(!cfg.distribution_selected("Bookworm"));
+        assert!(!cfg.is_passthrough_all());
+    }
+
+    #[test]
+    fn test_component_selected_matrix() {
+        let cfg = DebianRepositoryConfig {
+            components: vec!["main".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.component_selected("main"));
+        assert!(!cfg.component_selected("contrib"));
+        assert!(!cfg.component_selected("non-free"));
+    }
+
+    #[test]
+    fn test_arch_selected_matrix_and_all_always_allowed() {
+        let cfg = DebianRepositoryConfig {
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.arch_selected("amd64"));
+        assert!(!cfg.arch_selected("arm64"));
+        // Architecture-independent packages are always permitted.
+        assert!(cfg.arch_selected("all"));
+        // Empty allowlist selects everything.
+        let empty = DebianRepositoryConfig::default();
+        assert!(empty.arch_selected("arm64"));
+        assert!(empty.arch_selected("amd64"));
+    }
+
+    #[test]
+    fn test_config_roundtrip_serde() {
+        let cfg = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            components: vec!["main".to_string(), "contrib".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: DebianRepositoryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn test_config_deserialize_null_lists_and_distributions_alias() {
+        // `distributions` is an accepted alias for `distribution_paths`, and a
+        // null list deserializes to an empty (select-all) vector.
+        let json = r#"{"distributions":["trixie"],"components":null}"#;
+        let cfg: DebianRepositoryConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.distribution_paths, vec!["trixie".to_string()]);
+        assert!(cfg.components.is_empty());
+    }
+
+    #[test]
+    fn test_config_default_strategies_are_passthrough() {
+        let cfg = DebianRepositoryConfig::default();
+        assert_eq!(
+            cfg.metadata_strategy,
+            DebianMetadataStrategy::UpstreamPassthrough
+        );
+        assert_eq!(
+            cfg.package_fetch_strategy,
+            DebianPackageFetchStrategy::UpstreamPassthrough
+        );
+        assert!(cfg.validate_passthrough_only().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_generation_strategy() {
+        let cfg = DebianRepositoryConfig {
+            metadata_strategy: DebianMetadataStrategy::FilterAndGenerate,
+            ..Default::default()
+        };
+        let err = cfg.validate_passthrough_only().unwrap_err();
+        assert!(err.contains("not yet supported"));
+    }
+
+    #[test]
+    fn test_validate_rejects_signing_strategy() {
+        let cfg = DebianRepositoryConfig {
+            metadata_strategy: DebianMetadataStrategy::FilterGenerateAndSign,
+            ..Default::default()
+        };
+        assert!(cfg.validate_passthrough_only().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_non_passthrough_fetch_strategy() {
+        let cfg = DebianRepositoryConfig {
+            package_fetch_strategy: DebianPackageFetchStrategy::Eager,
+            ..Default::default()
+        };
+        assert!(cfg.validate_passthrough_only().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_package_queries_in_passthrough() {
+        let cfg = DebianRepositoryConfig {
+            package_queries: vec!["nginx".to_string()],
+            ..Default::default()
+        };
+        let err = cfg.validate_passthrough_only().unwrap_err();
+        assert!(err.contains("package_queries"));
+    }
+
+    #[test]
+    fn test_config_patch_merges_only_provided_fields() {
+        let base = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        // Patch only components; the rest is preserved.
+        let patch = DebianConfigPatch {
+            components: Some(vec!["main".to_string(), "contrib".to_string()]),
+            ..Default::default()
+        };
+        let merged = patch.apply_to(base);
+        assert_eq!(merged.distribution_paths, vec!["bookworm".to_string()]);
+        assert_eq!(
+            merged.components,
+            vec!["main".to_string(), "contrib".to_string()]
+        );
+        assert_eq!(merged.architectures, vec!["amd64".to_string()]);
+    }
+
+    #[test]
+    fn test_allow_encoded_separators_defaults_to_reject() {
+        // #2562: the guard is on by default (allow flag false) so the
+        // defense-in-depth is active without any operator action.
+        assert!(!DebianRepositoryConfig::default().allow_encoded_separators);
+        // Absent in JSON -> false (reject). Set true -> honored.
+        let cfg: DebianRepositoryConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.allow_encoded_separators);
+        let cfg: DebianRepositoryConfig =
+            serde_json::from_str(r#"{"allow_encoded_separators": true}"#).unwrap();
+        assert!(cfg.allow_encoded_separators);
+    }
+
+    #[test]
+    fn test_config_patch_toggles_allow_encoded_separators() {
+        let base = DebianRepositoryConfig::default();
+        assert!(!base.allow_encoded_separators);
+        let patch = DebianConfigPatch {
+            allow_encoded_separators: Some(true),
+            ..Default::default()
+        };
+        let merged = patch.apply_to(base);
+        assert!(merged.allow_encoded_separators);
+        // A patch that omits the field preserves the stored value.
+        let base = DebianRepositoryConfig {
+            allow_encoded_separators: true,
+            ..Default::default()
+        };
+        let merged = DebianConfigPatch::default().apply_to(base);
+        assert!(merged.allow_encoded_separators);
+    }
+
+    #[test]
+    fn test_config_patch_explicit_empty_list_clears_dimension() {
+        let base = DebianRepositoryConfig {
+            components: vec!["main".to_string()],
+            ..Default::default()
+        };
+        let patch = DebianConfigPatch {
+            components: Some(vec![]),
+            ..Default::default()
+        };
+        let merged = patch.apply_to(base);
+        // Now select-all again for components.
+        assert!(merged.components.is_empty());
+        assert!(merged.component_selected("contrib"));
     }
 }

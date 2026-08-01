@@ -8,8 +8,8 @@
 //!   GET  /rpm/{repo_key}/repodata/filelists.xml.gz  - File lists (stub)
 //!   GET  /rpm/{repo_key}/repodata/other.xml.gz      - Other metadata (stub)
 //!   GET  /rpm/{repo_key}/repodata/updateinfo.xml.gz - Update advisories (stub)
-//!   GET  /rpm/{repo_key}/repodata/repomd.xml.asc    - Detached GPG signature
-//!   GET  /rpm/{repo_key}/repodata/repomd.xml.key    - Public key (PEM)
+//!   GET  /rpm/{repo_key}/repodata/repomd.xml.asc    - Detached OpenPGP signature
+//!   GET  /rpm/{repo_key}/repodata/repomd.xml.key    - OpenPGP public key
 //!   GET  /rpm/{repo_key}/packages/*path              - Download RPM package
 //!   PUT  /rpm/{repo_key}/packages/*path              - Upload RPM package
 //!   POST /rpm/{repo_key}/upload                      - Upload RPM (alternative)
@@ -22,18 +22,20 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Extension;
 use axum::Router;
-use base64::Engine;
 use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use tracing::info;
+use tracing::{error, info, warn};
 
+use crate::api::handlers::error_helpers::{require_openpgp_capable_key, require_signing_key};
+use crate::api::handlers::metadata_epoch::metadata_epoch;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint};
 use crate::services::signing_service::SigningService;
 
 // ---------------------------------------------------------------------------
@@ -83,6 +85,146 @@ async fn resolve_rpm_repo(db: &sqlx::PgPool, repo_key: &str) -> Result<RepoInfo,
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["rpm", "yum"], "an RPM").await
 }
 
+// ---------------------------------------------------------------------------
+// Curated snapshot (`@N`) publication serving (#2358 — RPM Phase-3)
+// ---------------------------------------------------------------------------
+
+/// If `path` begins with a `@<digits>` segment, split it into
+/// `(version_number, remaining_sub_path)`.
+///   `@3/repodata/repomd.xml` -> `Some((3, "repodata/repomd.xml"))`
+///   `@3`                     -> `Some((3, ""))`
+/// Returns `None` when there is no leading `@N` segment (or the digits do not
+/// parse), so the normal proxy path is used.
+fn split_publication_prefix(path: &str) -> Option<(i64, String)> {
+    let rest = path.strip_prefix('@')?;
+    let (num_str, sub) = rest.split_once('/').unwrap_or((rest, ""));
+    if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let version_number: i64 = num_str.parse().ok()?;
+    Some((version_number, sub.to_string()))
+}
+
+/// Validate a `@N` sub-path before it is joined onto a storage prefix.
+///
+/// Rejects path traversal (`..`), absolute paths, empty/dot segments, `//` and
+/// backslashes so a crafted `@N/../../foo` (or `@N//etc/passwd`) can never
+/// escape the per-publication storage prefix. Returns the verified sub-path
+/// unchanged, or a `404` response.
+#[allow(clippy::result_large_err)]
+fn sanitize_publication_subpath(sub: &str) -> Result<String, Response> {
+    let rejected = sub.is_empty()
+        || sub.starts_with('/')
+        || sub.contains('\\')
+        || sub.contains("//")
+        || sub
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..");
+    if rejected {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+    Ok(sub.to_string())
+}
+
+/// Content type for a stored publication blob, keyed off its extension.
+fn publication_content_type(path: &str) -> &'static str {
+    if path.ends_with(".gz") {
+        "application/gzip"
+    } else if path.ends_with(".asc") {
+        "application/pgp-signature"
+    } else if path.ends_with(".key") {
+        "application/pgp-keys"
+    } else if path.ends_with(".xml") {
+        "application/xml"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// The `storage_prefix` of a specific PUBLISHED version, or `None` when the
+/// version is absent or not yet published (both surface to the client as 404).
+async fn fetch_published_version_prefix(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    version_number: i64,
+) -> Result<Option<String>, Response> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT storage_prefix FROM repository_versions \
+         WHERE repository_id = $1 AND version_number = $2 AND published_at IS NOT NULL",
+    )
+    .bind(repo_id)
+    .bind(version_number)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    Ok(row.and_then(|(p,)| p))
+}
+
+/// The `storage_prefix` of the repo's ACTIVE publication, or `None` when the
+/// repo has no active publication (keeps today's live-generation path).
+async fn fetch_active_publication_prefix(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<Option<String>, Response> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT rv.storage_prefix FROM repositories r \
+         JOIN repository_versions rv ON rv.id = r.active_publication_id \
+         WHERE r.id = $1 AND rv.published_at IS NOT NULL",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    Ok(row.and_then(|(p,)| p))
+}
+
+/// Serve `{prefix}/{sub_path}` from the repo's storage. `Ok(Some)` on a hit,
+/// `Ok(None)` when the blob is absent (caller falls through / keeps its live
+/// path), `Err` on a real storage failure. Metadata blobs are frozen at publish
+/// time, so this never proxies upstream.
+async fn serve_stored_publication_blob(
+    state: &SharedState,
+    repo: &RepoInfo,
+    prefix: &str,
+    sub_path: &str,
+) -> Result<Option<Response>, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let key = format!("{prefix}/{sub_path}");
+    match storage.get(&key).await {
+        Ok(bytes) => Ok(Some(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, publication_content_type(sub_path))
+                .header(CONTENT_LENGTH, bytes.len().to_string())
+                .body(Body::from(bytes))
+                .unwrap(),
+        )),
+        Err(crate::error::AppError::NotFound(_)) => Ok(None),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {e}"),
+        )
+            .into_response()),
+    }
+}
+
+/// Active-publication passthrough for the no-`@N` repodata routes: if the repo
+/// has an active publication, serve the frozen blob for `sub_path`; otherwise
+/// (`Ok(None)`) the caller keeps its unchanged live-generation / proxy path.
+async fn try_serve_active_publication(
+    state: &SharedState,
+    repo: &RepoInfo,
+    sub_path: &str,
+) -> Result<Option<Response>, Response> {
+    let prefix = match fetch_active_publication_prefix(&state.db, repo.id).await? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    serve_stored_publication_blob(state, repo, &prefix, sub_path).await
+}
+
 /// Reject RPM uploads to non-hosted (Remote/Virtual) repositories.
 ///
 /// `dnf`/`yum` only ever PUT/POST RPMs into hosted repos. Both Remote (proxy)
@@ -115,6 +257,15 @@ fn reject_rpm_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 /// repodata handlers always read from the local artifact table even
 /// when the repo was a proxy, so dnf saw an empty repository and
 /// silently did nothing.
+/// Buffered-metadata byte ceiling for the RPM repodata proxy.
+///
+/// RPM `primary`/`filelists` documents are legitimately large (an OL8
+/// `filelists` is tens of MiB), so #2623 raised this from the 8 MiB DEFAULT to
+/// the 128 MiB LARGE tier. It is the single source the handler reads, and a
+/// regression test (`rpm_proxy_metadata_cap_is_large_tier`, #2664) pins it to
+/// the LARGE value so a silent revert to DEFAULT is caught in CI.
+const RPM_PROXY_METADATA_MAX_BYTES: usize = proxy_helpers::LARGE_METADATA_MAX_BYTES;
+
 async fn try_proxy_repodata(
     state: &SharedState,
     repo: &RepoInfo,
@@ -129,25 +280,77 @@ async fn try_proxy_repodata(
         _ => return Ok(None),
     };
 
+    // #2665: reserve against the process-wide byte budget BEFORE buffering the
+    // upstream/cached document. Without this, N concurrent anonymous,
+    // un-rate-limited requests each buffered up to the per-request cap, so
+    // resident memory scaled with concurrency (~512× the cap in the issue) —
+    // and because a cache hit returns before the single-flight coordinator,
+    // even cached responses each re-buffered. The reservation is held for the
+    // buffered body's whole lifetime (it rides the response stream below) and
+    // released only after the bytes leave the server, so the SUM of concurrent
+    // buffering is capped regardless of request count.
+    let permit = proxy_helpers::proxy_metadata_budget()
+        .reserve(RPM_PROXY_METADATA_MAX_BYTES)
+        .await;
+
     let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         upstream_path,
-        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        RPM_PROXY_METADATA_MAX_BYTES,
     )
     .await?;
 
     let content_type = upstream_ct.unwrap_or_else(|| default_content_type.to_string());
-    Ok(Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, content_type)
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .body(Body::from(content))
-            .unwrap(),
-    ))
+    Ok(Some(buffered_metadata_response(
+        content,
+        content_type,
+        permit,
+    )))
+}
+
+/// Build the 200 response for a buffered proxy-metadata document, tying its
+/// [`ProxyMetadataBudget`] reservation to the response-body lifetime (#2665).
+///
+/// The `permit` rides the body stream (see [`metadata_body_stream`]) and is
+/// released only after the buffered chunk has been handed to the response
+/// writer, so the global byte budget accounts for the resident body until it
+/// leaves the server rather than releasing at handler return.
+fn buffered_metadata_response(
+    content: Bytes,
+    content_type: String,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let content_length = content.len();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, content_length.to_string())
+        .body(Body::from_stream(metadata_body_stream(content, permit)))
+        .unwrap()
+}
+
+/// One-shot body stream over an already-buffered metadata document that also
+/// owns its budget reservation (#2665). The permit is carried in the stream
+/// state and dropped only after the buffered chunk has been yielded to the
+/// response writer, so the budget stays debited for the body's whole lifetime.
+fn metadata_body_stream(
+    content: Bytes,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
+    enum State {
+        Data(Bytes, tokio::sync::OwnedSemaphorePermit),
+        Done(tokio::sync::OwnedSemaphorePermit),
+    }
+    futures::stream::unfold(State::Data(content, permit), |state| async move {
+        match state {
+            State::Data(bytes, permit) => Some((Ok(bytes), State::Done(permit))),
+            // Permit dropped here, after the chunk reached the response writer.
+            State::Done(_permit) => None,
+        }
+    })
 }
 
 /// Build the HTTP 200 response for serving an RPM package body.
@@ -178,6 +381,178 @@ fn build_rpm_package_response(
         .header("X-Checksum-SHA256", checksum_sha256.trim())
         .body(body)
         .unwrap()
+}
+
+/// Is `p` a safe RELATIVE upstream path to append to a curation-config
+/// upstream base?
+///
+/// The stored `upstream_path` comes from the upstream `<location href>`, which
+/// is attacker-influenced. `ProxyService::build_upstream_url` concatenates
+/// (`{base}/{path}`), so an absolute href cannot currently override the host —
+/// but this guard makes that safety explicit and local rather than an implicit
+/// dependency on a helper elsewhere: an absolute URL, an absolute path, a
+/// traversal, or a backslash is rejected so the `@N` fetch can only ever target
+/// a path UNDER the configured curation upstream (defense in depth, #2358).
+fn is_safe_upstream_rel_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.contains("://")
+        && !p.starts_with('/')
+        && !p.contains('\\')
+        && !p.split('/').any(|seg| seg == "..")
+}
+
+/// Stream an already-verified, frozen `@N` package from the immutable store
+/// (cache hit). Chunked (no `Content-Length`) so the whole `.rpm` is never
+/// buffered in memory when re-serving. Advertises the FROZEN checksum, so what a
+/// client validates against is what `@N`'s signed metadata attests.
+fn stream_rpm_response(body: Body, filename: &str, checksum_sha256: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-rpm")
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header("X-Checksum-SHA256", checksum_sha256.trim())
+        .body(body)
+        .unwrap()
+}
+
+/// Checksum-verified serving of a package under a published, immutable `@N`
+/// (#2358 A-hardened).
+///
+/// Everything this path trusts comes from the **frozen** snapshot membership
+/// (`repository_version_packages.frozen_*`), never from the live
+/// `curation_packages` row. That distinction is the whole security property:
+/// `curation_packages` is mutable (a routine re-sync upserts the same row), so
+/// resolving the checksum/location live would let a post-publish sync — or a
+/// compromised upstream — change what an already-published, SIGNED `@N` serves,
+/// handing out bytes that contradict `@N`'s own signed `primary.xml`. The frozen
+/// checksum is snapshotted from the same state the signed metadata is generated
+/// from, so verified bytes always match what `@N` attests.
+///
+/// The package BYTES are resolved and served fail-closed:
+///   1. Cache hit — a previously verified+stored copy in the version's immutable
+///      per-version store streams straight back (never re-fetched), advertising
+///      the FROZEN checksum.
+///   2. Otherwise fetch from the CURATION-CONFIG upstream (the curation source
+///      repo's `upstream_url` plus the FROZEN `upstream_path`) — NEVER from
+///      `repo.upstream_url` and NEVER from any metadata blob — VERIFY
+///      `sha256 == frozen_checksum_sha256`, and only on a match cache the bytes
+///      into the frozen store and stream them. A missing member, missing
+///      upstream, or a checksum MISMATCH fails closed (404 / 502): neither a
+///      tampered upstream body nor a post-publish live mutation is ever served.
+async fn serve_version_package(
+    state: &SharedState,
+    repo: &RepoInfo,
+    version_prefix: &str,
+    version_number: i64,
+    filename: &str,
+) -> Result<Response, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let cache_key = format!("{version_prefix}/packages/{filename}");
+
+    // 1. Resolve the member from the FROZEN snapshot membership. The upstream
+    //    URL still comes from the curation source repo (that is config, not
+    //    package identity); the checksum and the relative path are frozen.
+    let member = sqlx::query_as::<_, (String, String, Option<String>, uuid::Uuid, String)>(
+        "SELECT rvp.frozen_checksum_sha256, rvp.frozen_upstream_path, \
+                r.upstream_url, r.id, r.key \
+         FROM repository_version_packages rvp \
+         JOIN repository_versions rv ON rv.id = rvp.version_id \
+         JOIN curation_packages cp ON cp.id = rvp.curation_package_id \
+         JOIN repositories r ON r.id = cp.remote_repo_id \
+         WHERE rv.repository_id = $1 AND rv.version_number = $2 \
+           AND rv.published_at IS NOT NULL \
+           AND rvp.frozen_filename = $3",
+    )
+    .bind(repo.id)
+    .bind(version_number)
+    .bind(filename)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(super::db_err)?;
+
+    let (expected, upstream_path, upstream_url, remote_id, remote_key) = match member {
+        Some((ck, up, Some(url), rid, rkey)) if !ck.trim().is_empty() => (ck, up, url, rid, rkey),
+        // No such member, or nothing to fetch against -> fail closed.
+        _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
+    };
+
+    // 2. Cache-first: stream the already-verified copy from the immutable
+    //    per-version store, advertising the FROZEN checksum.
+    if let Ok(stream) = storage.get_stream(&cache_key).await {
+        return Ok(stream_rpm_response(
+            Body::from_stream(stream),
+            filename,
+            expected.trim(),
+        ));
+    }
+
+    // The stored href is attacker-influenced: refuse to fetch anything that is
+    // not a plain relative path under the curation upstream.
+    if !is_safe_upstream_rel_path(&upstream_path) {
+        tracing::warn!(
+            "@{} package {} has an unsafe upstream path {:?}; refusing to fetch",
+            version_number,
+            filename,
+            upstream_path
+        );
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
+    let proxy = state
+        .proxy_service
+        .as_ref()
+        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "Upstream proxy unavailable").into_response())?;
+
+    // Fetch UNCACHED from the curation-config upstream so an unverified body is
+    // never persisted to the shared proxy cache.
+    let (bytes, _ct, _url) = proxy_helpers::proxy_fetch_uncached(
+        proxy,
+        remote_id,
+        &remote_key,
+        &upstream_url,
+        &upstream_path,
+    )
+    .await?;
+
+    // VERIFY sha256 == the FROZEN checksum. FAIL CLOSED on mismatch. This is what
+    // catches an upstream mirror that changed the bytes behind an already-
+    // published NEVRA, and a post-publish re-sync that rewrote the live curation
+    // row: neither can make `@N` serve bytes its signed metadata does not attest.
+    if !sha256_hex(&bytes).eq_ignore_ascii_case(expected.trim()) {
+        tracing::warn!(
+            "@{} package {} failed verification against the FROZEN snapshot checksum; \
+             refusing to serve",
+            version_number,
+            filename
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Upstream package failed checksum verification",
+        )
+            .into_response());
+    }
+
+    // Cache into the immutable frozen store, then stream the verified bytes.
+    let size = bytes.len() as i64;
+    storage.put(&cache_key, bytes.clone()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {e}"),
+        )
+            .into_response()
+    })?;
+
+    Ok(build_rpm_package_response(
+        Body::from(bytes),
+        filename,
+        size,
+        expected.trim(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -214,36 +589,143 @@ fn parse_rpm_filename(filename: &str) -> Option<(String, String, String, String)
     ))
 }
 
+/// Build the `artifact_metadata` JSON for a stored `.rpm` package.
+///
+/// Combines the filename-derived NEVRA with whatever the RPM header yields
+/// (summary, description, license, sourcerpm, ...), preferring header fields —
+/// the header is authoritative, the filename is only a convention. Used by
+/// both the native RPM upload path and the generic chunked-upload completion
+/// so packages surface identical format metadata regardless of how they were
+/// pushed (#2588).
+///
+/// Header-parse failures are non-fatal: the filename-derived fields are kept
+/// and the header-only fields stay absent. Returns `None` only when *neither*
+/// source yields anything (non-NEVRA filename and unparseable content), in
+/// which case the caller should record no metadata at all.
+pub(crate) fn build_rpm_artifact_metadata(
+    filename: &str,
+    content: &[u8],
+) -> Option<serde_json::Value> {
+    let parsed = parse_rpm_filename(filename);
+    let header = crate::formats::rpm::RpmHandler::parse_rpm_header(content).ok();
+    if parsed.is_none() && header.is_none() {
+        return None;
+    }
+
+    let (file_name, file_version, file_release, file_arch) = parsed.unwrap_or_default();
+    let prefer = |from_header: Option<&String>, from_filename: String| -> String {
+        match from_header {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => from_filename,
+        }
+    };
+
+    let h = header.as_ref();
+    let mut metadata = serde_json::json!({
+        "name": prefer(h.map(|m| &m.name), file_name),
+        "version": prefer(h.map(|m| &m.version), file_version),
+        "release": prefer(h.map(|m| &m.release), file_release),
+        "arch": prefer(h.map(|m| &m.arch), file_arch),
+        "filename": filename,
+    });
+
+    if let Some(h) = header {
+        for (key, value) in [
+            ("summary", h.summary),
+            ("description", h.description),
+            ("license", h.license),
+            ("group", h.group),
+            ("url", h.url),
+            ("source_rpm", h.source_rpm),
+        ] {
+            if let Some(v) = value {
+                metadata[key] = serde_json::Value::String(v);
+            }
+        }
+    }
+
+    Some(metadata)
+}
+
 // ---------------------------------------------------------------------------
 // Artifact query helper
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-struct RpmArtifact {
-    id: uuid::Uuid,
-    path: String,
-    name: String,
-    version: Option<String>,
-    size_bytes: i64,
-    checksum_sha256: String,
-    storage_key: String,
-    metadata: Option<serde_json::Value>,
+pub(crate) struct RpmArtifact {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) version: Option<String>,
+    pub(crate) size_bytes: i64,
+    pub(crate) checksum_sha256: String,
+    pub(crate) storage_key: String,
+    pub(crate) metadata: Option<serde_json::Value>,
+    /// Drives the repodata metadata epoch (`<revision>`/`<timestamp>`) so the
+    /// render stays a pure function of repository state (#2636).
+    pub(crate) updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-async fn list_rpm_artifacts(
+/// List a repository's RPM artifacts in a **deterministic total order**.
+///
+/// The order is part of the repodata contract, not a display choice: it fixes
+/// the package order in `primary.xml`/`filelists.xml`, hence their checksums,
+/// hence the `repomd.xml` bytes that `repomd.xml.asc` signs. The previous
+/// `ORDER BY a.created_at DESC` was not a *total* order — artifacts sharing a
+/// `created_at` (a bulk upload commits many rows with the same `NOW()`) could
+/// come back in either order, so two renders of unchanged state could differ
+/// and the detached signature would not match the served document (#2636).
+/// `(name, version, path)` is the order Debian's package index already uses;
+/// `id` is unique, so appending it makes the order total.
+///
+/// Only actual `.rpm` package objects (including `.src.rpm`) are listed: the
+/// generic chunked upload flow can place arbitrary companions (signature
+/// sidecars, checksum files, `.repo` snippets) in an RPM repository, and
+/// repodata must never describe those as packages (#2590). Delta RPMs
+/// (`.drpm`) are also excluded — they belong in `prestodelta` metadata,
+/// which we do not generate, not in `primary.xml`.
+/// The repositories a repodata response for `repo` describes: the repo
+/// itself for Hosted (Local/Staging) repos, or the member repo ids for
+/// Virtual repos — otherwise `repomd.xml`/`primary.xml.gz` advertise
+/// `packages="0"` and `dnf` treats the aggregate repo as empty even though
+/// the members hold packages (#1780).
+///
+/// Sorted so the id set is canonical: `fetch_virtual_members` orders by
+/// `vrm.priority`, which is not a total order, and both the fingerprint
+/// comparison (#2521) and the render must not depend on member visit order
+/// for the output (and therefore the detached signature) to be reproducible
+/// (#2636).
+async fn repodata_repo_ids(
     db: &sqlx::PgPool,
-    repo_id: uuid::Uuid,
+    repo: &RepoInfo,
+) -> Result<Vec<uuid::Uuid>, Response> {
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok(vec![repo.id]);
+    }
+    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
+    let mut ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// Collect the RPM artifacts a repodata response should describe, in a
+/// deterministic total order (`ORDER BY name, version, path, id`) so
+/// unchanged state always renders byte-identical documents (#2636).
+async fn collect_repodata_artifacts(
+    db: &sqlx::PgPool,
+    repo_ids: &[uuid::Uuid],
 ) -> Result<Vec<RpmArtifact>, Response> {
     let rows = sqlx::query!(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               a.storage_key, am.metadata as "metadata?"
+               a.storage_key, a.updated_at, am.metadata as "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1 AND a.is_deleted = false
-        ORDER BY a.created_at DESC
+        WHERE a.repository_id = ANY($1) AND a.is_deleted = false
+          AND a.path LIKE '%.rpm'
+        ORDER BY a.name, a.version, a.path, a.id
         "#,
-        repo_id
+        repo_ids
     )
     .fetch_all(db)
     .await
@@ -260,39 +742,87 @@ async fn list_rpm_artifacts(
             checksum_sha256: r.checksum_sha256,
             storage_key: r.storage_key,
             metadata: r.metadata,
+            updated_at: r.updated_at,
         })
         .collect())
 }
 
-/// Collect the RPM artifacts a repodata response should describe.
+/// The current [`RepodataFingerprint`] for `repo_ids`: one aggregate query
+/// (count + latest `updated_at` over the live `.rpm` rows — an index scan
+/// with no row transfer and no metadata join), revalidated on every repodata
+/// request so a publish/delete/promotion is visible on the very next read.
 ///
-/// For Hosted (Local/Staging) repos this is just the repo's own artifacts.
-/// For Virtual repos the metadata must reflect the union of every member
-/// repo's packages — otherwise `repomd.xml`/`primary.xml.gz` advertise
-/// `packages="0"` and `dnf` treats the aggregate repo as empty even though
-/// the members hold packages (#1780). We resolve the member repo IDs via
-/// `fetch_virtual_members` and concatenate each member's artifact list.
-async fn collect_repodata_artifacts(
+/// The `.rpm` scoping matches `collect_repodata_artifacts` exactly: the
+/// fingerprint must move if and only if the rendered row set can change.
+async fn repodata_fingerprint(
     db: &sqlx::PgPool,
-    repo: &RepoInfo,
-) -> Result<Vec<RpmArtifact>, Response> {
-    if repo.repo_type != RepositoryType::Virtual {
-        return list_rpm_artifacts(db, repo.id).await;
-    }
+    repo_ids: Vec<uuid::Uuid>,
+) -> Result<RepodataFingerprint, Response> {
+    let row = sqlx::query!(
+        r#"
+        SELECT COUNT(*) AS "live_rpm_count!", MAX(a.updated_at) AS latest_update
+        FROM artifacts a
+        WHERE a.repository_id = ANY($1) AND a.is_deleted = false
+          AND a.path LIKE '%.rpm'
+        "#,
+        &repo_ids
+    )
+    .fetch_one(db)
+    .await
+    .map_err(super::db_err)?;
 
-    let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
-    let mut artifacts = Vec::new();
-    for member in &members {
-        artifacts.extend(list_rpm_artifacts(db, member.id).await?);
-    }
-    Ok(artifacts)
+    Ok(RepodataFingerprint {
+        repo_ids,
+        live_rpm_count: row.live_rpm_count,
+        latest_update: row.latest_update,
+    })
+}
+
+/// Serve the rendered repodata set for `repo` through the fingerprint-
+/// validated cache (#2521): a warm request costs the fingerprint query plus
+/// a refcount clone of the prebuilt bytes; a state change re-renders exactly
+/// once (concurrent misses coalesce on a per-repo single-flight lock). The
+/// O(repo) generation itself runs on the blocking pool so large renders do
+/// not stall the async runtime.
+async fn cached_repodata(
+    state: &SharedState,
+    repo: &RepoInfo,
+) -> Result<std::sync::Arc<RenderedRepodata>, Response> {
+    let repo_ids = repodata_repo_ids(&state.db, repo).await?;
+    // Captured BEFORE the artifact rows are fetched: a write racing the
+    // render can only make the stored entry look older than its content, so
+    // the next request re-renders — never serves stale bytes as fresh.
+    let fingerprint = repodata_fingerprint(&state.db, repo_ids).await?;
+    let db = state.db.clone();
+    let ids = fingerprint.repo_ids.clone();
+    state
+        .rpm_repodata_cache
+        .get_or_render(repo.id, fingerprint, || async move {
+            let artifacts = collect_repodata_artifacts(&db, &ids).await?;
+            tokio::task::spawn_blocking(move || render_repodata(&artifacts))
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "RPM repodata render task failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to render repository metadata",
+                    )
+                        .into_response()
+                })
+        })
+        .await
 }
 
 // ---------------------------------------------------------------------------
-// Shared repomd.xml generation
+// Shared repodata rendering
 // ---------------------------------------------------------------------------
 
-fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
+/// Render the complete repodata set for one repository state: `repomd.xml`
+/// plus every compressed index document its checksums describe. Rendering
+/// them together (instead of per endpoint, per request) is what lets the
+/// cache serve coherent, immutable bytes for the whole set (#2521) — and the
+/// gzipped siblings are byproducts `repomd.xml` had to build anyway.
+fn render_repodata(artifacts: &[RpmArtifact]) -> RenderedRepodata {
     // Generate primary.xml content and compute both the compressed (gzipped)
     // and uncompressed (open) sha256 + sizes. DNF/createrepo clients expect a
     // top-level <revision> plus per-<data> <open-checksum>/<open-size> elements
@@ -321,12 +851,17 @@ fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
     let updateinfo_gz = gzip_bytes(updateinfo_xml.as_bytes());
     let updateinfo_sha256 = sha256_hex(&updateinfo_gz);
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // #2636: the metadata epoch is derived from repository *state*, never from
+    // the clock. `repomd.xml` and `repomd.xml.asc` render this document
+    // independently, one request apart, and the client verifies the signature
+    // from the second render against the bytes of the first. A `now()` here
+    // makes those two renders disagree whenever the requests straddle a second
+    // boundary — a BAD signature on a repo nobody touched. See the
+    // `metadata_epoch` module docs; Debian's `Release`/`Release.gpg` pair has
+    // the same defect (#2652).
+    let timestamp = metadata_epoch(artifacts.iter().map(|a| a.updated_at)).timestamp();
 
-    format!(
+    let repomd_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <repomd xmlns="http://linux.duke.edu/metadata/repo" xmlns:rpm="http://linux.duke.edu/metadata/rpm">
   <revision>{timestamp}</revision>
@@ -381,7 +916,22 @@ fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
         other_open_size = other_open_size,
         updateinfo_size = updateinfo_gz.len(),
         updateinfo_open_size = updateinfo_open_size,
-    )
+    );
+
+    RenderedRepodata {
+        repomd_xml: Bytes::from(repomd_xml),
+        primary_gz: Bytes::from(primary_gz),
+        filelists_gz: Bytes::from(filelists_gz),
+        other_gz: Bytes::from(other_gz),
+    }
+}
+
+/// Test-facing shim retaining the original `repomd.xml`-only signature; the
+/// handlers serve [`render_repodata`] output through the cache.
+#[cfg(test)]
+fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
+    String::from_utf8(render_repodata(artifacts).repomd_xml.to_vec())
+        .expect("repomd.xml is valid UTF-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +944,12 @@ async fn repomd_xml(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    // #2358: if this repo has an active curated publication, serve its frozen,
+    // signed repomd.xml instead of live-generating / proxying.
+    if let Some(resp) = try_serve_active_publication(&state, &repo, "repodata/repomd.xml").await? {
+        return Ok(resp);
+    }
+
     // #1447: for Remote repos proxy the upstream repomd.xml instead of
     // synthesizing an empty index from local artifacts.
     if let Some(resp) =
@@ -402,13 +958,12 @@ async fn repomd_xml(
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-    let xml = generate_repomd_xml_content(&artifacts);
+    let rendered = cached_repodata(&state, &repo).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/xml")
-        .body(Body::from(xml))
+        .body(Body::from(rendered.repomd_xml.clone()))
         .unwrap())
 }
 
@@ -422,6 +977,14 @@ async fn repomd_xml_asc(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    // #2358: an active publication's detached signature is the one that matches
+    // its frozen repomd.xml — serve the stored .asc, not a freshly-signed one.
+    if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/repomd.xml.asc").await?
+    {
+        return Ok(resp);
+    }
+
     // #1447: proxy the upstream detached signature for Remote repos.
     if let Some(resp) = try_proxy_repodata(
         &state,
@@ -434,41 +997,64 @@ async fn repomd_xml_asc(
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-    let repomd_content = generate_repomd_xml_content(&artifacts);
+    // Sign the same cached bytes `repomd.xml` serves: the signature and the
+    // document are two requests, and both must render identically from
+    // unchanged state (#2636). The shared cache entry makes that literal —
+    // one render, one byte sequence, two endpoints.
+    let rendered = cached_repodata(&state, &repo).await?;
+    let repomd_content = rendered.repomd_xml.clone();
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let signature = signing_svc
-        .sign_data(repo.id, repomd_content.as_bytes())
+    // #2636: this endpoint must emit a real detached OpenPGP signature — the
+    // same thing Debian's Release.gpg serves — because that is the only form
+    // `dnf` (repo_gpgcheck=1) and `rpm --import` can verify. It previously
+    // signed via `SigningService::sign_data()`, which returns raw PKCS#1 v1.5
+    // bytes, and hand-wrapped them in "BEGIN PGP SIGNATURE" markers: no packet
+    // framing and no CRC24 armor checksum, so every real client rejected it.
+    let key = require_signing_key(signing_svc.get_active_key_for_repo(repo.id).await)?;
+    // An X.509 (`key_type=rsa`) key can never sign OpenPGP, so refuse before
+    // attempting it: 409 + WARN, not 500 + ERROR. This route is anonymous, so
+    // every `dnf` poll of a misconfigured repo lands here; a 500 would let an
+    // unauthenticated client drive unbounded ERROR logs and 500-rate alerts for
+    // what is an operator config mistake, not a server fault.
+    let key = require_openpgp_capable_key(key).map_err(|resp| {
+        warn!(
+            repo_id = %repo.id,
+            "repomd.xml.asc requested but the repository's active signing key cannot \
+             produce an OpenPGP signature (requires key_type='gpg')",
+        );
+        resp
+    })?;
+    let armored = signing_svc
+        .sign_openpgp_detached_with_key(&key, &repomd_content)
         .await
-        .unwrap_or(None);
-
-    match signature {
-        Some(sig_bytes) => {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
-            // Wrap base64 at 76 characters per line (PGP armor convention)
-            let wrapped: Vec<&str> = b64
-                .as_bytes()
-                .chunks(76)
-                .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                .collect();
-            let armored = format!(
-                "-----BEGIN PGP SIGNATURE-----\n\n{}\n-----END PGP SIGNATURE-----\n",
-                wrapped.join("\n"),
+        .map_err(|e| {
+            // A key that cannot sign is a server-side failure, not a missing
+            // configuration. Log it and return it: the previous
+            // `.unwrap_or(None)` collapsed this into a 404 "No signing key
+            // configured" while repomd.xml.key was serving that very key.
+            error!(
+                repo_id = %repo.id,
+                key_id = %key.id,
+                error = %e,
+                "failed to sign repomd.xml with the repository's active signing key",
             );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to sign repomd.xml: {}", e),
+            )
+                .into_response()
+        })?;
+    // Best-effort `last_used_at` stamp; the signature already succeeded, so an
+    // audit-update error must not fail the request.
+    let _ = signing_svc.mark_key_used(key.id).await;
 
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/pgp-signature")
-                .body(Body::from(armored))
-                .unwrap())
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            "No signing key configured for this repository",
-        )
-            .into_response()),
-    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/pgp-signature")
+        .header(CONTENT_LENGTH, armored.len().to_string())
+        .body(Body::from(armored))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -481,24 +1067,42 @@ async fn repomd_xml_key(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
-    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
-    let public_key = signing_svc
-        .get_repo_public_key(repo.id)
-        .await
-        .unwrap_or(None);
-
-    match public_key {
-        Some(pem) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/x-pem-file")
-            .body(Body::from(pem))
-            .unwrap()),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            "No signing key configured for this repository",
-        )
-            .into_response()),
+    // #2358: serve the active publication's frozen public key so a later signing
+    // key rotation never invalidates an already-published @N.
+    if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/repomd.xml.key").await?
+    {
+        return Ok(resp);
     }
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    // #2636: `dnf`'s `gpgkey=` and `rpm --import` both require an OpenPGP
+    // public key. The active key's stored `public_key_pem` is that armored
+    // OpenPGP block for `key_type=gpg` keys — the same material Debian's
+    // gpg-key.asc serves. A lookup error is surfaced rather than swallowed, so
+    // "cannot load the key" is never reported as "no key configured".
+    let key = require_signing_key(signing_svc.get_active_key_for_repo(repo.id).await)?;
+    // For any other key type `public_key_pem` is an X.509 SPKI PEM: not
+    // importable by `rpm --import`, and useless to `dnf gpgkey=` even if it
+    // were served honestly as `application/x-pem-file`, because the matching
+    // `.asc` can never exist. Refusing here keeps the repo from advertising a
+    // key it cannot sign with, and means the `application/pgp-keys` below is
+    // always the truth rather than a claim about the bytes.
+    let key = require_openpgp_capable_key(key).map_err(|resp| {
+        warn!(
+            repo_id = %repo.id,
+            "repomd.xml.key requested but the repository's active signing key is not an \
+             OpenPGP key (requires key_type='gpg')",
+        );
+        resp
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/pgp-keys")
+        .header(CONTENT_LENGTH, key.public_key_pem.len().to_string())
+        .body(Body::from(key.public_key_pem))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -544,15 +1148,19 @@ async fn primary_xml_gz(
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
     if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/primary.xml.gz").await?
+    {
+        return Ok(resp);
+    }
+
+    if let Some(resp) =
         try_proxy_repodata(&state, &repo, "repodata/primary.xml.gz", "application/gzip").await?
     {
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-
-    let primary_xml = generate_primary_xml(&artifacts);
-    let gz = gzip_bytes(primary_xml.as_bytes());
+    let rendered = cached_repodata(&state, &repo).await?;
+    let gz = rendered.primary_gz.clone();
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -572,6 +1180,12 @@ async fn filelists_xml_gz(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    if let Some(resp) =
+        try_serve_active_publication(&state, &repo, "repodata/filelists.xml.gz").await?
+    {
+        return Ok(resp);
+    }
+
     if let Some(resp) = try_proxy_repodata(
         &state,
         &repo,
@@ -583,10 +1197,8 @@ async fn filelists_xml_gz(
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-
-    let filelists_xml = generate_filelists_xml(&artifacts);
-    let gz = gzip_bytes(filelists_xml.as_bytes());
+    let rendered = cached_repodata(&state, &repo).await?;
+    let gz = rendered.filelists_gz.clone();
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -606,16 +1218,19 @@ async fn other_xml_gz(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    if let Some(resp) = try_serve_active_publication(&state, &repo, "repodata/other.xml.gz").await?
+    {
+        return Ok(resp);
+    }
+
     if let Some(resp) =
         try_proxy_repodata(&state, &repo, "repodata/other.xml.gz", "application/gzip").await?
     {
         return Ok(resp);
     }
 
-    let artifacts = collect_repodata_artifacts(&state.db, &repo).await?;
-
-    let other_xml = generate_other_xml(&artifacts);
-    let gz = gzip_bytes(other_xml.as_bytes());
+    let rendered = cached_repodata(&state, &repo).await?;
+    let gz = rendered.other_gz.clone();
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -639,6 +1254,19 @@ async fn repodata_proxy(
     Path((repo_key, path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    // #2358: an active publication serves its frozen repodata blobs (dnf also
+    // fetches the checksum-prefixed payloads through this catch-all). Route the
+    // catch-all subpath through the same traversal guard `upstream_proxy` uses
+    // before it is joined onto a storage prefix, so this path can never
+    // `storage.get` outside the publication prefix. On a reject we skip the
+    // frozen-blob serve and fall through to the unchanged proxy path.
+    let active_sub = format!("repodata/{}", path);
+    if let Ok(safe_sub) = sanitize_publication_subpath(&active_sub) {
+        if let Some(resp) = try_serve_active_publication(&state, &repo, &safe_sub).await? {
+            return Ok(resp);
+        }
+    }
 
     let upstream_path = format!("repodata/{}", path);
     let default_ct = if path.ends_with(".gz") {
@@ -675,6 +1303,46 @@ async fn upstream_proxy(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
+    // #2358: a leading `@<digits>` segment selects a published, immutable
+    // snapshot. Serve the frozen, AK-signed metadata blob for the sub-path from
+    // storage; a `packages/{nevra}.rpm` sub-path is served CHECKSUM-VERIFIED
+    // from the curation-config upstream. Nothing else is resolvable under an
+    // immutable `@N`, and upstream is NEVER proxied verbatim from here.
+    if let Some((version_number, sub)) = split_publication_prefix(&upstream_path) {
+        let prefix = fetch_published_version_prefix(&state.db, repo.id, version_number)
+            .await?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response())?;
+        let sub_path = sanitize_publication_subpath(&sub)?;
+
+        // A `packages/{filename}.rpm` request under a published @N: resolve the
+        // member from the FROZEN membership, serve the cached copy or fetch from
+        // the curation-config upstream, VERIFY sha256 against the FROZEN
+        // checksum, and stream — fail-closed on any mismatch.
+        //
+        // This is checked BEFORE the generic stored-blob serve on purpose: the
+        // verified bytes are cached under `{prefix}/packages/{filename}`, which
+        // the generic blob path would otherwise happily return as an opaque
+        // `application/octet-stream` with no `X-Checksum-SHA256` — bypassing the
+        // package response contract (content type, disposition, and the frozen
+        // checksum a client validates against).
+        if let Some(filename) = sub_path.strip_prefix("packages/") {
+            if !filename.is_empty() && !filename.contains('/') {
+                return serve_version_package(&state, &repo, &prefix, version_number, filename)
+                    .await;
+            }
+        }
+
+        // Frozen, AK-signed repodata blob?
+        if let Some(resp) = serve_stored_publication_blob(&state, &repo, &prefix, &sub_path).await?
+        {
+            return Ok(resp);
+        }
+
+        // Nothing else is served from an immutable @N.
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
+    // A normal (non-`@N`) request only serves from Remote repos.
     if repo.repo_type != RepositoryType::Remote {
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
@@ -766,6 +1434,7 @@ async fn download_package(
                 if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
                     &state,
                     &repo,
+                    &ctx,
                     proxy_helpers::DownloadResponseOpts {
                         upstream_path: &upstream_path,
                         virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
@@ -833,7 +1502,7 @@ async fn upload_package_put(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rpm", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
@@ -858,29 +1527,12 @@ async fn upload_package_post(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rpm", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
     // Try to get filename from Content-Disposition header, fall back to a hash-based name
-    let filename = headers
-        .get("Content-Disposition")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split("filename=")
-                .nth(1)
-                .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
-        })
-        .or_else(|| {
-            headers
-                .get("X-Package-Filename")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| {
-            let hash = sha256_hex(&body);
-            format!("{}.rpm", &hash[..16])
-        });
+    let filename = extract_rpm_filename(&headers, &body);
 
     if !filename.ends_with(".rpm") {
         return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
@@ -914,8 +1566,8 @@ async fn store_rpm(
             .into_response()
     })?;
 
-    let full_version = format!("{}-{}", pkg_version, release);
-    let artifact_path = format!("packages/{}", filename);
+    let full_version = build_rpm_full_version(&pkg_version, &release);
+    let artifact_path = build_rpm_artifact_path(filename);
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
@@ -925,7 +1577,7 @@ async fn store_rpm(
     )
     .await?;
 
-    let storage_key = format!("rpm/{}/{}", repo.id, filename);
+    let storage_key = build_rpm_storage_key(&repo.id, filename);
     proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
 
     let size_bytes = content.len() as i64;
@@ -947,14 +1599,12 @@ async fn store_rpm(
     )
     .await?;
 
-    // Store RPM-specific metadata
-    let rpm_metadata = serde_json::json!({
-        "name": pkg_name,
-        "version": pkg_version,
-        "release": release,
-        "arch": arch,
-        "filename": filename,
-    });
+    // Store RPM-specific metadata: filename-derived NEVRA enriched with the
+    // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
+    // describe the package fully (#2588). The filename already parsed above,
+    // so the builder always yields metadata here.
+    let rpm_metadata = build_rpm_artifact_metadata(filename, &content)
+        .unwrap_or_else(|| build_rpm_metadata(&pkg_name, &pkg_version, &release, &arch, filename));
 
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
         .await;
@@ -968,17 +1618,97 @@ async fn store_rpm(
         .status(StatusCode::CREATED)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({
-                "name": pkg_name,
-                "version": pkg_version,
-                "release": release,
-                "arch": arch,
-                "sha256": computed_sha256,
-                "size": size_bytes,
-            })
+            build_rpm_upload_response(
+                &pkg_name,
+                &pkg_version,
+                &release,
+                &arch,
+                &computed_sha256,
+                size_bytes,
+            )
             .to_string(),
         ))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Path/key builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the artifact path for an RPM package.
+fn build_rpm_artifact_path(filename: &str) -> String {
+    format!("packages/{}", filename)
+}
+
+/// Build the storage key for an RPM package.
+fn build_rpm_storage_key(repo_id: &uuid::Uuid, filename: &str) -> String {
+    format!("rpm/{}/{}", repo_id, filename)
+}
+
+/// Build the full version string from version and release.
+fn build_rpm_full_version(version: &str, release: &str) -> String {
+    format!("{}-{}", version, release)
+}
+
+/// Build the filename-derived RPM metadata JSON (fallback when the RPM header
+/// cannot be parsed).
+fn build_rpm_metadata(
+    name: &str,
+    version: &str,
+    release: &str,
+    arch: &str,
+    filename: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "filename": filename,
+    })
+}
+
+/// Build the upload response JSON.
+fn build_rpm_upload_response(
+    name: &str,
+    version: &str,
+    release: &str,
+    arch: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "sha256": sha256,
+        "size": size,
+    })
+}
+
+/// Extract RPM filename from headers, falling back to a hash-based name
+/// derived from the body (hashed only when no header names the file).
+fn extract_rpm_filename(headers: &HeaderMap, body: &[u8]) -> String {
+    headers
+        .get("Content-Disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split("filename=")
+                .nth(1)
+                .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
+        })
+        .or_else(|| {
+            headers
+                .get("X-Package-Filename")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            let hash = sha256_hex(body);
+            format!("{}.rpm", &hash[..16])
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1762,33 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
             )
         };
 
+        // Header-derived fields recorded at upload time (#2588). Blank when the
+        // artifact predates header extraction or the header was unparseable.
+        let meta_str = |key: &str| -> String {
+            artifact
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(key))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let description = meta_str("description");
+        let url = meta_str("url");
+        let license = meta_str("license");
+        let source_rpm = meta_str("source_rpm");
+
+        // The hosted RPM route serves packages under `packages/<file>` (see the
+        // `/rpm/{repo}/{path}` handler). Artifacts uploaded through the native
+        // RPM PUT already carry a `packages/`-prefixed path, but ones pushed via
+        // the generic upload flow are stored at their bare path. Emit a location
+        // that always matches the download route so both upload paths resolve.
+        let location = if artifact.path.starts_with("packages/") {
+            artifact.path.clone()
+        } else {
+            build_rpm_artifact_path(filename)
+        };
+
         xml.push_str(&format!(
             r#"  <package type="rpm">
     <name>{name}</name>
@@ -1039,8 +1796,14 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
     <arch>{arch}</arch>
     <checksum type="sha256" pkgid="YES">{checksum}</checksum>
     <summary>{summary}</summary>
+    <description>{description}</description>
+    <url>{url}</url>
     <size package="{size}" installed="0"/>
     <location href="{location}"/>
+    <format>
+      <rpm:license>{license}</rpm:license>
+      <rpm:sourcerpm>{source_rpm}</rpm:sourcerpm>
+    </format>
   </package>
 "#,
             name = xml_escape(&name),
@@ -1049,8 +1812,12 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
             arch = xml_escape(&arch),
             checksum = artifact.checksum_sha256,
             summary = xml_escape(&summary),
+            description = xml_escape(&description),
+            url = xml_escape(&url),
             size = artifact.size_bytes,
-            location = xml_escape(&artifact.path),
+            location = xml_escape(&location),
+            license = xml_escape(&license),
+            source_rpm = xml_escape(&source_rpm),
         ));
     }
 
@@ -1058,7 +1825,7 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
     xml
 }
 
-fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
+pub(crate) fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="{}">
@@ -1122,7 +1889,7 @@ fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
     xml
 }
 
-fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
+pub(crate) fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <otherdata xmlns="http://linux.duke.edu/metadata/other" packages="{}">
@@ -1200,19 +1967,19 @@ fn generate_updateinfo_xml() -> String {
 // Utility helpers
 // ---------------------------------------------------------------------------
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
 }
 
-fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+pub(crate) fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data).expect("gzip write failed");
     encoder.finish().expect("gzip finish failed")
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -1230,92 +1997,153 @@ fn xml_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
 
-    /// Wrap a base64-encoded signature in PGP armor format.
-    fn pgp_armor_signature(b64: &str) -> String {
-        let wrapped: Vec<&str> = b64
-            .as_bytes()
-            .chunks(76)
-            .map(|c| std::str::from_utf8(c).unwrap_or(""))
-            .collect();
-        format!(
-            "-----BEGIN PGP SIGNATURE-----\n\n{}\n-----END PGP SIGNATURE-----\n",
-            wrapped.join("\n"),
-        )
-    }
+    use crate::services::signing_service::{verify_detached, CreateKeyRequest};
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (test-only)
+    // RPM proxy metadata cap + memory bound (#2664 / #2665)
     // -----------------------------------------------------------------------
 
-    /// Build the artifact path for an RPM package.
-    fn build_rpm_artifact_path(filename: &str) -> String {
-        format!("packages/{}", filename)
+    /// #2664: pin the RPM repodata proxy buffered cap to the LARGE tier.
+    ///
+    /// #2623 raised it DEFAULT (8 MiB) → LARGE (128 MiB) because real
+    /// `filelists`/`primary` documents exceed 8 MiB and would otherwise 502.
+    /// If someone silently reverts the handler to the DEFAULT tier, this fails.
+    #[test]
+    fn rpm_proxy_metadata_cap_is_large_tier() {
+        assert_eq!(
+            RPM_PROXY_METADATA_MAX_BYTES,
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            "RPM proxy metadata cap must be the LARGE tier (#2623/#2664)"
+        );
+        assert_ne!(
+            RPM_PROXY_METADATA_MAX_BYTES,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            "RPM proxy metadata cap must not be the DEFAULT tier"
+        );
     }
 
-    /// Build the storage key for an RPM package.
-    fn build_rpm_storage_key(repo_id: &uuid::Uuid, filename: &str) -> String {
-        format!("rpm/{}/{}", repo_id, filename)
+    /// #2665: the RPM repodata proxy response must keep its budget reservation
+    /// debited for the whole lifetime of the buffered body — releasing it only
+    /// once the response (and thus the body) is dropped. This is what makes the
+    /// total-memory bound hold under sustained concurrency: a request cannot
+    /// release its slice of the budget the instant it returns and let the next
+    /// request pile another buffer on top.
+    #[tokio::test]
+    async fn buffered_metadata_response_holds_budget_until_body_dropped() {
+        let budget = proxy_helpers::ProxyMetadataBudget::new(4096);
+        let permit = budget.reserve(1000).await;
+        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
+
+        let resp = buffered_metadata_response(
+            Bytes::from_static(b"repodata-bytes"),
+            "application/gzip".to_string(),
+            permit,
+        );
+        // Still debited while the response (its body owns the permit) is alive.
+        assert_eq!(
+            budget.available_bytes(),
+            3096,
+            "budget stays debited while the response body is alive"
+        );
+
+        drop(resp);
+        assert_eq!(
+            budget.available_bytes(),
+            4096,
+            "budget is released once the response body is dropped"
+        );
     }
 
-    /// Build the full version string from version and release.
-    fn build_rpm_full_version(version: &str, release: &str) -> String {
-        format!("{}-{}", version, release)
+    // -- #2358 @N publication-serving pure helpers ---------------------------
+
+    // The stored upstream href is attacker-influenced. Only a plain relative
+    // path under the curation upstream may ever be fetched.
+    #[test]
+    fn test_is_safe_upstream_rel_path_rejects_hostile_hrefs() {
+        // Legit relative upstream paths.
+        assert!(is_safe_upstream_rel_path(
+            "Packages/nginx-1.24.0-1.el9.x86_64.rpm"
+        ));
+        assert!(is_safe_upstream_rel_path("nginx.rpm"));
+        assert!(is_safe_upstream_rel_path("el/9/x86_64/n/nginx.rpm"));
+
+        // The injection vectors: absolute attacker URL, absolute path,
+        // traversal, backslash, empty.
+        assert!(!is_safe_upstream_rel_path(
+            "https://evil.example.com/backdoor.rpm"
+        ));
+        assert!(!is_safe_upstream_rel_path("http://evil/backdoor.rpm"));
+        assert!(!is_safe_upstream_rel_path("//evil/backdoor.rpm"));
+        assert!(!is_safe_upstream_rel_path("/etc/passwd"));
+        assert!(!is_safe_upstream_rel_path("../../etc/passwd"));
+        assert!(!is_safe_upstream_rel_path("Packages/../../../etc/passwd"));
+        assert!(!is_safe_upstream_rel_path("Packages\\evil.rpm"));
+        assert!(!is_safe_upstream_rel_path(""));
     }
 
-    /// Build RPM-specific metadata JSON.
-    fn build_rpm_metadata(
-        name: &str,
-        version: &str,
-        release: &str,
-        arch: &str,
-        filename: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "release": release,
-            "arch": arch,
-            "filename": filename,
-        })
+    #[test]
+    fn test_split_publication_prefix() {
+        assert_eq!(
+            split_publication_prefix("@3/repodata/repomd.xml"),
+            Some((3, "repodata/repomd.xml".to_string()))
+        );
+        assert_eq!(split_publication_prefix("@42"), Some((42, String::new())));
+        // No leading @N -> None (normal proxy path).
+        assert_eq!(split_publication_prefix("repodata/repomd.xml"), None);
+        assert_eq!(split_publication_prefix("Packages/foo.rpm"), None);
+        // `@` not followed by digits -> None.
+        assert_eq!(split_publication_prefix("@latest/x"), None);
+        assert_eq!(split_publication_prefix("@/x"), None);
+        // An email-like package name is not mistaken for a version.
+        assert_eq!(split_publication_prefix("@1.2/x"), None);
     }
 
-    /// Build the upload response JSON.
-    fn build_rpm_upload_response(
-        name: &str,
-        version: &str,
-        release: &str,
-        arch: &str,
-        sha256: &str,
-        size: i64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "name": name,
-            "version": version,
-            "release": release,
-            "arch": arch,
-            "sha256": sha256,
-            "size": size,
-        })
+    #[test]
+    fn test_sanitize_publication_subpath_rejects_traversal() {
+        assert!(sanitize_publication_subpath("repodata/repomd.xml").is_ok());
+        assert!(sanitize_publication_subpath("Packages/tree.rpm").is_ok());
+        // Traversal / absolute / empty / dot / backslash / double-slash all 404.
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../secret",
+            "repodata/../../etc/passwd",
+            "a//b",
+            "a/./b",
+            "a\\b",
+            "..",
+        ] {
+            assert!(
+                sanitize_publication_subpath(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
     }
 
-    /// Extract RPM filename from headers, falling back to a hash-based name.
-    fn extract_rpm_filename(headers: &HeaderMap, body_hash: &str) -> String {
-        headers
-            .get("Content-Disposition")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                v.split("filename=")
-                    .nth(1)
-                    .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
-            })
-            .or_else(|| {
-                headers
-                    .get("X-Package-Filename")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| format!("{}.rpm", &body_hash[..16]))
+    #[test]
+    fn test_publication_content_type() {
+        assert_eq!(
+            publication_content_type("repodata/primary.xml.gz"),
+            "application/gzip"
+        );
+        assert_eq!(
+            publication_content_type("repodata/repomd.xml.asc"),
+            "application/pgp-signature"
+        );
+        assert_eq!(
+            publication_content_type("repodata/repomd.xml.key"),
+            "application/pgp-keys"
+        );
+        assert_eq!(
+            publication_content_type("repodata/repomd.xml"),
+            "application/xml"
+        );
+        assert_eq!(
+            publication_content_type("Packages/tree.rpm"),
+            "application/octet-stream"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1636,7 +2464,7 @@ mod tests {
             HeaderValue::from_static("attachment; filename=my-pkg-1.0-1.x86_64.rpm"),
         );
         assert_eq!(
-            extract_rpm_filename(&headers, "somehash1234567890"),
+            extract_rpm_filename(&headers, b""),
             "my-pkg-1.0-1.x86_64.rpm"
         );
     }
@@ -1648,17 +2476,16 @@ mod tests {
             "X-Package-Filename",
             HeaderValue::from_static("custom-name.rpm"),
         );
-        assert_eq!(
-            extract_rpm_filename(&headers, "somehash1234567890"),
-            "custom-name.rpm"
-        );
+        assert_eq!(extract_rpm_filename(&headers, b""), "custom-name.rpm");
     }
 
     #[test]
     fn test_extract_rpm_filename_fallback_to_hash() {
         let headers = HeaderMap::new();
-        let result = extract_rpm_filename(&headers, "abcdef1234567890abcdef");
-        assert_eq!(result, "abcdef1234567890.rpm");
+        // sha256("") = e3b0c44298fc1c14...; the fallback name is the first 16 hex
+        // chars of the body hash.
+        let result = extract_rpm_filename(&headers, b"");
+        assert_eq!(result, "e3b0c44298fc1c14.rpm");
     }
 
     #[test]
@@ -1673,7 +2500,7 @@ mod tests {
             HeaderValue::from_static("from-header.rpm"),
         );
         // Content-Disposition has priority
-        assert_eq!(extract_rpm_filename(&headers, "hash"), "from-cd.rpm");
+        assert_eq!(extract_rpm_filename(&headers, b""), "from-cd.rpm");
     }
 
     #[test]
@@ -1683,56 +2510,20 @@ mod tests {
             "Content-Disposition",
             HeaderValue::from_static("attachment; filename=\"quoted.rpm\""),
         );
-        assert_eq!(
-            extract_rpm_filename(&headers, "hash1234567890123456"),
-            "quoted.rpm"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // pgp_armor_signature
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pgp_armor_signature_basic() {
-        let armored = pgp_armor_signature("dGVzdA==");
-        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----"));
-        assert!(armored.ends_with("-----END PGP SIGNATURE-----\n"));
-        assert!(armored.contains("dGVzdA=="));
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_wrapping() {
-        // Create a long base64 string that exceeds 76 chars
-        let long_b64 = "A".repeat(200);
-        let armored = pgp_armor_signature(&long_b64);
-        // Each line in the body should be at most 76 characters
-        let body = armored
-            .strip_prefix("-----BEGIN PGP SIGNATURE-----\n\n")
-            .unwrap()
-            .strip_suffix("\n-----END PGP SIGNATURE-----\n")
-            .unwrap();
-        for line in body.lines() {
-            assert!(line.len() <= 76, "Line exceeds 76 chars: {}", line);
-        }
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_empty() {
-        let armored = pgp_armor_signature("");
-        assert!(armored.contains("-----BEGIN PGP SIGNATURE-----"));
-        assert!(armored.contains("-----END PGP SIGNATURE-----"));
-    }
-
-    #[test]
-    fn test_pgp_armor_signature_short() {
-        let armored = pgp_armor_signature("YQ==");
-        assert!(armored.contains("YQ=="));
+        assert_eq!(extract_rpm_filename(&headers, b""), "quoted.rpm");
     }
 
     // -----------------------------------------------------------------------
     // XML generation helpers
     // -----------------------------------------------------------------------
+
+    /// A fixed `updated_at` for artifact fixtures. Deliberately a constant and
+    /// never `Utc::now()`: the repodata render must be a pure function of
+    /// repository state, so a fixture that carried a clock reading would let
+    /// the very bug these tests pin (#2636) slip back in unnoticed.
+    fn test_updated_at() -> chrono::DateTime<chrono::Utc> {
+        chrono::TimeZone::timestamp_opt(&chrono::Utc, 1_700_000_000, 0).unwrap()
+    }
 
     #[test]
     fn test_generate_primary_xml_empty() {
@@ -1752,6 +2543,7 @@ mod tests {
             size_bytes: 1024,
             checksum_sha256: "abc123".to_string(),
             storage_key: "rpm/1/test-1.0-1.x86_64.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: Some(serde_json::json!({
                 "name": "test",
                 "version": "1.0",
@@ -1777,6 +2569,7 @@ mod tests {
             size_bytes: 512,
             checksum_sha256: "def456".to_string(),
             storage_key: "rpm/1/test.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: Some(serde_json::json!({
                 "name": "test<pkg>",
                 "version": "1.0",
@@ -1786,6 +2579,211 @@ mod tests {
         }];
         let xml = generate_primary_xml(&artifacts);
         assert!(xml.contains("test&lt;pkg&gt;"));
+    }
+
+    // The <location href> must match the hosted download route (`packages/<file>`)
+    // regardless of how the artifact was stored (native PUT vs. generic upload).
+    #[test]
+    fn test_generate_primary_xml_bare_path_location_prefixed() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "hello-1.0-1.x86_64.rpm".to_string(),
+            name: "hello".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(
+            xml.contains(r#"<location href="packages/hello-1.0-1.x86_64.rpm"/>"#),
+            "bare-path RPM must emit a packages/-prefixed href: {xml}"
+        );
+    }
+
+    #[test]
+    fn test_generate_primary_xml_nested_non_packages_path_uses_basename() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "some/nested/dir/hello-1.0-1.x86_64.rpm".to_string(),
+            name: "hello".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(
+            xml.contains(r#"<location href="packages/hello-1.0-1.x86_64.rpm"/>"#),
+            "nested non-packages path must map to packages/<basename>: {xml}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rpm_artifact_metadata (#2588)
+    // -----------------------------------------------------------------------
+
+    /// Real minimal noarch RPM built with rpmbuild (Summary/License/URL/Group
+    /// set, so header extraction has something to find).
+    const TEST_RPM: &[u8] = include_bytes!("../../../tests/fixtures/ak-meta-test-1.0-1.noarch.rpm");
+
+    #[test]
+    fn test_build_rpm_artifact_metadata_extracts_header_fields() {
+        let meta = build_rpm_artifact_metadata("ak-meta-test-1.0-1.noarch.rpm", TEST_RPM)
+            .expect("metadata for a real RPM");
+        assert_eq!(meta["name"], "ak-meta-test");
+        assert_eq!(meta["version"], "1.0");
+        assert_eq!(meta["release"], "1");
+        assert_eq!(meta["arch"], "noarch");
+        assert_eq!(meta["filename"], "ak-meta-test-1.0-1.noarch.rpm");
+        assert_eq!(meta["summary"], "Artifact Keeper metadata test package");
+        assert_eq!(meta["license"], "MIT");
+        assert_eq!(meta["url"], "https://artifact-keeper.example/test");
+        assert_eq!(meta["source_rpm"], "ak-meta-test-1.0-1.src.rpm");
+    }
+
+    /// The header is authoritative: a filename that disagrees with the header
+    /// must not override the header-derived NEVRA.
+    #[test]
+    fn test_build_rpm_artifact_metadata_header_wins_over_filename() {
+        let meta = build_rpm_artifact_metadata("wrong-9.9-9.x86_64.rpm", TEST_RPM)
+            .expect("metadata for a real RPM");
+        assert_eq!(meta["name"], "ak-meta-test");
+        assert_eq!(meta["version"], "1.0");
+        assert_eq!(meta["arch"], "noarch");
+        // The stored filename still reflects what the client pushed.
+        assert_eq!(meta["filename"], "wrong-9.9-9.x86_64.rpm");
+    }
+
+    /// Unparseable content with a NEVRA filename degrades to filename-derived
+    /// fields (header-only fields absent), never an error.
+    #[test]
+    fn test_build_rpm_artifact_metadata_unparseable_content_uses_filename() {
+        let meta = build_rpm_artifact_metadata("hello-2.10-1.el8.noarch.rpm", b"not an rpm")
+            .expect("filename-derived metadata");
+        assert_eq!(meta["name"], "hello");
+        assert_eq!(meta["version"], "2.10");
+        assert_eq!(meta["release"], "1.el8");
+        assert_eq!(meta["arch"], "noarch");
+        assert!(meta.get("summary").is_none());
+        assert!(meta.get("source_rpm").is_none());
+    }
+
+    /// No signal from either source -> no metadata row at all.
+    #[test]
+    fn test_build_rpm_artifact_metadata_no_signal_returns_none() {
+        assert!(build_rpm_artifact_metadata("blob.bin", b"junk").is_none());
+        assert!(build_rpm_artifact_metadata("bad.rpm", b"junk").is_none());
+    }
+
+    /// primary.xml must surface the header-derived format metadata (#2588):
+    /// description/url plus the <format> block dnf's `Source:` field reads.
+    #[test]
+    fn test_generate_primary_xml_emits_format_metadata() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/test-1.0-1.x86_64.rpm".to_string(),
+            name: "test".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/test-1.0-1.x86_64.rpm".to_string(),
+            updated_at: test_updated_at(),
+            metadata: Some(serde_json::json!({
+                "name": "test",
+                "version": "1.0",
+                "release": "1",
+                "arch": "x86_64",
+                "summary": "A test package",
+                "description": "Longer description",
+                "url": "https://example.test",
+                "license": "MIT",
+                "source_rpm": "test-1.0-1.src.rpm",
+            })),
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(xml.contains("<summary>A test package</summary>"), "{xml}");
+        assert!(
+            xml.contains("<description>Longer description</description>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<url>https://example.test</url>"), "{xml}");
+        assert!(xml.contains("<rpm:license>MIT</rpm:license>"), "{xml}");
+        assert!(
+            xml.contains("<rpm:sourcerpm>test-1.0-1.src.rpm</rpm:sourcerpm>"),
+            "{xml}"
+        );
+    }
+
+    /// Artifacts recorded before header extraction existed keep rendering
+    /// (fields blank, not an error).
+    #[test]
+    fn test_generate_primary_xml_blank_format_fields_without_metadata() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/hello-1.0-1.x86_64.rpm".to_string(),
+            name: "hello".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(xml.contains("<rpm:license></rpm:license>"), "{xml}");
+        assert!(xml.contains("<rpm:sourcerpm></rpm:sourcerpm>"), "{xml}");
+    }
+
+    // Regression pin: a native `packages/`-prefixed path must be emitted
+    // byte-for-byte identically (no double-prefixing, no rewrite).
+    #[test]
+    fn test_generate_primary_xml_native_packages_path_location_identical() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/hello-1.0-1.x86_64.rpm".to_string(),
+            name: "hello".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(
+            xml.contains(r#"<location href="packages/hello-1.0-1.x86_64.rpm"/>"#),
+            "native packages/ path must be emitted verbatim: {xml}"
+        );
+        assert!(
+            !xml.contains("packages/packages/"),
+            "native packages/ path must not be double-prefixed: {xml}"
+        );
+    }
+
+    // xml_escape must still apply to the computed location.
+    #[test]
+    fn test_generate_primary_xml_location_is_xml_escaped() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "weird&name-1.0-1.x86_64.rpm".to_string(),
+            name: "weird".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/weird.rpm".to_string(),
+            updated_at: test_updated_at(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(
+            xml.contains(r#"<location href="packages/weird&amp;name-1.0-1.x86_64.rpm"/>"#),
+            "location must be xml-escaped: {xml}"
+        );
     }
 
     #[test]
@@ -1805,6 +2803,7 @@ mod tests {
             size_bytes: 256,
             checksum_sha256: "sha256hash".to_string(),
             storage_key: "rpm/1/hello.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: Some(serde_json::json!({
                 "name": "hello",
                 "version": "1.0",
@@ -1835,6 +2834,7 @@ mod tests {
             size_bytes: 4096,
             checksum_sha256: "otherhash".to_string(),
             storage_key: "rpm/1/util.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: Some(serde_json::json!({
                 "name": "util",
                 "version": "2.0",
@@ -1886,6 +2886,7 @@ mod tests {
             size_bytes: 2048,
             checksum_sha256: "fallbackhash".to_string(),
             storage_key: "rpm/1/curl.rpm".to_string(),
+            updated_at: test_updated_at(),
             metadata: None,
         }];
         let xml = generate_primary_xml(&artifacts);
@@ -2533,6 +3534,78 @@ mod tests {
         );
     }
 
+    /// **The determinism gate (#2636).**
+    ///
+    /// `repomd.xml` and `repomd.xml.asc` render this document independently,
+    /// one request apart, and the client verifies the second render's
+    /// signature against the first render's bytes. So the render must depend
+    /// on repository state and nothing else — above all, not on the clock.
+    ///
+    /// The `sleep` is the whole point: this stamped `SystemTime::now()` into
+    /// `<revision>` and every `<data><timestamp>`, so back-to-back renders
+    /// agreed ~99.9% of the time and *looked* fine. Crossing a second boundary
+    /// is what exposes it — and is exactly what a real `dnf` run does between
+    /// fetching the two URLs.
+    #[test]
+    fn test_repomd_render_is_byte_identical_over_unchanged_state() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/det-1.0-1.x86_64.rpm".to_string(),
+            name: "det".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 4096,
+            checksum_sha256: "feed".to_string(),
+            storage_key: "rpm/det.rpm".to_string(),
+            metadata: None,
+            updated_at: test_updated_at(),
+        }];
+
+        let first = generate_repomd_xml_content(&artifacts);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = generate_repomd_xml_content(&artifacts);
+
+        assert_eq!(
+            first, second,
+            "unchanged repository state must render byte-identical repomd.xml across a \
+             second boundary; a wall-clock read in the render makes repomd.xml.asc sign \
+             different bytes than repomd.xml serves",
+        );
+    }
+
+    /// The epoch must come from repository state, not the clock: it equals the
+    /// newest artifact's `updated_at`, and an empty repo pins to 0.
+    #[test]
+    fn test_repomd_revision_is_the_repo_state_epoch() {
+        let mk = |secs: i64| RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: format!("packages/p-{secs}.rpm"),
+            name: format!("p{secs}"),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1,
+            checksum_sha256: "aa".to_string(),
+            storage_key: format!("rpm/p-{secs}.rpm"),
+            metadata: None,
+            updated_at: chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, 0).unwrap(),
+        };
+
+        let xml = generate_repomd_xml_content(&[mk(1_600_000_000), mk(1_700_000_000)]);
+        assert!(
+            xml.contains("<revision>1700000000</revision>"),
+            "<revision> must be the most recent artifact updated_at: {xml}"
+        );
+        assert_eq!(
+            xml.matches("<timestamp>1700000000</timestamp>").count(),
+            4,
+            "every <data><timestamp> must carry the repo-state epoch: {xml}"
+        );
+
+        let empty = generate_repomd_xml_content(&[]);
+        assert!(
+            empty.contains("<revision>0</revision>"),
+            "an empty repo has no state to date, and must not fall back to now(): {empty}"
+        );
+    }
+
     #[test]
     fn test_generate_repomd_open_checksum_matches_uncompressed_primary() {
         // The primary <open-checksum> must equal sha256 of the *uncompressed*
@@ -2670,5 +3743,679 @@ mod tests {
             .await
             .ok();
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2590: repodata must describe only actual `.rpm` packages. The generic
+    // chunked upload flow can place arbitrary objects (signature sidecars,
+    // checksum files, `.repo` snippets) into an RPM repository; those must
+    // not leak into primary.xml/filelists.xml/other.xml, or dnf/yum trip on
+    // metadata entries that are not packages.
+    // -----------------------------------------------------------------------
+
+    /// Insert an arbitrary (non-`.rpm`) object row into the fixture repo,
+    /// mimicking what the generic upload flow stores.
+    async fn insert_repo_object(f: &tdh::Fixture, path: &str, name: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                repository_id, path, name, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .bind(name)
+        .bind(64i64)
+        .bind("1111111111111111111111111111111111111111111111111111111111111111")
+        .bind("application/octet-stream")
+        .bind(path)
+        .bind(f.user_id)
+        .execute(&f.pool)
+        .await
+        .expect("insert non-rpm repo object");
+    }
+
+    #[tokio::test]
+    async fn test_rpm_repodata_excludes_non_rpm_objects() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+
+        // Two real packages: a binary RPM and a source RPM (both must stay).
+        insert_rpm_artifact(&f, "realpkg").await;
+        insert_repo_object(&f, "packages/realpkg-1.0-1.src.rpm", "realpkg-src").await;
+        // Non-package companions the generic flow can store (all must go).
+        insert_repo_object(&f, "packages/realpkg-1.0-1.x86_64.rpm.asc", "realpkg-sig").await;
+        insert_repo_object(&f, "realpkg-1.0-1.x86_64.rpm.sha256", "realpkg-sum").await;
+        insert_repo_object(&f, "test.repo", "test-repo").await;
+
+        // The query helper itself must only return the package rows.
+        let listed = super::collect_repodata_artifacts(&f.pool, &[f.repo_id])
+            .await
+            .expect("collect_repodata_artifacts");
+        let paths: Vec<&str> = listed.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "packages/realpkg-1.0-1.x86_64.rpm",
+                "packages/realpkg-1.0-1.src.rpm",
+            ],
+            "collect_repodata_artifacts must return only .rpm package objects"
+        );
+
+        // End to end: primary.xml must describe exactly the two packages.
+        let (status, body) = get_repodata(&f, "primary.xml.gz").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut decoder = GzDecoder::new(&body[..]);
+        let mut primary = String::new();
+        decoder
+            .read_to_string(&mut primary)
+            .expect("decompress primary.xml.gz");
+
+        f.teardown().await;
+
+        assert!(
+            primary.contains("packages=\"2\""),
+            "primary.xml must count only the .rpm packages, got: {primary}"
+        );
+        assert!(primary.contains("realpkg-1.0-1.x86_64.rpm"));
+        assert!(primary.contains("realpkg-1.0-1.src.rpm"));
+        for junk in [".rpm.asc", ".rpm.sha256", "test.repo"] {
+            assert!(
+                !primary.contains(junk),
+                "non-package object {junk} leaked into primary.xml: {primary}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The `generate_primary_xml` unit tests prove `<location href>` is emitted
+    // as a string; only resolving that href the way dnf/yum does — against the
+    // repository base URL (the directory that holds `repodata/`), NOT against
+    // the primary.xml document itself — and routing it against the REAL router
+    // proves a package the index advertises is actually downloadable. A href
+    // that 404s at the download route passes every generator test yet breaks
+    // `dnf install`.
+    // -----------------------------------------------------------------------
+
+    /// The rpm routes mounted exactly where `api::routes` nests them, so the
+    /// repo-base-relative `<location href>` resolves with the `/rpm` prefix.
+    fn rpm_mounted_router() -> Router<SharedState> {
+        Router::new().nest("/rpm", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path to request.
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_advertised_primary_location_resolves_against_real_router() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+
+        // Publish a package's bytes under the exact `packages/<file>` path the
+        // native RPM PUT stores, so both the index location and the download
+        // route agree on it.
+        let filename = "realpkg-1.0-1.x86_64.rpm";
+        let rpm_bytes: &[u8] = b"fake-rpm-package-bytes-for-advertised-url";
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            &format!("packages/{filename}"),
+            &format!("packages/{filename}"),
+            "realpkg",
+            "1.0-1",
+            "application/x-rpm",
+            bytes::Bytes::from_static(rpm_bytes),
+            f.user_id,
+        )
+        .await;
+
+        // Read the `<location href>` primary.xml advertises for the package.
+        let (status, body) = tdh::send(
+            f.router_anon(rpm_mounted_router()),
+            tdh::get(format!("/rpm/{}/repodata/primary.xml.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "primary.xml.gz");
+        let mut primary = String::new();
+        GzDecoder::new(&body[..])
+            .read_to_string(&mut primary)
+            .expect("decompress primary.xml.gz");
+        let href = primary
+            .split_once("<location href=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_default();
+
+        // dnf resolves `<location href>` against the repository base URL — the
+        // directory that CONTAINS `repodata/`, not the primary.xml document.
+        let repo_base = format!("http://ak.test/rpm/{}/", f.repo_key);
+        let (dl_status, dl_body) = if href.is_empty() {
+            (StatusCode::NOT_FOUND, bytes::Bytes::new())
+        } else {
+            let path = resolve_advertised(&repo_base, &href);
+            tdh::send(f.router_anon(rpm_mounted_router()), tdh::get(path)).await
+        };
+
+        f.teardown().await;
+
+        assert!(
+            !href.is_empty(),
+            "primary.xml must advertise a <location href>, got: {primary}"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised <location href> ({href}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            rpm_bytes,
+            "the advertised location must serve the published .rpm bytes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // repomd.xml.asc / repomd.xml.key — the OpenPGP contract (#2636)
+    //
+    // These replace the former `pgp_armor_signature` tests, which asserted the
+    // shape of hand-rolled "BEGIN PGP SIGNATURE" markers wrapped around raw
+    // base64 PKCS#1 bytes. Those tests passed against output no OpenPGP client
+    // could parse: they pinned the bug. What matters is not that the markers
+    // are present, but that the bytes between them are a real OpenPGP
+    // signature packet that verifies against the key the repo advertises.
+    // -----------------------------------------------------------------------
+
+    /// Mint a signing key of `key_type` and attach it to the fixture repo for
+    /// metadata signing. Returns the armored public key the repo will serve.
+    async fn attach_signing_key(f: &tdh::Fixture, key_type: &str) -> String {
+        let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+        let key = svc
+            .create_key(CreateKeyRequest {
+                repository_id: Some(f.repo_id),
+                name: format!("rpm-sign-{}", f.repo_key),
+                key_type: key_type.to_string(),
+                algorithm: "rsa2048".to_string(),
+                uid_name: Some("AK RPM".to_string()),
+                uid_email: Some("rpm@example.com".to_string()),
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+        svc.update_signing_config(f.repo_id, Some(key.id), true, false, false)
+            .await
+            .expect("attach signing key");
+        key.public_key_pem
+    }
+
+    async fn get_repodata(f: &tdh::Fixture, file: &str) -> (StatusCode, Bytes) {
+        tdh::send(
+            f.router_anon(super::router()),
+            tdh::get(format!("/{}/repodata/{}", f.repo_key, file)),
+        )
+        .await
+    }
+
+    /// Give the repo a package, so the metadata epoch is derived from real
+    /// repository state rather than the empty-repo fallback.
+    async fn insert_rpm_artifact(f: &tdh::Fixture, name: &str) {
+        sqlx::query!(
+            r#"
+            INSERT INTO artifacts (
+                repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key, uploaded_by
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
+            f.repo_id,
+            format!("packages/{}-1.0-1.x86_64.rpm", name),
+            name,
+            "1.0-1",
+            1024i64,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "application/x-rpm",
+            format!("rpm/{}/{}-1.0-1.x86_64.rpm", f.repo_key, name),
+            f.user_id,
+        )
+        .execute(&f.pool)
+        .await
+        .expect("insert rpm artifact");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2521 (PF-004): repodata requests must serve a prebuilt cached render.
+    // Before the fix every /repodata/* request refetched all live .rpm rows
+    // and regenerated + regzipped the whole document set in the request path
+    // (repomd.xml built primary/filelists/other/updateinfo just to hash
+    // them), so one dnf refresh cost O(repo) work five times over.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rpm_repodata_warm_requests_serve_one_cached_render() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        insert_rpm_artifact(&f, "alpha").await;
+        insert_rpm_artifact(&f, "beta").await;
+
+        let renders_before = f.state.rpm_repodata_cache.renders();
+
+        // A full dnf-style refresh (manifest + all three indexes) plus a
+        // repeat of the manifest: five requests against unchanged state.
+        let (st, repomd) = get_repodata(&f, "repomd.xml").await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, primary) = get_repodata(&f, "primary.xml.gz").await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _filelists) = get_repodata(&f, "filelists.xml.gz").await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _other) = get_repodata(&f, "other.xml.gz").await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, repomd_again) = get_repodata(&f, "repomd.xml").await;
+        assert_eq!(st, StatusCode::OK);
+
+        assert_eq!(
+            f.state.rpm_repodata_cache.renders() - renders_before,
+            1,
+            "five repodata requests against unchanged state must cost exactly \
+             one O(repo) render"
+        );
+        assert_eq!(repomd, repomd_again, "warm manifest must be byte-identical");
+
+        // Coherence across the set: the checksum repomd.xml advertises for
+        // primary.xml.gz must be the checksum of the bytes the sibling
+        // endpoint actually served — they come from the same render.
+        let repomd_text = String::from_utf8(repomd.to_vec()).expect("repomd utf8");
+        let primary_sha = super::sha256_hex(&primary);
+        assert!(
+            repomd_text.contains(&primary_sha),
+            "repomd.xml must advertise the checksum of the served primary.xml.gz \
+             (expected {primary_sha} in: {repomd_text})"
+        );
+
+        // A one-artifact mutation rotates the fingerprint: exactly one new
+        // render, and the served metadata reflects the change immediately
+        // (no TTL window — the fingerprint is revalidated per request).
+        insert_rpm_artifact(&f, "gamma").await;
+        let (st, primary_after) = get_repodata(&f, "primary.xml.gz").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            f.state.rpm_repodata_cache.renders() - renders_before,
+            2,
+            "one artifact mutation must cause exactly one re-render"
+        );
+        let mut decoder = GzDecoder::new(&primary_after[..]);
+        let mut primary_xml = String::new();
+        decoder
+            .read_to_string(&mut primary_xml)
+            .expect("decompress primary.xml.gz");
+        assert!(
+            primary_xml.contains("<name>gamma</name>"),
+            "post-mutation metadata must include the new package: {primary_xml}"
+        );
+        assert!(
+            primary_xml.contains("packages=\"3\""),
+            "post-mutation metadata must count all three packages: {primary_xml}"
+        );
+
+        f.teardown().await;
+    }
+
+    /// The end-to-end contract `dnf repo_gpgcheck=1` enforces: the signature
+    /// served at repodata/repomd.xml.asc must be real, CRC24-armored OpenPGP
+    /// that verifies over the exact repomd.xml bytes under the key served at
+    /// repodata/repomd.xml.key.
+    ///
+    /// Before #2636 this endpoint returned raw PKCS#1 RSA bytes base64'd
+    /// inside hand-rolled "BEGIN PGP SIGNATURE" markers — no packet framing,
+    /// no CRC24 — and the key endpoint served an X.509 SPKI PEM.
+    #[tokio::test]
+    async fn test_repomd_asc_is_verifiable_openpgp_against_advertised_key() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "gpg").await;
+
+        let (xml_status, repomd) = get_repodata(&f, "repomd.xml").await;
+        let (asc_status, asc) = get_repodata(&f, "repomd.xml.asc").await;
+        let (key_status, pubkey) = get_repodata(&f, "repomd.xml.key").await;
+        assert_eq!(xml_status, StatusCode::OK);
+        assert_eq!(
+            asc_status,
+            StatusCode::OK,
+            "asc: {}",
+            String::from_utf8_lossy(&asc)
+        );
+        assert_eq!(key_status, StatusCode::OK);
+
+        let asc = String::from_utf8(asc.to_vec()).expect("asc must be ASCII armor");
+        let pubkey = String::from_utf8(pubkey.to_vec()).expect("key must be ASCII armor");
+
+        assert!(asc.starts_with("-----BEGIN PGP SIGNATURE-----"));
+        assert!(asc.trim_end().ends_with("-----END PGP SIGNATURE-----"));
+        // Real armor carries a CRC24 checksum line ("=XXXX") before END; its
+        // absence is what made gpg report "invalid packet (ctb=37)".
+        assert!(
+            asc.lines().any(|l| l.len() == 5 && l.starts_with('=')),
+            "armor must carry a CRC24 checksum line; got:\n{}",
+            asc
+        );
+        // Decisive: a parseable signature packet that verifies over the served
+        // metadata under the advertised key — exactly what dnf and gpg do.
+        StandaloneSignature::from_string(&asc)
+            .expect("armor must parse as an OpenPGP signature packet");
+        verify_detached(&pubkey, &repomd, &asc)
+            .expect("the served signature must verify against the advertised key");
+
+        f.teardown().await;
+    }
+
+    /// **The cross-request determinism gate (#2636).**
+    ///
+    /// A real `dnf` run fetches `repomd.xml` and `repomd.xml.asc` as two
+    /// separate requests, and verifies the signature from the second against
+    /// the bytes of the first. The two handlers render the document
+    /// independently, so anything clock-derived in the render makes them
+    /// disagree whenever the fetches straddle a second boundary — `BAD
+    /// signature` on a repo nobody touched, at roughly `gap / 1s` probability.
+    /// dnf's metadata cache makes it worse: a `repomd.xml` retained from an
+    /// earlier run can never match a freshly stamped signature.
+    ///
+    /// `test_repomd_asc_is_verifiable_openpgp_against_advertised_key` models
+    /// the same contract but fetches back-to-back in well under a millisecond,
+    /// so it passed ~99.9% of the time even while this was broken — a latent
+    /// flake, not a gate. The sleep is what turns it into one.
+    #[tokio::test]
+    async fn test_repomd_asc_verifies_against_a_repomd_fetched_a_second_earlier() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "gpg").await;
+        insert_rpm_artifact(&f, "delayed").await;
+
+        let (xml_status, repomd) = get_repodata(&f, "repomd.xml").await;
+        assert_eq!(xml_status, StatusCode::OK);
+
+        // Straddle a second boundary, as any real client trivially does.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let (asc_status, asc) = get_repodata(&f, "repomd.xml.asc").await;
+        let (key_status, pubkey) = get_repodata(&f, "repomd.xml.key").await;
+        assert_eq!(asc_status, StatusCode::OK);
+        assert_eq!(key_status, StatusCode::OK);
+
+        let asc = String::from_utf8(asc.to_vec()).expect("asc must be ASCII armor");
+        let pubkey = String::from_utf8(pubkey.to_vec()).expect("key must be ASCII armor");
+
+        verify_detached(&pubkey, &repomd, &asc).expect(
+            "repomd.xml.asc must verify over the repomd.xml served a second earlier: the \
+             signature must cover repository state, not the time the request arrived",
+        );
+
+        f.teardown().await;
+    }
+
+    /// The same repository state must serve byte-identical `repomd.xml` no
+    /// matter when it is asked for — through the real route, over a second
+    /// boundary. This is what makes the metadata cacheable and reproducible,
+    /// and what lets a cached `repomd.xml` still match a later signature.
+    #[tokio::test]
+    async fn test_repomd_xml_route_is_byte_stable_over_time() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        insert_rpm_artifact(&f, "stable").await;
+
+        let (_, first) = get_repodata(&f, "repomd.xml").await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (_, second) = get_repodata(&f, "repomd.xml").await;
+
+        assert_eq!(
+            first,
+            second,
+            "unchanged repo state must serve identical repomd.xml bytes; got:\n{}\n---\n{}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second),
+        );
+
+        f.teardown().await;
+    }
+
+    /// The served signature must not verify over metadata it did not sign.
+    #[tokio::test]
+    async fn test_repomd_asc_rejects_tampered_metadata() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "gpg").await;
+
+        let (_, repomd) = get_repodata(&f, "repomd.xml").await;
+        let (_, asc) = get_repodata(&f, "repomd.xml.asc").await;
+        let (_, pubkey) = get_repodata(&f, "repomd.xml.key").await;
+        let asc = String::from_utf8(asc.to_vec()).unwrap();
+        let pubkey = String::from_utf8(pubkey.to_vec()).unwrap();
+
+        let tampered = String::from_utf8(repomd.to_vec())
+            .unwrap()
+            .replace("</repomd>", "<data type=\"evil\"></data></repomd>");
+        assert!(
+            verify_detached(&pubkey, tampered.as_bytes(), &asc).is_err(),
+            "a tampered repomd.xml must fail signature verification"
+        );
+
+        f.teardown().await;
+    }
+
+    /// repodata/repomd.xml.key must serve an importable OpenPGP public key.
+    /// `dnf`'s `gpgkey=` and `rpm --import` reject an X.509 SPKI PEM
+    /// ("no valid OpenPGP data found").
+    #[tokio::test]
+    async fn test_repomd_key_serves_importable_openpgp_key() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "gpg").await;
+
+        let (status, body) = get_repodata(&f, "repomd.xml.key").await;
+        assert_eq!(status, StatusCode::OK);
+        let pubkey = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            pubkey.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+            "must be an OpenPGP key block, got: {}",
+            pubkey.lines().next().unwrap_or("")
+        );
+        assert!(
+            !pubkey.contains("BEGIN PUBLIC KEY"),
+            "must not be an X.509 SubjectPublicKeyInfo PEM"
+        );
+        let (parsed, _) = SignedPublicKey::from_string(&pubkey).expect("key must parse as OpenPGP");
+        parsed.verify().expect("advertised key must self-verify");
+
+        f.teardown().await;
+    }
+
+    /// **The regression guard that matters (#2636).**
+    ///
+    /// A key that claims `key_type=gpg` but whose stored material will not
+    /// parse as an OpenPGP secret key (a legacy PEM key predating OpenPGP
+    /// support) is a genuine server-side fault: it must surface a real, logged
+    /// 500 carrying the cause — never a 404 "No signing key configured for
+    /// this repository" while `repomd.xml.key` serves that very key.
+    ///
+    /// The old path was `sign_data(..).await.unwrap_or(None)`: the `Err`
+    /// collapsed into `None`, and the resulting misleading 404 is why this
+    /// stayed invisible. Storing X.509 material under `key_type=gpg`
+    /// reproduces that load failure past the key-type gate.
+    #[tokio::test]
+    async fn test_unloadable_signing_key_is_a_loud_500_not_a_misleading_404() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "rsa").await;
+        // Present X.509 material as an OpenPGP key: the key type now claims it
+        // can sign, so the failure happens where the material is parsed.
+        sqlx::query!(
+            "UPDATE signing_keys SET key_type = 'gpg' WHERE repository_id = $1",
+            f.repo_id
+        )
+        .execute(&f.pool)
+        .await
+        .expect("force key_type=gpg");
+
+        let (asc_status, body) = get_repodata(&f, "repomd.xml.asc").await;
+
+        assert_eq!(
+            asc_status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a key that cannot be loaded is a server fault, and must not be swallowed \
+             into 404 'No signing key configured'",
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("Failed to sign repomd.xml"),
+            "the response must carry the real cause, got: {}",
+            body
+        );
+
+        f.teardown().await;
+    }
+
+    /// An `rsa` key — the *default* `key_type` — cannot produce an OpenPGP
+    /// chain, so both signing endpoints refuse with **409 Conflict**: the
+    /// repository's signing config conflicts with what these endpoints must
+    /// serve. Distinctly not 404 (the repo *does* advertise a key) and
+    /// distinctly not 500 (nothing is broken server-side).
+    ///
+    /// The status is load-bearing: these routes are anonymous, so every `dnf`
+    /// poll of a misconfigured repo lands here. A 500 would let an
+    /// unauthenticated client drive unbounded ERROR logs and 500-rate alerts —
+    /// paging an on-call engineer for an operator config mistake.
+    #[tokio::test]
+    async fn test_rsa_key_is_a_409_conflict_on_both_signing_endpoints() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        attach_signing_key(&f, "rsa").await;
+
+        let (asc_status, asc_body) = get_repodata(&f, "repomd.xml.asc").await;
+        let (key_status, _) = get_repodata(&f, "repomd.xml.key").await;
+
+        assert_eq!(
+            asc_status,
+            StatusCode::CONFLICT,
+            "an unsignable key type is a config conflict, not a server error",
+        );
+        assert_eq!(
+            key_status,
+            StatusCode::CONFLICT,
+            "the repo must not advertise a key it can never sign with",
+        );
+        let asc_body = String::from_utf8_lossy(&asc_body);
+        assert!(
+            asc_body.contains("key_type='gpg'"),
+            "the response must name the fix, got: {}",
+            asc_body
+        );
+
+        f.teardown().await;
+    }
+
+    /// A repo with genuinely no signing key still 404s: the 500 above is a
+    /// signing *failure*, not a missing configuration. Keeps the two distinct.
+    #[tokio::test]
+    async fn test_repo_without_signing_key_still_404s() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+
+        let (asc_status, _) = get_repodata(&f, "repomd.xml.asc").await;
+        let (key_status, _) = get_repodata(&f, "repomd.xml.key").await;
+        assert_eq!(asc_status, StatusCode::NOT_FOUND);
+        assert_eq!(key_status, StatusCode::NOT_FOUND);
+
+        f.teardown().await;
+    }
+
+    /// The 404-vs-500 decision itself, as a pure mapping (#2636). A *missing*
+    /// key is a client-visible 404; a key that fails to load is a loud 500
+    /// carrying the real error. Collapsing the second into the first is the
+    /// bug class this guards.
+    #[test]
+    fn test_require_signing_key_separates_missing_from_broken() {
+        let missing = require_signing_key(Ok(None)).expect_err("None must be an error response");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let broken = require_signing_key(Err(crate::error::AppError::Internal(
+            "Failed to parse OpenPGP private key".to_string(),
+        )))
+        .expect_err("Err must be an error response");
+        assert_eq!(
+            broken.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a key-load failure must be a loud 500, never a 404 'not configured'"
+        );
+    }
+
+    fn key_of_type(key_type: &str) -> crate::models::signing_key::SigningKey {
+        crate::models::signing_key::SigningKey {
+            id: uuid::Uuid::new_v4(),
+            repository_id: None,
+            name: "k".to_string(),
+            key_type: key_type.to_string(),
+            fingerprint: None,
+            key_id: None,
+            public_key_pem: String::new(),
+            private_key_enc: Vec::new(),
+            algorithm: "rsa2048".to_string(),
+            uid_name: None,
+            uid_email: None,
+            expires_at: None,
+            is_active: true,
+            created_at: test_updated_at(),
+            created_by: None,
+            rotated_from: None,
+            last_used_at: None,
+        }
+    }
+
+    /// The 409-vs-500 decision as a pure mapping (#2636): a key type that can
+    /// never sign OpenPGP is an operator config conflict, not a server fault.
+    #[test]
+    fn test_require_openpgp_capable_key_separates_conflict_from_capable() {
+        assert!(
+            require_openpgp_capable_key(key_of_type("gpg")).is_ok(),
+            "a gpg key must be accepted"
+        );
+
+        let conflict = require_openpgp_capable_key(key_of_type("rsa"))
+            .expect_err("an rsa key cannot produce an OpenPGP chain");
+        assert_eq!(
+            conflict.status(),
+            StatusCode::CONFLICT,
+            "an unsignable key type must be a 409 an anonymous client cannot turn into \
+             an ERROR-log/500-alert amplifier",
+        );
     }
 }

@@ -15,6 +15,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
+use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{
     api_token_audit_entry, audit_fire_and_forget, password_change_audit_entry,
     sessions_invalidated_audit_entry, AuditAction, AuditEntry, ResourceType,
@@ -785,10 +786,13 @@ pub async fn assign_role(
         AuditEntry::new(AuditAction::RoleAssigned, ResourceType::User)
             .user(auth.user_id)
             .resource(id)
-            .details(serde_json::json!({
-                "actor_id": auth.user_id.to_string(),
-                "role_id": payload.role_id.to_string(),
-            })),
+            .actor_name(auth.username.clone())
+            .details_typed(audit_details::PermissionDetails {
+                actor_id: auth.user_id,
+                role_id: payload.role_id,
+                grantee_id: id,
+                repository_id: None,
+            }),
     )
     .await;
 
@@ -838,10 +842,13 @@ pub async fn revoke_role(
         AuditEntry::new(AuditAction::RoleRevoked, ResourceType::User)
             .user(auth.user_id)
             .resource(user_id)
-            .details(serde_json::json!({
-                "actor_id": auth.user_id.to_string(),
-                "role_id": role_id.to_string(),
-            })),
+            .actor_name(auth.username.clone())
+            .details_typed(audit_details::PermissionDetails {
+                actor_id: auth.user_id,
+                role_id,
+                grantee_id: user_id,
+                repository_id: None,
+            }),
     )
     .await;
 
@@ -985,6 +992,11 @@ async fn create_api_token_inner(
     // `write:users`.
     crate::services::token_service::enforce_admin_only_scopes(&payload.scopes, auth.is_admin)
         .map_err(AppError::Authorization)?;
+
+    // Delegation ceiling (#2996): a scoped credential may not mint a token
+    // that exceeds its own scopes. Interactive sessions (`scopes: None`)
+    // are unaffected.
+    auth.enforce_mint_ceiling(&payload.scopes)?;
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (token, token_id) = auth_service
@@ -3755,8 +3767,10 @@ mod password_audit_tests {
         )
         .await;
 
-        let changed = tdh::audit_count(&pool, user_id, "PASSWORD_CHANGED").await;
-        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for each.
+        let changed = tdh::audit_count_eventually(&pool, user_id, "PASSWORD_CHANGED", 1).await;
+        let invalidated =
+            tdh::audit_count_eventually(&pool, user_id, "SESSIONS_INVALIDATED", 1).await;
         let by_admin = by_admin_flag(&pool, user_id).await;
         tdh::cleanup_user(&pool, user_id).await;
 
@@ -3789,7 +3803,8 @@ mod password_audit_tests {
 
         let res = reset_password(State(state.clone()), Extension(auth), Path(target_id)).await;
 
-        let changed = tdh::audit_count(&pool, target_id, "PASSWORD_CHANGED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for it.
+        let changed = tdh::audit_count_eventually(&pool, target_id, "PASSWORD_CHANGED", 1).await;
         let by_admin = by_admin_flag(&pool, target_id).await;
         tdh::cleanup_user(&pool, target_id).await;
         tdh::cleanup_user(&pool, admin_id).await;
@@ -3820,7 +3835,11 @@ mod password_audit_tests {
         let res =
             force_password_change(State(state.clone()), Extension(auth), Path(target_id)).await;
 
-        let invalidated = tdh::audit_count(&pool, target_id, "SESSIONS_INVALIDATED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for the
+        // positive event; once it has landed the (never-emitted) negative event
+        // is safely read directly.
+        let invalidated =
+            tdh::audit_count_eventually(&pool, target_id, "SESSIONS_INVALIDATED", 1).await;
         // No password actually changed, so PASSWORD_CHANGED must NOT be emitted.
         let changed = tdh::audit_count(&pool, target_id, "PASSWORD_CHANGED").await;
         tdh::cleanup_user(&pool, target_id).await;

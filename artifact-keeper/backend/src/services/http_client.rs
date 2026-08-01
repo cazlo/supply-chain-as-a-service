@@ -61,7 +61,61 @@ pub fn base_client_builder() -> ClientBuilder {
 
     let builder = reqwest::Client::builder()
         .redirect(ssrf_redirect_policy())
-        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver());
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver())
+        // This crate's own `Cargo.toml` requests only `["json", "stream",
+        // "form"]`, but Cargo unifies features for a single resolved
+        // `reqwest` version across the whole build: the `opensearch` crate
+        // (full-text search) pulls in `reqwest` with its `gzip` feature
+        // enabled, which silently switches EVERY `reqwest::Client` in this
+        // binary — including this one — into auto content-negotiation mode.
+        // That makes the client add `Accept-Encoding: gzip` to outbound
+        // upstream requests and, on any response upstream compresses,
+        // transparently decode the body AND strip both `Content-Encoding`
+        // and `Content-Length` from `response.headers()` before this proxy's
+        // header-capture code ever sees them. A CDN that compresses
+        // responses above a size threshold (observed live against
+        // huggingface.co's CloudFront) then reaches the client with no
+        // Content-Length, which `huggingface_hub`'s HEAD-based metadata
+        // check hard-requires (`FileMetadataError: Distant resource does not
+        // have a Content-Length`) — small responses stay under the
+        // threshold and are unaffected, which is why this only shows up on
+        // larger upstream files. `no_gzip`/`no_brotli`/`no_deflate`/
+        // `no_zstd` are documented by reqwest to exist for exactly this
+        // "another dependency enabled it" scenario: they stop the
+        // auto-negotiation (no automatic `Accept-Encoding`, no automatic
+        // decode) regardless of which decompression features happen to be
+        // compiled in, so every proxied format's Content-Length survives
+        // intact.
+        //
+        // Only `gzip` is actually in the resolved feature set today; the other
+        // three are defensive, so a future dependency enabling brotli/zstd
+        // cannot silently re-introduce the same bug.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        // Disabling the codecs makes reqwest/tower-http send *no*
+        // `Accept-Encoding` at all, and RFC 9110 §12.5.3 reads an absent
+        // header as "any content coding is acceptable" — the opposite of what
+        // this client can handle now that nothing decodes. Advertise identity
+        // explicitly so a compliant upstream does not elect a coding we would
+        // then pass through to the client. This is belt-and-braces with the
+        // `content_encoding` plumbing in `proxy_service`: object stores
+        // (notably S3) return a stored `Content-Encoding` regardless of what
+        // the request advertised, so the header must still be forwarded
+        // faithfully when it does appear.
+        //
+        // Composes with tower-http's decompression layer, which only inserts
+        // `Accept-Encoding` when the entry is vacant — this explicit value
+        // wins.
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::ACCEPT_ENCODING,
+                reqwest::header::HeaderValue::from_static("identity"),
+            );
+            headers
+        });
 
     apply_custom_ca_cert(builder)
 }
@@ -214,6 +268,39 @@ pub fn default_client() -> reqwest::Client {
     base_client_builder()
         .build()
         .expect("failed to build default HTTP client")
+}
+
+/// Default connect timeout (seconds) for the remote-instance proxy client.
+const DEFAULT_PROXY_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Default read-inactivity timeout (seconds) for the remote-instance proxy
+/// client.
+const DEFAULT_PROXY_READ_TIMEOUT_SECS: u64 = 30;
+
+/// Build a [`reqwest::Client`] for the **remote-instance management proxy**
+/// (`/api/v1/instances/:id/proxy/*`).
+///
+/// Same SSRF trust class, redirect policy and plaintext/HTTP semantics as
+/// [`default_client`] — the proxy target is user-influenceable, so it stays
+/// fail-closed and is deliberately NOT switched to [`large_object_client_builder`],
+/// which would force `https_only` and change the existing behavior. The only
+/// addition is a `connect_timeout` plus a `read_timeout` that bounds inactivity
+/// while reading the upstream response, so a slow-loris / endless upstream
+/// cannot pin a worker task indefinitely. Both are env-tunable via
+/// `REMOTE_PROXY_CONNECT_TIMEOUT_SECS` and `REMOTE_PROXY_READ_TIMEOUT_SECS`.
+pub fn proxy_client() -> reqwest::Client {
+    let connect_secs = std::env::var("REMOTE_PROXY_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PROXY_CONNECT_TIMEOUT_SECS);
+    let read_secs = std::env::var("REMOTE_PROXY_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PROXY_READ_TIMEOUT_SECS);
+    base_client_builder()
+        .connect_timeout(Duration::from_secs(connect_secs))
+        .read_timeout(Duration::from_secs(read_secs))
+        .build()
+        .expect("failed to build remote-instance proxy HTTP client")
 }
 
 /// Redirect policy that re-runs the SSRF allow-list on every hop. An
@@ -624,7 +711,17 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    /// The clock starts UNPAUSED here (#2974): under `start_paused = true`
+    /// the very first `advance()` raced the real loopback TCP handshake —
+    /// the handshake progresses in wall-clock time while `connect_timeout`
+    /// is measured in virtual time, so jumping the clock 20s could expire
+    /// the 10s connect timeout before the socket ever became writable
+    /// (deterministic on some platforms). Instead, the connect and the
+    /// response headers complete under real time; only then is the clock
+    /// paused and advanced, so the sole outstanding timers are the server's
+    /// mid-body delay and any total timeout the builder might (wrongly)
+    /// apply — which is exactly what this test exists to detect.
+    #[tokio::test]
     async fn test_large_object_client_builder_does_not_apply_total_timeout() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -652,25 +749,159 @@ mod tests {
             socket.write_all(b"K").await.expect("write second byte");
         });
 
-        let client = large_object_client_builder(true)
-            .build()
-            .expect("build large-object client");
+        // Serialize the client build against `test_configured_proxy_host_is_
+        // exempted_from_guard`, which briefly sets a process-wide `HTTP_PROXY`
+        // while building its own client. Without this, a concurrent build here
+        // could observe that proxy and route this round-trip away from the
+        // test's own listener. The guard is dropped before any `.await`, so it
+        // never crosses an await point.
+        let client = {
+            let _proxy_env_guard = PROXY_ENV_LOCK.lock().unwrap();
+            large_object_client_builder(true)
+                .build()
+                .expect("build large-object client")
+        };
+        let (headers_received_tx, headers_received_rx) = tokio::sync::oneshot::channel::<()>();
         let request = tokio::spawn(async move {
-            client
+            let response = client
                 .post(&url)
                 .body("request body")
                 .send()
                 .await
-                .expect("send request")
-                .bytes()
-                .await
-                .expect("read response")
+                .expect("send request");
+            // Response headers are in: connect (and its timeout timer) are
+            // fully behind us, under real time. Tell the test it is now safe
+            // to pause the clock and jump past the server's mid-body delay.
+            headers_received_tx
+                .send(())
+                .expect("signal headers received");
+            response.bytes().await.expect("read response")
         });
 
-        tokio::task::yield_now().await;
+        headers_received_rx
+            .await
+            .expect("request task reached response headers");
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(20)).await;
 
         assert_eq!(request.await.expect("request task").as_ref(), b"OK");
         server.await.expect("server task");
+    }
+
+    /// Serializes tests that mutate the process-wide `HTTP_PROXY`/`NO_PROXY`
+    /// env so a leaked value cannot perturb the loopback-block tests above.
+    static PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Issue #2570: the configured egress-proxy host is exempted from the
+    /// SSRF DNS guard. With `HTTP_PROXY` pointing at a loopback listener (a
+    /// hard-blocked address the guard would normally refuse), a request built
+    /// by `base_client_builder()` for an EXTERNAL http URL must be routed to —
+    /// and accepted by — that proxy listener. Before the fix the guard blocked
+    /// the proxy host's own (loopback/private) address and the connect never
+    /// happened (the 502/500 in #2570); the accepted connection is what proves
+    /// the exemption is wired in.
+    ///
+    /// The proxy host MUST be a hostname (`localhost`), not an IP literal: an IP
+    /// literal skips DNS resolution entirely, so the resolver — and therefore
+    /// the exemption — would never be exercised. `localhost` resolves (via the
+    /// SSRF resolver) to loopback, which is normally hard-blocked; the exempt
+    /// entry (parsed from the proxy env) is what lets it through. The paired
+    /// negative test [`test_unexempted_proxy_host_is_blocked_by_guard`] proves
+    /// this listener would NOT be reached without the exemption.
+    #[tokio::test]
+    async fn test_configured_proxy_host_is_exempted_from_guard() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        // Both reqwest (proxy routing) and our SSRF resolver (the proxy-host
+        // exempt-set) read the proxy env at builder-construction time. Set it,
+        // build synchronously, then remove it immediately — this keeps the
+        // process-wide env mutation to a synchronous window (no `.await` in
+        // between) so it cannot perturb a concurrently-running test that also
+        // builds a client. The `PROXY_ENV_LOCK` guard serializes that window
+        // and is dropped before the request `.await` below, so it never
+        // crosses an await point.
+        let client = {
+            let _proxy_env_guard = PROXY_ENV_LOCK.lock().unwrap();
+            std::env::set_var("HTTP_PROXY", format!("http://localhost:{port}"));
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+            let client = base_client_builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .expect("build client");
+            std::env::remove_var("HTTP_PROXY");
+            client
+        };
+
+        // GET an external http host so the built-in proxy applies; we only care
+        // that the connect reaches the proxy listener, not about a full response.
+        let request = tokio::spawn(async move {
+            let _ = client.get("http://example.com/").send().await;
+        });
+
+        let accepted = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
+
+        request.abort();
+
+        assert!(
+            accepted.is_ok(),
+            "the configured proxy host (localhost) must be exempted so the request \
+             reaches the proxy listener at 127.0.0.1:{port}; got {accepted:?}"
+        );
+    }
+
+    /// Discriminating negative for #2570: proves that (a) reqwest DOES route the
+    /// proxy HOSTNAME through our custom SSRF DNS resolver, and (b) WITHOUT the
+    /// exempt-set entry that resolver refuses the proxy's own loopback/private
+    /// address — exactly the failure the exemption fixes. The proxy is set
+    /// EXPLICITLY as a hostname (`localhost`, so DNS resolution — hence the
+    /// resolver — is actually invoked) and paired with an EMPTY-exempt resolver.
+    /// The request must be blocked before any TCP connection: the listener must
+    /// never accept and `send()` must error. If reqwest bypassed the resolver
+    /// for proxy hosts, the listener WOULD accept and this test would fail — so
+    /// a pass confirms the resolver is on the proxy path and the exemption is
+    /// load-bearing.
+    #[tokio::test]
+    async fn test_unexempted_proxy_host_is_blocked_by_guard() {
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let port = listener.local_addr().expect("local addr").port();
+
+        // Explicit proxy at a loopback-resolving HOSTNAME + a resolver with an
+        // EMPTY exempt-set (the pre-#2570 fail-closed behavior). No env mutation.
+        let empty_exempt_resolver: Arc<dyn reqwest::dns::Resolve> =
+            Arc::new(crate::services::ssrf_dns::SsrfGuardResolver::default());
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://localhost:{port}")).expect("proxy url"))
+            .dns_resolver(empty_exempt_resolver)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("build client");
+
+        let request =
+            tokio::spawn(async move { client.get("http://example.com/").send().await.is_err() });
+
+        let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+        let send_errored = request.await.expect("request task");
+
+        assert!(
+            accepted.is_err(),
+            "an UNEXEMPTED loopback-resolving proxy host must be blocked by the \
+             resolver; the listener must never accept, but it did: {accepted:?}"
+        );
+        assert!(
+            send_errored,
+            "the request through an unexempted loopback proxy must fail at the \
+             resolver instead of connecting"
+        );
     }
 }

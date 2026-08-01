@@ -42,6 +42,8 @@ pub fn parse_name_and_version(
         "helm" | "helm_oci" => parse_helm(filename),
         "npm" | "yarn" | "pnpm" | "bower" => parse_npm(filename, artifact_path),
         "maven" | "gradle" | "sbt" | "ivy" => parse_maven(filename, artifact_path),
+        "nuget" => parse_nuget(filename, artifact_path),
+        "go" | "golang" => parse_go(artifact_path, filename),
         _ => fallback(filename),
     }
 }
@@ -113,30 +115,18 @@ fn extract_npm_metadata(artifact_data: &[u8]) -> Option<serde_json::Value> {
 }
 
 fn extract_npm_metadata_reader<R: std::io::Read>(reader: R) -> Option<serde_json::Value> {
-    use std::io::Read;
-    let gz = flate2::read::GzDecoder::new(reader);
-    let mut tar = tar::Archive::new(gz);
-    let entries = tar.entries().ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path().ok()?;
-        let name = path.to_string_lossy();
-        // Most npm tarballs use the `package/` prefix, but some publish
-        // tools put the actual package name first or omit the prefix
-        // entirely. Match any path ending in `/package.json` or the bare
-        // `package.json` at the root.
-        if name == "package.json" || name.ends_with("/package.json") {
-            // Drop the moved entry — re-iterate is messy with `tar`'s
-            // Read-once entries iterator, so capture the bytes here.
-            drop(name);
-            drop(path);
-            let mut buf = String::new();
-            let mut e = entry;
-            e.read_to_string(&mut buf).ok()?;
-            let pkg: serde_json::Value = serde_json::from_str(&buf).ok()?;
-            return Some(serde_json::json!({ "version_data": pkg }));
-        }
-    }
-    None
+    // Bound the gzip/tar decompression on this migration-worker reprocessing
+    // path (#2556). Most npm tarballs use the `package/` prefix, but some
+    // publish tools put the actual package name first or omit the prefix — match
+    // any path whose file name is `package.json`.
+    let bytes = crate::util::bounded_archive::read_metadata_from_tar_gz(reader, |path| {
+        path.file_name()
+            .map(|n| n == "package.json")
+            .unwrap_or(false)
+    })
+    .ok()??;
+    let pkg: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(serde_json::json!({ "version_data": pkg }))
 }
 
 /// Extract helm chart metadata from a `.tgz` tarball.
@@ -151,39 +141,30 @@ fn extract_helm_metadata(artifact_data: &[u8]) -> Option<serde_json::Value> {
 }
 
 fn extract_helm_metadata_reader<R: std::io::Read>(reader: R) -> Option<serde_json::Value> {
-    use std::io::Read;
-    let gz = flate2::read::GzDecoder::new(reader);
-    let mut tar = tar::Archive::new(gz);
-    let entries = tar.entries().ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path().ok()?;
-        let name = path.to_string_lossy();
-        if name == "Chart.yaml" || name.ends_with("/Chart.yaml") {
-            drop(name);
-            drop(path);
-            let mut buf = String::new();
-            let mut e = entry;
-            e.read_to_string(&mut buf).ok()?;
-            let chart: serde_json::Value = serde_yaml::from_str(&buf).ok()?;
-            let description = chart
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let app_version = chart
-                .get("appVersion")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let mut wrapper = serde_json::json!({ "chart": chart });
-            if let Some(d) = description {
-                wrapper["description"] = serde_json::Value::String(d);
-            }
-            if let Some(a) = app_version {
-                wrapper["appVersion"] = serde_json::Value::String(a);
-            }
-            return Some(wrapper);
-        }
+    // Bound the gzip/tar decompression on this migration-worker reprocessing
+    // path (#2556).
+    let bytes = crate::util::bounded_archive::read_metadata_from_tar_gz(reader, |path| {
+        path.file_name().map(|n| n == "Chart.yaml").unwrap_or(false)
+    })
+    .ok()??;
+    let buf = String::from_utf8(bytes).ok()?;
+    let chart: serde_json::Value = serde_yaml::from_str(&buf).ok()?;
+    let description = chart
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let app_version = chart
+        .get("appVersion")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let mut wrapper = serde_json::json!({ "chart": chart });
+    if let Some(d) = description {
+        wrapper["description"] = serde_json::Value::String(d);
     }
-    None
+    if let Some(a) = app_version {
+        wrapper["appVersion"] = serde_json::Value::String(a);
+    }
+    Some(wrapper)
 }
 
 fn fallback(filename: &str) -> ParsedArtifact {
@@ -257,6 +238,65 @@ fn parse_helm(filename: &str) -> ParsedArtifact {
 }
 
 // ---------------------------------------------------------------------------
+// Go
+// ---------------------------------------------------------------------------
+
+/// Go module-proxy parser (#2784). Go repositories (in Nexus and the GOPROXY
+/// protocol) lay artifacts out as `<module>/@v/<version>.{zip,mod,info}`,
+/// e.g. `github.com/gorilla/mux/@v/v1.8.0.zip`. The module path is the
+/// portion before `/@v/` and the version is the file stem after it. Module
+/// paths encode uppercase letters as `!` followed by the lowercase letter
+/// (e.g. `!azure` == `Azure`), so the recovered name is un-escaped back to
+/// the canonical, human-readable module path the Go tooling and the Packages
+/// tab display.
+///
+/// Non-versioned proxy files (`@v/list`, `@latest`, `@v/<v>.lock`) don't
+/// carry a parseable version and fall through to the filename-as-name
+/// behaviour (no catalog row), matching how other formats treat their index
+/// files.
+fn parse_go(artifact_path: &str, filename: &str) -> ParsedArtifact {
+    if let Some((module_enc, ver_file)) = artifact_path.split_once("/@v/") {
+        if !module_enc.is_empty() {
+            let version = ver_file
+                .strip_suffix(".zip")
+                .or_else(|| ver_file.strip_suffix(".info"))
+                .or_else(|| ver_file.strip_suffix(".mod"))
+                .filter(|v| !v.is_empty())
+                .map(go_unescape_module_path);
+            if version.is_some() {
+                return ParsedArtifact {
+                    name: go_unescape_module_path(module_enc),
+                    version,
+                };
+            }
+        }
+    }
+    fallback(filename)
+}
+
+/// Decode the Go module-proxy case-encoding: an uppercase ASCII letter is
+/// stored as `!` followed by its lowercase form. Any other `!` is preserved
+/// verbatim so malformed input round-trips without panicking.
+fn go_unescape_module_path(encoded: &str) -> String {
+    if !encoded.contains('!') {
+        return encoded.to_string();
+    }
+    let mut out = String::with_capacity(encoded.len());
+    let mut chars = encoded.chars();
+    while let Some(c) = chars.next() {
+        if c == '!' {
+            match chars.next() {
+                Some(next) => out.push(next.to_ascii_uppercase()),
+                None => out.push('!'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // npm
 // ---------------------------------------------------------------------------
 
@@ -308,6 +348,52 @@ fn parse_maven(filename: &str, artifact_path: &str) -> ParsedArtifact {
         };
     }
     fallback(filename)
+}
+
+// ---------------------------------------------------------------------------
+// NuGet
+// ---------------------------------------------------------------------------
+
+/// NuGet parser (#2676). Packages are `<id>.<version>.nupkg` where `<id>`
+/// itself contains dots (`Newtonsoft.Json.13.0.3.nupkg`), so the split point
+/// is the first dot whose right-hand side is a valid NuGet version
+/// (2–4 numeric dot-segments plus an optional `-prerelease` suffix) — the
+/// same heuristic the NuGet client uses for folder layouts. Scanning
+/// left-to-right keeps ids with embedded numeric segments intact
+/// (`MyLib.2.Core.1.0.0` → `MyLib.2.Core` @ `1.0.0`, because `2.Core.1.0.0`
+/// is not a valid version). Falls back to the JFrog/Nexus
+/// `<id>/<version>/<filename>` path layout, then to the legacy
+/// filename-as-name behaviour.
+fn parse_nuget(filename: &str, artifact_path: &str) -> ParsedArtifact {
+    if let Some(stem) = filename
+        .strip_suffix(".nupkg")
+        .or_else(|| filename.strip_suffix(".snupkg"))
+    {
+        for (i, _) in stem.match_indices('.') {
+            let (name, rest) = (&stem[..i], &stem[i + 1..]);
+            if !name.is_empty() && is_nuget_version(rest) {
+                return ParsedArtifact {
+                    name: name.to_string(),
+                    version: Some(rest.to_string()),
+                };
+            }
+        }
+    }
+    parse_from_path_segments(artifact_path).unwrap_or_else(|| fallback(filename))
+}
+
+/// True when `s` is a NuGet-shaped version: 2–4 dot-separated numeric parts
+/// with an optional `-<prerelease>` suffix (`1.0.0`, `13.0.3-beta.1`,
+/// `4.7.0.5`). A single bare integer is rejected — package-id segments are
+/// frequently numeric (`MyLib.2`), and NuGet versions always carry at least
+/// `major.minor`.
+fn is_nuget_version(s: &str) -> bool {
+    let core = s.split_once('-').map_or(s, |(core, _pre)| core);
+    let parts: Vec<&str> = core.split('.').collect();
+    (2..=4).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 // ---------------------------------------------------------------------------
@@ -587,5 +673,182 @@ mod tests {
         let garbage = b"not a tarball";
         assert!(extract_artifact_metadata("npm", garbage).is_none());
         assert!(extract_artifact_metadata("helm", garbage).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // NuGet (#2676)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn nuget_simple_id() {
+        let p = parse_name_and_version("nuget", "MyPackage.1.0.0.nupkg", "MyPackage.1.0.0.nupkg");
+        assert_eq!(p.name, "MyPackage");
+        assert_eq!(p.version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn nuget_dotted_id() {
+        let p = parse_name_and_version(
+            "nuget",
+            "Newtonsoft.Json.13.0.3.nupkg",
+            "Newtonsoft.Json/13.0.3/Newtonsoft.Json.13.0.3.nupkg",
+        );
+        assert_eq!(p.name, "Newtonsoft.Json");
+        assert_eq!(p.version.as_deref(), Some("13.0.3"));
+    }
+
+    #[test]
+    fn nuget_id_with_numeric_segment() {
+        // `2.Core.1.0.0` is not a valid version, so the split lands after
+        // the embedded numeric id segment, not at it.
+        let p = parse_name_and_version(
+            "nuget",
+            "MyLib.2.Core.1.0.0.nupkg",
+            "MyLib.2.Core.1.0.0.nupkg",
+        );
+        assert_eq!(p.name, "MyLib.2.Core");
+        assert_eq!(p.version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn nuget_prerelease_version() {
+        let p = parse_name_and_version(
+            "nuget",
+            "MyPackage.1.0.0-beta.1.nupkg",
+            "MyPackage.1.0.0-beta.1.nupkg",
+        );
+        assert_eq!(p.name, "MyPackage");
+        assert_eq!(p.version.as_deref(), Some("1.0.0-beta.1"));
+    }
+
+    #[test]
+    fn nuget_four_part_version() {
+        let p = parse_name_and_version(
+            "nuget",
+            "Legacy.Pkg.4.7.0.5.nupkg",
+            "Legacy.Pkg.4.7.0.5.nupkg",
+        );
+        assert_eq!(p.name, "Legacy.Pkg");
+        assert_eq!(p.version.as_deref(), Some("4.7.0.5"));
+    }
+
+    #[test]
+    fn nuget_unparseable_filename_falls_back_to_path_segments() {
+        let p = parse_name_and_version("nuget", "weird.nupkg", "MyPackage/1.0.0/weird.nupkg");
+        assert_eq!(p.name, "MyPackage");
+        assert_eq!(p.version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn nuget_unparseable_everything_falls_back_to_filename() {
+        let p = parse_name_and_version("nuget", "weird.bin", "weird.bin");
+        assert_eq!(p.name, "weird.bin");
+        assert_eq!(p.version, None);
+    }
+
+    #[test]
+    fn nuget_symbols_package() {
+        let p = parse_name_and_version(
+            "nuget",
+            "MyPackage.1.0.0.snupkg",
+            "MyPackage/1.0.0/MyPackage.1.0.0.snupkg",
+        );
+        assert_eq!(p.name, "MyPackage");
+        assert_eq!(p.version.as_deref(), Some("1.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Go (#2784)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn go_zip_recovers_module_and_version() {
+        let p = parse_name_and_version("go", "v1.8.0.zip", "github.com/gorilla/mux/@v/v1.8.0.zip");
+        assert_eq!(p.name, "github.com/gorilla/mux");
+        assert_eq!(p.version.as_deref(), Some("v1.8.0"));
+    }
+
+    #[test]
+    fn go_mod_and_info_sidecars_recover_the_same_identity() {
+        let m = parse_name_and_version("go", "v1.8.0.mod", "github.com/gorilla/mux/@v/v1.8.0.mod");
+        let i =
+            parse_name_and_version("go", "v1.8.0.info", "github.com/gorilla/mux/@v/v1.8.0.info");
+        assert_eq!(m.name, "github.com/gorilla/mux");
+        assert_eq!(m.version.as_deref(), Some("v1.8.0"));
+        assert_eq!(i.name, "github.com/gorilla/mux");
+        assert_eq!(i.version.as_deref(), Some("v1.8.0"));
+    }
+
+    #[test]
+    fn go_pseudo_version_is_preserved() {
+        let p = parse_name_and_version(
+            "go",
+            "v0.0.0-20210101000000-abcdef123456.zip",
+            "example.com/x/y/@v/v0.0.0-20210101000000-abcdef123456.zip",
+        );
+        assert_eq!(p.name, "example.com/x/y");
+        assert_eq!(
+            p.version.as_deref(),
+            Some("v0.0.0-20210101000000-abcdef123456")
+        );
+    }
+
+    #[test]
+    fn go_case_escaped_module_path_is_decoded() {
+        // `!azure` decodes to `Azure` per the GOPROXY case-encoding.
+        let p = parse_name_and_version(
+            "go",
+            "v68.0.0.zip",
+            "github.com/!azure/azure-sdk-for-go/@v/v68.0.0.zip",
+        );
+        assert_eq!(p.name, "github.com/Azure/azure-sdk-for-go");
+        assert_eq!(p.version.as_deref(), Some("v68.0.0"));
+    }
+
+    #[test]
+    fn go_golang_alias_uses_the_same_parser() {
+        let p = parse_name_and_version("golang", "v1.0.0.mod", "rsc.io/quote/@v/v1.0.0.mod");
+        assert_eq!(p.name, "rsc.io/quote");
+        assert_eq!(p.version.as_deref(), Some("v1.0.0"));
+    }
+
+    #[test]
+    fn go_index_files_have_no_version() {
+        // `list` and `@latest` are proxy index files, not releases.
+        let list = parse_name_and_version("go", "list", "github.com/gorilla/mux/@v/list");
+        assert_eq!(list.version, None);
+        let latest = parse_name_and_version("go", "@latest", "github.com/gorilla/mux/@latest");
+        assert_eq!(latest.version, None);
+    }
+
+    #[test]
+    fn go_non_proxy_path_falls_back_to_filename() {
+        let p = parse_name_and_version("go", "weird.bin", "weird.bin");
+        assert_eq!(p.name, "weird.bin");
+        assert_eq!(p.version, None);
+    }
+
+    #[test]
+    fn go_unescape_module_path_cases() {
+        assert_eq!(
+            go_unescape_module_path("github.com/gorilla/mux"),
+            "github.com/gorilla/mux"
+        );
+        assert_eq!(go_unescape_module_path("!azure"), "Azure");
+        assert_eq!(go_unescape_module_path("!a!b!c"), "ABC");
+        // Trailing bang round-trips without panicking.
+        assert_eq!(go_unescape_module_path("foo!"), "foo!");
+    }
+
+    #[test]
+    fn is_nuget_version_shapes() {
+        assert!(is_nuget_version("1.0"));
+        assert!(is_nuget_version("1.0.0"));
+        assert!(is_nuget_version("4.7.0.5"));
+        assert!(is_nuget_version("13.0.3-beta.1"));
+        assert!(!is_nuget_version("2")); // bare integer = id segment, not version
+        assert!(!is_nuget_version("2.Core.1.0.0"));
+        assert!(!is_nuget_version("1.0.0.0.0"));
+        assert!(!is_nuget_version(""));
     }
 }

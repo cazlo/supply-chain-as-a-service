@@ -56,6 +56,17 @@ pub struct NexusStatusResponse {
     pub version: Option<String>,
 }
 
+/// Nexus's OpenAPI doc — only `info.version` (the running version) is read.
+#[derive(Debug, Deserialize)]
+struct SwaggerDoc {
+    info: SwaggerInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwaggerInfo {
+    version: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct NexusRepository {
     pub name: String,
@@ -63,6 +74,39 @@ pub struct NexusRepository {
     #[serde(rename = "type")]
     pub repo_type: String,
     pub url: Option<String>,
+}
+
+/// A repository entry from the Nexus repository-settings endpoint
+/// (`/service/rest/v1/repositorySettings`). Unlike the browse
+/// `/service/rest/v1/repositories` list, this carries the full config,
+/// including the `group.memberNames` of `group`-type repositories — the member
+/// list that must be correlated to migrated Artifact Keeper repos (issue #2783).
+#[derive(Debug, Deserialize)]
+pub struct NexusRepositorySettings {
+    pub name: String,
+    #[serde(default)]
+    pub group: Option<NexusGroupAttributes>,
+    /// The `proxy` attributes block of a Nexus `proxy`-type repository, which
+    /// carries the upstream `remoteUrl` this repo proxies (issue #2822).
+    #[serde(default)]
+    pub proxy: Option<NexusProxyAttributes>,
+}
+
+/// The `group` attributes block of a Nexus `group`-type repository.
+#[derive(Debug, Deserialize)]
+pub struct NexusGroupAttributes {
+    /// Ordered member repository names aggregated by this group.
+    #[serde(rename = "memberNames", default)]
+    pub member_names: Vec<String>,
+}
+
+/// The `proxy` attributes block of a Nexus `proxy`-type repository.
+#[derive(Debug, Deserialize)]
+pub struct NexusProxyAttributes {
+    /// Upstream URL that this proxy repository mirrors. Maps onto the migrated
+    /// Artifact Keeper repo's `upstream_url` (issue #2822).
+    #[serde(rename = "remoteUrl", default)]
+    pub remote_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,21 +209,39 @@ impl NexusClient {
         Ok(response.status().is_success())
     }
 
-    /// Get Nexus version — returns in the same format as Artifactory for compatibility
+    /// Nexus version: try the status endpoint, fall back to the OpenAPI doc, then "unknown".
     pub async fn get_version(&self) -> Result<SystemVersionResponse, ArtifactoryError> {
-        let status: NexusStatusResponse =
-            self.get("/service/rest/v1/status")
-                .await
-                .unwrap_or(NexusStatusResponse {
-                    edition: Some("Unknown".into()),
-                    version: Some("Unknown".into()),
+        if let Ok(status) = self
+            .get::<NexusStatusResponse>("/service/rest/v1/status")
+            .await
+        {
+            if let Some(version) = status.version {
+                return Ok(SystemVersionResponse {
+                    version,
+                    revision: None,
+                    addons: None,
+                    license: status.edition,
                 });
+            }
+        }
+
+        // status is often empty (OSS, or behind a proxy); the OpenAPI doc has the version.
+        if let Ok(doc) = self.get::<SwaggerDoc>("/service/rest/swagger.json").await {
+            if let Some(version) = doc.info.version {
+                return Ok(SystemVersionResponse {
+                    version,
+                    revision: None,
+                    addons: None,
+                    license: None,
+                });
+            }
+        }
 
         Ok(SystemVersionResponse {
-            version: status.version.unwrap_or_else(|| "unknown".into()),
+            version: "unknown".into(),
             revision: None,
             addons: None,
-            license: status.edition,
+            license: None,
         })
     }
 
@@ -187,7 +249,7 @@ impl NexusClient {
     pub async fn list_repositories(&self) -> Result<Vec<RepositoryListItem>, ArtifactoryError> {
         let repos: Vec<NexusRepository> = self.get("/service/rest/v1/repositories").await?;
 
-        Ok(repos
+        let mut items: Vec<RepositoryListItem> = repos
             .into_iter()
             .map(|r| RepositoryListItem {
                 key: r.name,
@@ -195,8 +257,91 @@ impl NexusClient {
                 package_type: r.format,
                 url: r.url,
                 description: None,
+                members: vec![],
+                upstream_url: None,
             })
-            .collect())
+            .collect();
+
+        // The browse list above does not carry group membership or a proxy
+        // repo's upstream URL, so `group` repos would migrate to Artifact Keeper
+        // `virtual` repos with zero members (issue #2783) and `proxy` repos
+        // (≡ AK `remote`) would migrate with a NULL `upstream_url` and be
+        // rejected by the `check_upstream_url` constraint (issue #2822). Enrich
+        // both from the settings endpoint, which reports each group's ordered
+        // `memberNames` and each proxy's `proxy.remoteUrl`. Best-effort: if the
+        // settings endpoint is unavailable (older Nexus, restricted token), we
+        // fall back to no enrichment rather than failing the whole listing.
+        if items
+            .iter()
+            .any(|i| i.repo_type == "group" || i.repo_type == "proxy")
+        {
+            match self
+                .get::<Vec<NexusRepositorySettings>>("/service/rest/v1/repositorySettings")
+                .await
+            {
+                Ok(settings) => {
+                    Self::apply_group_members(&mut items, &settings);
+                    Self::apply_proxy_upstreams(&mut items, &settings);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not fetch Nexus repository settings to resolve group members / \
+                         proxy upstreams; migrated virtual repos may have no members and \
+                         migrated proxy repos may be skipped: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(items)
+    }
+
+    /// Copy each Nexus `group` repo's ordered `memberNames` onto the matching
+    /// `RepositoryListItem`. Factored out (pure, no I/O) so the group→member
+    /// correlation can be unit-tested without a live Nexus (issue #2783).
+    fn apply_group_members(items: &mut [RepositoryListItem], settings: &[NexusRepositorySettings]) {
+        use std::collections::HashMap;
+        let members_by_name: HashMap<&str, &Vec<String>> = settings
+            .iter()
+            .filter_map(|s| s.group.as_ref().map(|g| (s.name.as_str(), &g.member_names)))
+            .collect();
+
+        for item in items.iter_mut() {
+            if item.repo_type == "group" {
+                if let Some(members) = members_by_name.get(item.key.as_str()) {
+                    item.members = (*members).clone();
+                }
+            }
+        }
+    }
+
+    /// Copy each Nexus `proxy` repo's `proxy.remoteUrl` onto the matching
+    /// `RepositoryListItem`'s `upstream_url`. Mirrors `apply_group_members`
+    /// (pure, no I/O) so the correlation can be unit-tested without a live
+    /// Nexus (issue #2822).
+    fn apply_proxy_upstreams(
+        items: &mut [RepositoryListItem],
+        settings: &[NexusRepositorySettings],
+    ) {
+        use std::collections::HashMap;
+        let upstreams_by_name: HashMap<&str, &str> = settings
+            .iter()
+            .filter_map(|s| {
+                s.proxy
+                    .as_ref()
+                    .and_then(|p| p.remote_url.as_deref())
+                    .map(|u| (s.name.as_str(), u))
+            })
+            .collect();
+
+        for item in items.iter_mut() {
+            if item.repo_type == "proxy" {
+                if let Some(url) = upstreams_by_name.get(item.key.as_str()) {
+                    item.upstream_url = Some((*url).to_string());
+                }
+            }
+        }
     }
 
     /// List artifacts (components + assets) with pagination.
@@ -510,6 +655,137 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_group_members_correlates_group_repos_2783() {
+        // Group repos get their ordered `memberNames`; non-group repos and
+        // groups absent from settings keep an empty member list.
+        let mut items = vec![
+            RepositoryListItem {
+                key: "maven-releases".into(),
+                repo_type: "hosted".into(),
+                package_type: "maven2".into(),
+                url: None,
+                description: None,
+                members: vec![],
+                upstream_url: None,
+            },
+            RepositoryListItem {
+                key: "maven-public".into(),
+                repo_type: "group".into(),
+                package_type: "maven2".into(),
+                url: None,
+                description: None,
+                members: vec![],
+                upstream_url: None,
+            },
+        ];
+
+        // Settings endpoint reports the group's ordered members.
+        let settings: Vec<NexusRepositorySettings> = serde_json::from_str(
+            r#"[
+                {"name":"maven-releases","format":"maven2","type":"hosted"},
+                {"name":"maven-public","format":"maven2","type":"group",
+                 "group":{"memberNames":["maven-releases","maven-central"]}}
+            ]"#,
+        )
+        .unwrap();
+
+        NexusClient::apply_group_members(&mut items, &settings);
+
+        // The hosted repo is untouched; the group repo carries its members in
+        // the source-declared order (which becomes virtual-member priority).
+        assert!(items[0].members.is_empty());
+        assert_eq!(
+            items[1].members,
+            vec!["maven-releases".to_string(), "maven-central".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_nexus_repository_settings_deserializes_proxy_remote_url_2822() {
+        // A `proxy` repo's settings carry the upstream at `proxy.remoteUrl`.
+        let settings: Vec<NexusRepositorySettings> = serde_json::from_str(
+            r#"[
+                {"name":"maven-central","format":"maven2","type":"proxy",
+                 "proxy":{"remoteUrl":"https://repo1.maven.org/maven2/"}}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(settings.len(), 1);
+        assert_eq!(
+            settings[0]
+                .proxy
+                .as_ref()
+                .and_then(|p| p.remote_url.as_deref()),
+            Some("https://repo1.maven.org/maven2/"),
+        );
+        // The new optional `proxy` field must not disturb group parsing.
+        assert!(settings[0].group.is_none());
+    }
+
+    #[test]
+    fn test_group_parsing_unaffected_by_new_proxy_field_2822() {
+        // A group repo (no `proxy` block) still deserializes and its
+        // memberNames are parsed as before.
+        let settings: Vec<NexusRepositorySettings> = serde_json::from_str(
+            r#"[
+                {"name":"maven-public","format":"maven2","type":"group",
+                 "group":{"memberNames":["maven-releases","maven-central"]}}
+            ]"#,
+        )
+        .unwrap();
+        assert!(settings[0].proxy.is_none());
+        assert_eq!(
+            settings[0].group.as_ref().unwrap().member_names,
+            vec!["maven-releases".to_string(), "maven-central".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_apply_proxy_upstreams_copies_remote_url_onto_proxy_repos_2822() {
+        // Proxy repos get their `proxy.remoteUrl` as `upstream_url`; non-proxy
+        // repos and proxies absent from settings keep a `None` upstream.
+        let mut items = vec![
+            RepositoryListItem {
+                key: "maven-releases".into(),
+                repo_type: "hosted".into(),
+                package_type: "maven2".into(),
+                url: None,
+                description: None,
+                members: vec![],
+                upstream_url: None,
+            },
+            RepositoryListItem {
+                key: "maven-central".into(),
+                repo_type: "proxy".into(),
+                package_type: "maven2".into(),
+                // The browse `url` is the repo's own Nexus URL, NOT the upstream.
+                url: Some("https://nexus.example.com/repository/maven-central/".into()),
+                description: None,
+                members: vec![],
+                upstream_url: None,
+            },
+        ];
+
+        let settings: Vec<NexusRepositorySettings> = serde_json::from_str(
+            r#"[
+                {"name":"maven-releases","format":"maven2","type":"hosted"},
+                {"name":"maven-central","format":"maven2","type":"proxy",
+                 "proxy":{"remoteUrl":"https://repo1.maven.org/maven2/"}}
+            ]"#,
+        )
+        .unwrap();
+
+        NexusClient::apply_proxy_upstreams(&mut items, &settings);
+
+        // The hosted repo is untouched; the proxy repo carries the upstream.
+        assert!(items[0].upstream_url.is_none());
+        assert_eq!(
+            items[1].upstream_url,
+            Some("https://repo1.maven.org/maven2/".to_string()),
+        );
+    }
+
+    #[test]
     fn test_nexus_component_deserialization() {
         let json = r#"{
             "id": "component-id-123",
@@ -599,6 +875,51 @@ mod tests {
         assert_eq!(checksum.sha256, Some("hash_only".to_string()));
         assert!(checksum.sha1.is_none());
         assert!(checksum.md5.is_none());
+    }
+
+    #[test]
+    fn test_swagger_doc_extracts_version() {
+        // The real swagger.json has hundreds of fields; only info.version matters.
+        let json = r#"{
+            "openapi": "3.0.1",
+            "info": { "title": "Nexus Repository Manager REST API", "version": "3.61.0-02" },
+            "paths": {}
+        }"#;
+        let doc: SwaggerDoc = serde_json::from_str(json).unwrap();
+        assert_eq!(doc.info.version, Some("3.61.0-02".to_string()));
+    }
+
+    // Regression: an empty /service/rest/v1/status body used to make every Nexus
+    // connection report version "Unknown". get_version now falls back to the
+    // OpenAPI doc, so this passes here but fails on main.
+    #[tokio::test]
+    async fn test_get_version_falls_back_to_swagger_when_status_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/status"))
+            .respond_with(ResponseTemplate::new(200)) // empty body, like real Nexus
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/swagger.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "info": { "version": "3.61.0-02" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            timeout_secs: 30,
+            throttle_delay_ms: 0,
+        })
+        .unwrap();
+
+        assert_eq!(client.get_version().await.unwrap().version, "3.61.0-02");
     }
 
     #[test]

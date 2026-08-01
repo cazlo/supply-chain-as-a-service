@@ -4,7 +4,7 @@
 #
 # * Every entry below is a Go-dependency CVE compiled INTO one of the vendored
 #   scanner CLIs that AK images ship and invoke:
-#     - /usr/local/bin/grype  (ghcr.io/anchore/grype:v0.115.0, backend images)
+#     - /usr/local/bin/grype  (ghcr.io/anchore/grype:v0.116.0, backend images)
 #     - /usr/local/bin/trivy  (ghcr.io/aquasecurity/trivy:0.72.0,
 #       scanner-adapter image only — the backend images do NOT bundle trivy)
 #   Both are short-lived CLI subprocesses the services shell out to. They are
@@ -23,7 +23,7 @@
 #   every build), or in the UBI/Alpine base OS packages. Only
 #   vendored-scanner-binary CVEs that have no fixed *tool release* are listed.
 #
-# * Both tools are pinned to the latest upstream release (grype v0.115.0,
+# * Both tools are pinned to the latest upstream release (grype v0.116.0,
 #   trivy 0.72.0, bumped for #2391). For the CVEs below the dependency fix
 #   exists upstream but no tagged tool release has been rebuilt against it
 #   yet (or, where noted, no upstream fix exists at all). They drop off
@@ -39,8 +39,8 @@
 # Trivy tracker: ghcr.io/aquasecurity/trivy tags (GitHub repo has no releases)
 
 # ---------------------------------------------------------------------------
-# grype v0.115.0 binary — Go stdlib @ go1.26.3
-# Fixed in Go 1.26.4/1.26.5 (1.25.11/1.25.12). grype v0.115.0 (latest) is
+# grype v0.116.0 binary — Go stdlib @ go1.26.3
+# Fixed in Go 1.26.4/1.26.5 (1.25.11/1.25.12). grype v0.116.0 (latest) is
 # still built with go1.26.3. Drops off when grype ships a release built on
 # Go >= 1.26.5. (CVE-2026-39822 / CVE-2026-42505 also cover the trivy 0.72.0
 # binary, which is built with go1.26.4.)
@@ -51,10 +51,10 @@ CVE-2026-42505
 CVE-2026-42507
 
 # ---------------------------------------------------------------------------
-# grype v0.115.0 binary — github.com/docker/docker @ v28.5.2+incompatible
+# grype v0.116.0 binary — github.com/docker/docker @ v28.5.2+incompatible
 # CVE-2026-41567 / -41568 / -42306: NO upstream-fixed docker release exists yet
 # (FixedVersion=none). CVE-2026-33997 / -34040 are fixed in docker 29.3.1 but
-# grype v0.115.0 (latest) has not rebuilt against it. Code path: grype's
+# grype v0.116.0 (latest) has not rebuilt against it. Code path: grype's
 # Docker engine client for `docker:` image sources; the backend invokes grype
 # against on-disk artifacts/SBOMs, not the Docker daemon.
 CVE-2026-33997
@@ -62,6 +62,17 @@ CVE-2026-34040
 CVE-2026-41567
 CVE-2026-41568
 CVE-2026-42306
+
+# ---------------------------------------------------------------------------
+# grype v0.116.0 binary — google.golang.org/grpc @ v1.80.0
+# GHSA-hrxh-6v49-42gf (gRPC-Go: xDS RBAC and HTTP/2 vulnerabilities): fixed in
+# grpc-go v1.82.1, but grype v0.116.0 (latest) has not rebuilt against it.
+# Neither affected path is reachable in how AK drives grype: it is not an
+# xDS/service-mesh client (the RBAC authz path is dead code), and it runs as a
+# short-lived local CLI over on-disk artifacts/SBOMs with a pre-seeded offline
+# DB — it exposes no HTTP/2 server surface to untrusted peers. Drops off when
+# grype ships a release built on grpc-go >= 1.82.1. Re-evaluate on bump (#2391).
+GHSA-hrxh-6v49-42gf
 
 # ---------------------------------------------------------------------------
 # trivy 0.72.0 binary (scanner-adapter image) — oras.land/oras-go/v2 @ v2.6.0
@@ -72,6 +83,36 @@ CVE-2026-48978
 CVE-2026-50151
 CVE-2026-50162
 GHSA-vh4v-2xq2-g5cg
+
+# ---------------------------------------------------------------------------
+# trivy 0.72.0 binary (scanner-adapter image): golang.org/x/text @ v0.38.0
+# Fixed in x/text 0.39.0. trivy 0.72.0 is the latest upstream release and has
+# not been rebuilt against it, so there is no tool version to bump to. Drops
+# off when Aqua ships a trivy release built on x/text >= 0.39.0.
+#
+# Scope verified on 2026-07-29 (v1.6.4 scan): this CVE is present ONLY in the
+# vendored trivy CLI. The scanner-adapter's own binary cannot carry it, since
+# docker/scanner-adapter/go.mod declares no dependencies at all (stdlib only).
+# The backend and openscap images scan clean at 0 findings and do not bundle
+# trivy (#1544), so nothing in the network-reachable service surface is
+# affected. No reachability argument is claimed for the x/text code path
+# itself; the justification here is vendored-binary scope plus the absence of
+# any fixed tool release.
+CVE-2026-56852
+
+# ---------------------------------------------------------------------------
+# trivy 0.72.0 binary (scanner-adapter image): golang.org/x/net @ v0.55.0
+# Same vendored-binary scope as the x/text entry above: present only in the
+# bundled trivy CLI, not in the adapter's own binary (no dependencies) and not
+# in the backend or openscap images (0 findings, no bundled trivy, #1544).
+#
+# Note on severity, learned the hard way on the v1.6.4 cut: this CVE exports
+# to SARIF as UNKNOWN/note, so it looks non-gating in the code-scanning UI.
+# It DOES gate. Trivy filters on the vendor severity, not the NVD one, and
+# logs "Using severities from other vendors for some vulnerabilities"; under
+# `severity: CRITICAL,HIGH` this entry still failed the scan. Do not assume an
+# UNKNOWN/note alert is harmless: check whether the scan step actually failed.
+CVE-2026-46600
 
 # ---------------------------------------------------------------------------
 # trivy 0.72.0 binary (scanner-adapter image) — sigstore verification stack

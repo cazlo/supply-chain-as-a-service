@@ -7,6 +7,7 @@
 //! - `Authorization: Bearer <api_token>` - API tokens via Bearer scheme
 //! - `Authorization: ApiKey <api_token>` - API tokens via ApiKey scheme
 //! - `X-API-Key: <api_token>` - API tokens via custom header
+//! - `X-NuGet-ApiKey: <api_token>` - API tokens on the NuGet push route only
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +33,13 @@ use crate::services::permission_service::PermissionService;
 
 /// Custom header name for API key
 static X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+
+/// Header the NuGet client sends the push credential in.
+///
+/// `dotnet nuget push --api-key <key>` puts the credential here rather than in
+/// `Authorization` when the configured source carries no credentials. Only the
+/// NuGet push route honours it (see [`extract_nuget_push_api_key`]).
+static X_NUGET_API_KEY: HeaderName = HeaderName::from_static("x-nuget-apikey");
 
 /// Extension that holds authenticated user information
 ///
@@ -141,6 +149,53 @@ impl AuthExtension {
         }
     }
 
+    /// Delegation ceiling for token minting (#2996): a non-admin caller may
+    /// not mint a token carrying a scope its own presenting credential does
+    /// not hold. `scopes: None` (interactive/UI/CI login) is
+    /// action-unrestricted, so this is a no-op for those principals and never
+    /// affects the console mint flow; it only constrains a scoped API token
+    /// (or a JWT exchanged from one, #2430) attempting to mint a token that
+    /// exceeds its own authority — e.g. a `read:artifacts` token minting
+    /// `write:artifacts`.
+    ///
+    /// The per-scope decision is delegated to `has_scope` →
+    /// `scopes_grant_access`, so the wildcard (`*`/`admin`) and bare-parent
+    /// coverage semantics stay in the one canonical helper (#1316).
+    pub fn enforce_mint_ceiling(&self, requested: &[String]) -> crate::error::Result<()> {
+        if self.is_admin {
+            return Ok(());
+        }
+        for s in requested {
+            if !self.has_scope(s) {
+                return Err(AppError::Authorization(format!(
+                    "Cannot mint a token with scope '{s}': it exceeds the scopes of the \
+                     presenting credential",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold the effective-admin decision at construction time so every
+    /// downstream `is_admin` read (both `require_admin` and the ~34 raw
+    /// `if !auth.is_admin` handler checks) inherits scope awareness from a
+    /// single place.
+    ///
+    /// A principal is an *effective* admin only when it is BOTH owned by an
+    /// admin user AND presenting a credential whose scope ceiling grants the
+    /// `admin` scope. `has_scope` treats `None` (interactive login / basic
+    /// auth) as unrestricted, so this is a no-op for those principals and
+    /// preserves their admin. For a scope-restricted credential (an API token
+    /// or a JWT exchanged from one), `Some(list)` only grants `admin` when the
+    /// list carries `admin` or `*` — both of which live on `ADMIN_ONLY_SCOPES`
+    /// and cannot be minted by a non-admin. This closes GHSA-vvc3: an
+    /// admin-owned but narrow-scoped token (e.g. `read:artifacts`) no longer
+    /// inherits unconditional admin.
+    fn with_scope_gated_admin(mut self) -> Self {
+        self.is_admin = self.is_admin && self.has_scope("admin");
+        self
+    }
+
     /// Return a 403 Forbidden error if the caller is not an admin.
     pub fn require_admin(&self) -> crate::error::Result<()> {
         if self.is_admin {
@@ -194,6 +249,9 @@ impl From<Claims> for AuthExtension {
             allowed_repo_ids: AccessScope::from(claims.allowed_repo_ids),
             iat_ms,
         }
+        // No-op for interactive/CI JWTs (`scopes = None`); demotes an
+        // exchanged JWT that inherited a narrow token ceiling (GHSA-vvc3).
+        .with_scope_gated_admin()
     }
 }
 
@@ -593,6 +651,17 @@ pub async fn auth_middleware(
                         // Basic-auth password. `From<Claims>` stamps `iat_ms` so
                         // credential-change invalidation can exempt the calling
                         // session.
+                        //
+                        // An API token is deliberately NOT accepted as the Basic
+                        // password here: this is the hard-auth middleware for the
+                        // management API (/api/v1/auth, /profile, /signing, …).
+                        // Per the openapi.rs contract, an API token is only ever
+                        // valid as a `Bearer`/`X-Api-Key` credential or the Basic
+                        // password on the FORMAT/registry endpoints (handled by
+                        // `repo_visibility_middleware` → `try_resolve_auth_outcome`
+                        // with `allow_basic_api_token=true`). Accepting it here
+                        // (added by #2798) over-reached the #2786 need; #2806
+                        // restores the /api/v1 Basic-auth boundary.
                         match auth_service.validate_access_token_async(&password).await {
                             Ok(claims) => Ok(AuthExtension::from(claims)),
                             Err(_) => Err("Invalid credentials"),
@@ -751,7 +820,11 @@ async fn validate_api_token_with_scopes(
         allowed_repo_ids: validation.allowed_repo_ids,
         // API tokens are not JWTs and carry no `iat`.
         iat_ms: None,
-    })
+    }
+    // An admin-owned token only wields admin when its scope ceiling grants
+    // the `admin` scope (or `*`); a narrow-scoped token is demoted to a
+    // non-admin principal here (GHSA-vvc3).
+    .with_scope_gated_admin())
 }
 
 /// Outcome of resolving an authentication credential.
@@ -803,9 +876,26 @@ pub(crate) enum AuthOutcome {
 ///   * `ExtractedToken::Bearer` / `ApiKey` / `Basic` ->
 ///     - `Resolved(ext)` on any successful path
 ///     - `InvalidCredential` if every validation attempt failed
+///
+/// `allow_basic_api_token` controls the ONE difference between the format/registry
+/// callers and the management-API (/api/v1) callers: whether an API token is
+/// accepted as the HTTP Basic *password*.
+///   * `true`  — `repo_visibility_middleware` (npm/maven/pypi/v2/… format
+///     endpoints): pip-netrc / Artifactory-style `username:<api_token>` Basic
+///     auth resolves to the token owner (the #2786 customer need).
+///   * `false` — `optional_auth_middleware` / `admin_middleware` (/api/v1/*):
+///     a Basic password is ONLY ever a bcrypt `username:password`. An API token
+///     is refused as the Basic password, enforcing the openapi.rs contract that
+///     API tokens never authenticate as Basic on the management API (#2806).
+///
+/// Bearer `<api_token>`, `X-Api-Key`, JWT-as-password, and real bcrypt
+/// `username:password` logins are unaffected in BOTH modes. The discrimination is
+/// per-middleware (structural), never request-path string matching — axum's
+/// nest-prefix stripping makes path matching unreliable here.
 pub(crate) async fn try_resolve_auth_outcome(
     auth_service: &AuthService,
     extracted: ExtractedToken<'_>,
+    allow_basic_api_token: bool,
 ) -> AuthOutcome {
     match extracted {
         ExtractedToken::Bearer(token) => {
@@ -874,7 +964,18 @@ pub(crate) async fn try_resolve_auth_outcome(
                 return AuthOutcome::Resolved(AuthExtension::from(claims));
             }
             // Fall back to treating the password as an API token — compatible with
-            // pip netrc / Artifactory-style `token:<api_token>` credential format
+            // pip netrc / Artifactory-style `token:<api_token>` credential format.
+            //
+            // Only the format/registry endpoints (`repo_visibility_middleware`)
+            // opt into this via `allow_basic_api_token=true`. The /api/v1
+            // management callers (`optional_auth_middleware`, `admin_middleware`)
+            // pass `false`, so an API token presented as a Basic password there is
+            // refused (falls through to `InvalidCredential`), honouring the
+            // openapi.rs contract (#2806). Bearer/X-Api-Key token auth and
+            // bcrypt/JWT Basic auth above are unaffected.
+            if !allow_basic_api_token {
+                return AuthOutcome::InvalidCredential;
+            }
             match validate_api_token_with_scopes(auth_service, &password).await {
                 Ok(ext) => AuthOutcome::Resolved(ext),
                 // The token fallback also burns a bcrypt verify under the
@@ -1123,7 +1224,10 @@ pub async fn optional_auth_middleware(
     next: Next,
 ) -> Response {
     let extracted = extract_token(&request);
-    let outcome = try_resolve_auth_outcome(&auth_service, extracted).await;
+    // /api/v1 optional-auth route: an API token is NOT accepted as the Basic
+    // password (`allow_basic_api_token=false`) — the /api/v1 Basic-auth boundary
+    // (#2806). Bearer/X-Api-Key token auth and bcrypt/JWT Basic auth still work.
+    let outcome = try_resolve_auth_outcome(&auth_service, extracted, false).await;
     // A transient bcrypt-capacity shed surfaces here as `Overloaded`. Return a
     // retryable 503 immediately rather than silently dropping to anonymous and
     // letting a downstream `require_auth_basic*` turn it into a misleading 401
@@ -1189,7 +1293,10 @@ pub async fn admin_middleware(
     // as the Basic-auth password). Use the tri-state outcome so a transient
     // bcrypt-cap or pool-acquire shed surfaces as a retryable 503, never a
     // spurious 401 (#2101/#2125). Admin privilege is enforced below.
-    let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted).await {
+    //
+    // /api/v1 admin route: an API token is NOT accepted as the Basic password
+    // (`allow_basic_api_token=false`) — the /api/v1 Basic-auth boundary (#2806).
+    let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted, false).await {
         AuthOutcome::Resolved(ext) => ext,
         AuthOutcome::Overloaded => return service_unavailable_response(),
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => {
@@ -1217,11 +1324,14 @@ pub async fn admin_middleware(
             let entry = AuditEntry::new(AuditAction::PermissionDenied, ResourceType::User)
                 .user(auth_ext.user_id)
                 .resource(auth_ext.user_id)
-                .details(serde_json::json!({
-                    "path": request.uri().path(),
-                    "method": request.method().as_str(),
-                    "reason": "admin_privileges_required",
-                }));
+                .actor_name(auth_ext.username.clone())
+                .details_typed(
+                    crate::services::audit_export::details::AuthDetails::permission_denied(
+                        request.uri().path(),
+                        request.method().as_str(),
+                        "admin_privileges_required",
+                    ),
+                );
             audit_fire_and_forget(auth_service.db().clone(), entry).await;
         }
         return (StatusCode::FORBIDDEN, "Admin access required").into_response();
@@ -1250,8 +1360,121 @@ pub struct RepoVisibilityState {
 pub(crate) fn extract_repo_key(path: &str) -> &str {
     let trimmed = path.trim_start_matches('/');
     let mut segments = trimmed.split('/');
-    segments.next(); // skip format prefix (pypi, npm, maven, etc.)
+    // Format prefix (pypi, npm, maven, ...).
+    let format = segments.next().unwrap_or("");
+    // Conda token channels embed the credential in the URL path:
+    //   /conda/t/<TOKEN>/<repo_key>/<subdir>/...
+    // The generic "skip one prefix segment" rule would return "t" as the repo
+    // key (the conda token router is mounted at /conda/t), so the visibility
+    // middleware would resolve a nonexistent repo and 401 an otherwise valid
+    // token-channel read. Skip the `t/<TOKEN>` pair for conda token URLs so the
+    // actual repository key is returned.
+    if format == "conda" && segments.clone().next() == Some("t") {
+        segments.next(); // "t"
+        segments.next(); // "<TOKEN>"
+    }
     segments.next().unwrap_or("")
+}
+
+/// Extract the credential from a conda token-channel URL path.
+///
+/// Conda clients embed the token directly in the path as
+/// `/conda/t/<TOKEN>/<repo_key>/...` (configured in `.condarc`). This
+/// credential is invisible to [`extract_token`], which only inspects headers
+/// and cookies, so without this helper the visibility middleware treats an
+/// authenticated token-channel request as anonymous and rejects reads of
+/// private channels. Returns `None` for any non-conda-token path or an empty
+/// token segment.
+pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
+    let trimmed = path.trim_start_matches('/');
+    let mut segments = trimmed.split('/');
+    if segments.next()? != "conda" {
+        return None;
+    }
+    if segments.next()? != "t" {
+        return None;
+    }
+    match segments.next() {
+        Some(token) if !token.is_empty() => Some(token),
+        _ => None,
+    }
+}
+
+/// Is `path` the NuGet package-push route (`/nuget/<repo_key>/api/v2/package`)?
+///
+/// Matched exactly — with or without the trailing slash that `dotnet nuget
+/// push` appends to the `PackagePublish/2.0.0` URL it discovers from the v3
+/// service index (both spellings are registered in `nuget::router`). Every
+/// other NuGet route (service index, search, registration, flat container) and
+/// every other format returns `false`, which is what keeps the
+/// `X-NuGet-ApiKey` credential fallback from widening the accepted credential
+/// surface anywhere else.
+fn is_nuget_push_path(path: &str) -> bool {
+    let trimmed = path.trim_start_matches('/');
+    let mut segments = trimmed.split('/');
+    if segments.next() != Some("nuget") {
+        return false;
+    }
+    // Repository key.
+    match segments.next() {
+        Some(key) if !key.is_empty() => {}
+        _ => return false,
+    }
+    if segments.next() != Some("api") || segments.next() != Some("v2") {
+        return false;
+    }
+    if segments.next() != Some("package") {
+        return false;
+    }
+    // Nothing may follow except the optional trailing slash.
+    match segments.next() {
+        None => true,
+        Some("") => segments.next().is_none(),
+        Some(_) => false,
+    }
+}
+
+/// Extract the credential from the NuGet `X-NuGet-ApiKey` push header.
+///
+/// `dotnet nuget push --api-key <key>` against a source with no configured
+/// credentials sends the key in `X-NuGet-ApiKey` and nothing in
+/// `Authorization`. That header is invisible to [`extract_token`], so the
+/// visibility middleware treated such a push as anonymous and rejected it with
+/// 401 (writes always require auth) *before* `push_package` — which has its own
+/// `X-NuGet-ApiKey` fallback — could ever run.
+///
+/// Scoped to `PUT` on the push route alone: this header is a NuGet client
+/// convention, so it must not become a general-purpose credential channel on
+/// read routes or on other formats. Returns `None` for any other method, path,
+/// or an empty header value.
+fn extract_nuget_push_api_key(request: &Request) -> Option<&str> {
+    if request.method() != Method::PUT || !is_nuget_push_path(request.uri().path()) {
+        return None;
+    }
+    request
+        .headers()
+        .get(&X_NUGET_API_KEY)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+}
+
+/// Resolve the request credential for the visibility middleware, falling back
+/// to format-specific credential channels when no header/cookie credential is
+/// present: the conda token-channel URL, and the NuGet push `X-NuGet-ApiKey`
+/// header. Header credentials always take precedence, and an unparseable or
+/// invalid fallback credential still fails closed downstream.
+pub(crate) fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> {
+    let extracted = extract_token(request);
+    if !matches!(extracted, ExtractedToken::None) {
+        return extracted;
+    }
+    if let Some(token) = extract_conda_url_token(request.uri().path()) {
+        return ExtractedToken::ApiKey(token);
+    }
+    if let Some(token) = extract_nuget_push_api_key(request) {
+        return ExtractedToken::ApiKey(token);
+    }
+    ExtractedToken::None
 }
 
 /// Decide whether a request to a repository should be allowed.
@@ -1271,6 +1494,55 @@ fn is_write_method(method: &Method) -> bool {
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     )
+}
+
+/// Is `path` a POST route that is *not* a repository mutation despite using a
+/// write HTTP method?
+///
+/// A handful of format endpoints are `POST` by protocol but are negotiation /
+/// credential-exchange steps rather than artifact writes. The method-based
+/// mutation gate in [`repo_visibility_middleware`] (#2603 G1) would otherwise
+/// reject them with 403 for any caller lacking the repository `write` action,
+/// which breaks legitimate reads/logins:
+///
+/// * **git-lfs batch** — `POST /lfs/<repo_key>/objects/batch` is the mandatory
+///   download/upload negotiation. `git lfs pull` issues an `{"operation":
+///   "download"}` batch, so a read-only member or a public-repo non-member must
+///   be able to reach it. The `batch` handler self-gates uploads: an
+///   `{"operation":"upload"}` batch is authorized as a repository `write`
+///   in-handler, and the subsequent object `PUT` is write-gated by this same
+///   middleware, so exempting the batch POST does not open an upload hole.
+/// * **conan authenticate** — `POST /conan/<repo_key>/v2/users/authenticate` is
+///   a Basic→JWT credential exchange, not a write. The handler requires a valid
+///   credential and mints a scope-ceilinged token; no repository `write` is
+///   needed or implied.
+///
+/// The `#508` write-auth requirement (writes require authentication; anonymous
+/// callers get 401) still applies to these paths independently, so this
+/// exemption never loosens the anonymous contract — it only routes the
+/// *authenticated* caller through the read/visibility path instead of the
+/// deny-by-default write choke-point.
+fn is_non_mutating_format_post(path: &str) -> bool {
+    let trimmed = path.trim_start_matches('/');
+    let mut segments = trimmed.split('/');
+    match segments.next() {
+        // /lfs/<repo_key>/objects/batch
+        Some("lfs") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("objects")
+                && segments.next() == Some("batch")
+                && segments.next().is_none()
+        }
+        // /conan/<repo_key>/v2/users/authenticate
+        Some("conan") => {
+            matches!(segments.next(), Some(k) if !k.is_empty())
+                && segments.next() == Some("v2")
+                && segments.next() == Some("users")
+                && segments.next() == Some("authenticate")
+                && segments.next().is_none()
+        }
+        _ => false,
+    }
 }
 
 /// Build a 401 response with `WWW-Authenticate` challenges for both Basic
@@ -1482,8 +1754,10 @@ pub async fn repo_visibility_middleware(
     // info-disclosure question (#-TBD); for now we mirror
     // `optional_auth_middleware` and prioritise honouring the deactivation.
     let Some(repo) = repo else {
-        let extracted = extract_token(&request);
-        let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
+        let extracted = extract_visibility_token(&request);
+        // Format/registry endpoint: preserve pip-netrc / Artifactory-style
+        // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
+        let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
         // Transient bcrypt-capacity shed -> retryable 503 (see
         // `AuthOutcome::Overloaded`), never a 401.
         if matches!(outcome, AuthOutcome::Overloaded) {
@@ -1522,9 +1796,13 @@ pub async fn repo_visibility_middleware(
     let is_public = repo.is_public;
     let is_write = is_write_method(request.method());
 
-    // Perform optional auth (shared with optional_auth_middleware).
-    let extracted = extract_token(&request);
-    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted).await;
+    // Perform optional auth (shared with optional_auth_middleware). Conda
+    // token channels carry the credential in the URL path, so fall back to it
+    // when no header/cookie credential is present.
+    let extracted = extract_visibility_token(&request);
+    // Format/registry endpoint: preserve pip-netrc / Artifactory-style
+    // `username:<api_token>` Basic auth (`allow_basic_api_token=true`, #2786).
+    let outcome = try_resolve_auth_outcome(&vis_state.auth_service, extracted, true).await;
     // Transient bcrypt-capacity shed -> retryable 503 (see
     // `AuthOutcome::Overloaded`), never a 401.
     if matches!(outcome, AuthOutcome::Overloaded) {
@@ -1592,108 +1870,164 @@ pub async fn repo_visibility_middleware(
         }
     }
 
-    // #817: Fine-grained repository permission enforcement.
+    // Repository permission enforcement (#817 reads, #2603 G1 writes).
     //
     // If the authenticated user is an admin, skip permission checks entirely
     // to preserve backward compatibility and avoid unnecessary DB lookups.
-    //
-    // For non-admin users, check whether any permission rules exist for this
-    // repository. If no rules exist, fall through to the default access model
-    // (the visibility checks above are sufficient). If rules do exist, the
-    // user must hold the action that matches the HTTP method.
     if let Some(ref ext) = auth_ext {
         if !ext.is_admin {
-            let has_rules = match vis_state
-                .permission_service
-                .has_any_rules_for_target("repository", repo.id)
-                .await
-            {
-                Ok(v) => v,
-                Err(_) => {
-                    // DB error on permission check: fail closed.
-                    tracing::error!("permission check failed: database unreachable");
-                    return Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body(axum::body::Body::from(
-                            "permission service temporarily unavailable",
-                        ))
-                        .unwrap();
-                }
+            // A few POST routes are negotiation / credential-exchange steps, not
+            // repository mutations, even though the HTTP method is a write (see
+            // `is_non_mutating_format_post`). Classify them as reads so a
+            // read-only member or a public-repo non-member can still perform
+            // download negotiation / token exchange. The #508 write-auth gate
+            // above (401 for anonymous) is unaffected, and actual LFS uploads
+            // remain write-gated by the batch handler and the object-PUT path.
+            let non_mutating_post = is_non_mutating_format_post(&path);
+            let action = if non_mutating_post {
+                "read"
+            } else {
+                action_for_method(request.method())
             };
 
-            if has_rules {
-                let action = action_for_method(request.method());
-                // #2329: On a *public* repository, reads are always allowed
-                // for anonymous callers (visibility check above), so an
-                // authenticated caller must not end up with *less* read
-                // access just because ACL rules exist. Grant the anonymous
-                // read baseline and skip the ACL for reads only; writes and
-                // deletes remain fully ACL-gated, and private repos never
-                // take this shortcut. Anonymous callers never reach this
-                // block at all (no `auth_ext`), so the existing
-                // anonymous-public contract is untouched.
-                if !public_read_satisfies_acl(is_public, action) {
-                    // Check for the specific action first, then fall back to
-                    // "admin" which implies all actions (#827 policy compat).
-                    // Both calls resolve from the same cached action set, so
-                    // the second call is essentially free.
-                    let allowed = vis_state
-                        .permission_service
-                        .check_permission(ext.user_id, "repository", repo.id, action, false)
-                        .await
-                        .unwrap_or(false)
-                        || vis_state
-                            .permission_service
-                            .check_permission(ext.user_id, "repository", repo.id, "admin", false)
-                            .await
-                            .unwrap_or(false);
-
-                    if !allowed {
-                        return forbidden_permission_response();
+            if is_write && !non_mutating_post {
+                // #2603 G1: writes and deletes route through the single
+                // canonical action choke-point, DENY-BY-DEFAULT. `is_public`
+                // confers a read baseline only and never satisfies a write, and
+                // a repository with NO fine-grained rules does not fall open —
+                // the caller must hold a role assignment carrying the action
+                // (or an allowing fine-grained rule, or `admin`), for public
+                // and private repositories alike. This closes the rules-less
+                // public-repo write hole (any authed caller could PUT/DELETE)
+                // and the rules-less private-repo case (a read-only `viewer`
+                // member could write/delete). DB error fails closed (503).
+                match vis_state
+                    .permission_service
+                    .check_repository_action(ext.user_id, repo.id, action, false)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return forbidden_permission_response(),
+                    Err(_) => {
+                        tracing::error!("permission check failed: database unreachable");
+                        return service_unavailable_response();
                     }
                 }
-            } else if !is_public {
-                // A private repo with NO fine-grained permission rules must
-                // still not be readable by every authenticated user. Mirror
-                // the REST `require_visible` model: a non-admin needs a role
-                // assignment scoped to this repo (or a global assignment).
-                //
-                // Without this branch the native-protocol path default-ALLOWED
-                // rule-less private repos to any authenticated principal, while
-                // the REST download path denied the same caller (404) — a
-                // cross-tenant private-artifact leak (red-team round 2).
-                //
-                // Uses sqlx::query_scalar (not the macro) so no new entry in
-                // the sqlx offline-query cache is required, matching the rest
-                // of this middleware. Same predicate as
-                // RepositoryService::user_can_access_repo.
-                let granted = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM role_assignments ra \
-                         WHERE ra.user_id = $1 \
-                           AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
-                     )",
-                )
-                .bind(ext.user_id)
-                .bind(repo.id)
-                .fetch_one(&vis_state.db)
-                .await;
-
-                match granted {
-                    Ok(true) => {}
-                    // Existence-hiding 404, matching REST `require_visible`.
-                    Ok(false) => return not_found_response(),
+            } else {
+                // Reads: preserve the public-anonymous baseline + private
+                // membership + fine-grained ACL model (#817 / #2329). For a
+                // non-admin user, check whether any permission rules exist for
+                // this repository. If no rules exist, fall through to the
+                // default access model (the visibility checks above are
+                // sufficient for public repos; private repos still require a
+                // role assignment). If rules do exist, the user must hold the
+                // read action.
+                let has_rules = match vis_state
+                    .permission_service
+                    .has_any_rules_for_target("repository", repo.id)
+                    .await
+                {
+                    Ok(v) => v,
                     Err(_) => {
-                        // DB error on access check: fail closed.
-                        tracing::error!("repo access check failed: database unreachable");
-                        return service_unavailable_response();
+                        // DB error on permission check: fail closed.
+                        tracing::error!("permission check failed: database unreachable");
+                        return Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(axum::body::Body::from(
+                                "permission service temporarily unavailable",
+                            ))
+                            .unwrap();
+                    }
+                };
+
+                if has_rules {
+                    // #2329: On a *public* repository, reads are always allowed
+                    // for anonymous callers (visibility check above), so an
+                    // authenticated caller must not end up with *less* read
+                    // access just because ACL rules exist. Grant the anonymous
+                    // read baseline and skip the ACL for reads only; private
+                    // repos never take this shortcut. Anonymous callers never
+                    // reach this block at all (no `auth_ext`), so the existing
+                    // anonymous-public contract is untouched.
+                    if !public_read_satisfies_acl(is_public, action) {
+                        // Check for the specific action first, then fall back to
+                        // "admin" which implies all actions (#827 policy compat).
+                        // Both calls resolve from the same cached action set, so
+                        // the second call is essentially free.
+                        let allowed = vis_state
+                            .permission_service
+                            .check_permission(ext.user_id, "repository", repo.id, action, false)
+                            .await
+                            .unwrap_or(false)
+                            || vis_state
+                                .permission_service
+                                .check_permission(
+                                    ext.user_id,
+                                    "repository",
+                                    repo.id,
+                                    "admin",
+                                    false,
+                                )
+                                .await
+                                .unwrap_or(false);
+
+                        if !allowed {
+                            return forbidden_permission_response();
+                        }
+                    }
+                } else if !is_public {
+                    // A private repo with NO fine-grained permission rules must
+                    // still not be readable by every authenticated user. Mirror
+                    // the REST `require_visible` model: a non-admin needs a role
+                    // assignment scoped to this repo (or a global assignment).
+                    //
+                    // Without this branch the native-protocol path
+                    // default-ALLOWED rule-less private repos to any
+                    // authenticated principal, while the REST download path
+                    // denied the same caller (404) — a cross-tenant
+                    // private-artifact leak (red-team round 2).
+                    //
+                    // Uses sqlx::query_scalar (not the macro) so no new entry in
+                    // the sqlx offline-query cache is required, matching the rest
+                    // of this middleware. Same predicate as
+                    // RepositoryService::user_can_access_repo.
+                    let granted = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS ( \
+                             SELECT 1 FROM role_assignments ra \
+                             WHERE ra.user_id = $1 \
+                               AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
+                         )",
+                    )
+                    .bind(ext.user_id)
+                    .bind(repo.id)
+                    .fetch_one(&vis_state.db)
+                    .await;
+
+                    match granted {
+                        Ok(true) => {}
+                        // Existence-hiding 404, matching REST `require_visible`.
+                        Ok(false) => return not_found_response(),
+                        Err(_) => {
+                            // DB error on access check: fail closed.
+                            tracing::error!("repo access check failed: database unreachable");
+                            return service_unavailable_response();
+                        }
                     }
                 }
             }
         }
     }
 
-    next.run(request).await
+    // #2598: attribute every downstream ingestion/serve archive decode to this
+    // repository so the per-tenant fairness sub-limit applies. This is the
+    // single seam that resolves the repo id for all format routes, so scoping
+    // here gives every extractor call site per-tenant fairness without any
+    // per-handler plumbing.
+    crate::util::bounded_archive::run_with_tenant_scope(
+        crate::util::bounded_archive::TenantKey::Repo(repo.id),
+        next.run(request),
+    )
+    .await
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -1772,6 +2106,221 @@ mod tests {
             .unwrap();
         let result = extract_token(&request);
         assert!(matches!(result, ExtractedToken::ApiKey("token-xyz")));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_uses_conda_url_token() {
+        // No header credential: the conda token-channel URL supplies the token.
+        let request = Request::builder()
+            .uri("/conda/t/url-token-123/my-channel/noarch/repodata.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let result = extract_visibility_token(&request);
+        assert!(matches!(result, ExtractedToken::ApiKey("url-token-123")));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_header_takes_priority() {
+        // A header credential always wins over the URL token.
+        let request = Request::builder()
+            .uri("/conda/t/url-token-123/my-channel/noarch/repodata.json")
+            .header(AUTHORIZATION, "Bearer header-jwt")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let result = extract_visibility_token(&request);
+        assert!(matches!(result, ExtractedToken::Bearer("header-jwt")));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_none_for_plain_path() {
+        // A non-token path with no header credential yields no token.
+        let request = Request::builder()
+            .uri("/conda/my-channel/noarch/repodata.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let result = extract_visibility_token(&request);
+        assert!(matches!(result, ExtractedToken::None));
+    }
+
+    // -----------------------------------------------------------------------
+    // NuGet push X-NuGet-ApiKey fallback
+    // -----------------------------------------------------------------------
+
+    fn nuget_push_request(uri: &str, api_key: Option<&str>) -> Request {
+        let mut builder = Request::builder().method(Method::PUT).uri(uri);
+        if let Some(key) = api_key {
+            builder = builder.header("x-nuget-apikey", key);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn test_extract_visibility_token_uses_nuget_push_api_key() {
+        // `dotnet nuget push --api-key <key>` against a credential-less source
+        // sends the key ONLY in X-NuGet-ApiKey. Without this fallback the
+        // visibility middleware saw an anonymous write and 401'd before the
+        // push handler (which has its own X-NuGet-ApiKey fallback) could run.
+        let request = nuget_push_request("/nuget/my-feed/api/v2/package", Some("nuget-key-123"));
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::ApiKey("nuget-key-123")
+        ));
+
+        // `dotnet nuget push` appends a trailing slash to the discovered
+        // PackagePublish URL; both spellings are registered routes.
+        let request = nuget_push_request("/nuget/my-feed/api/v2/package/", Some("nuget-key-123"));
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::ApiKey("nuget-key-123")
+        ));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_nuget_header_credential_takes_priority() {
+        // An explicit Authorization credential always wins over X-NuGet-ApiKey.
+        let mut request =
+            nuget_push_request("/nuget/my-feed/api/v2/package", Some("nuget-key-123"));
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer header-jwt"),
+        );
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::Bearer("header-jwt")
+        ));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_malformed_auth_header_not_rescued_by_nuget_key() {
+        // Precedence must hold for a MALFORMED Authorization header, not just a
+        // valid one: a caller who presents a broken credential gets that
+        // credential's (failing) outcome, never a silent rescue by
+        // X-NuGet-ApiKey.
+        //
+        // This property currently rests on an implementation detail —
+        // `extract_token_from_auth_header` never returns `None`, so the early
+        // return in `extract_visibility_token` always fires and the worst case
+        // is `Invalid`, which `repo_visibility_middleware` maps to
+        // `InvalidCredential` -> 401. A refactor that made the parser return
+        // `None` for an unparseable header would silently open a real fallback
+        // (bogus Authorization + valid api key -> authenticated). Pin it here
+        // so that refactor fails loudly instead.
+        for (header_value, expected) in [
+            // Parsed as Basic, but the credentials are not valid base64 ->
+            // rejected downstream as InvalidCredential.
+            ("Basic !!!bad!!!", ExtractedToken::Basic("!!!bad!!!")),
+            // Unparseable: no known scheme, and multi-word so it cannot be
+            // taken for a scheme-less cargo token -> Invalid.
+            ("!!! bad !!!", ExtractedToken::Invalid),
+            ("Bogus scheme-with args", ExtractedToken::Invalid),
+        ] {
+            let mut request =
+                nuget_push_request("/nuget/my-feed/api/v2/package", Some("nuget-key-123"));
+            request.headers_mut().insert(
+                AUTHORIZATION,
+                axum::http::HeaderValue::from_str(header_value).unwrap(),
+            );
+            let resolved = extract_visibility_token(&request);
+            assert!(
+                !matches!(resolved, ExtractedToken::ApiKey("nuget-key-123")),
+                "malformed Authorization {header_value:?} must not fall back to X-NuGet-ApiKey"
+            );
+            match (&resolved, &expected) {
+                (ExtractedToken::Basic(got), ExtractedToken::Basic(want)) => assert_eq!(got, want),
+                (ExtractedToken::Invalid, ExtractedToken::Invalid) => {}
+                _ => panic!("Authorization {header_value:?} resolved to an unexpected credential"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_visibility_token_empty_nuget_api_key_is_none() {
+        // An empty header value is not a credential: fall through to anonymous
+        // so the write gate fails closed with 401.
+        let request = nuget_push_request("/nuget/my-feed/api/v2/package", Some(""));
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::None
+        ));
+    }
+
+    #[test]
+    fn test_extract_visibility_token_nuget_api_key_ignored_off_push_path() {
+        // The fallback must not widen the credential surface beyond the push
+        // route: NuGet read routes ignore the header entirely.
+        for uri in [
+            "/nuget/my-feed/v3/index.json",
+            "/nuget/my-feed/v3/search",
+            "/nuget/my-feed/v3/flatcontainer/pkg/1.0.0/pkg.nupkg",
+            "/nuget/my-feed/api/v2/package/extra",
+            "/nuget/my-feed/api/v2/symbolpackage",
+            "/nuget/api/v2/package",
+        ] {
+            let request = nuget_push_request(uri, Some("nuget-key-123"));
+            assert!(
+                matches!(extract_visibility_token(&request), ExtractedToken::None),
+                "X-NuGet-ApiKey must be ignored on {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_visibility_token_nuget_api_key_ignored_for_other_formats() {
+        // No cross-format blast radius: an identically-shaped path under any
+        // other format prefix never honours the header.
+        for uri in [
+            "/pypi/my-feed/api/v2/package",
+            "/npm/my-feed/api/v2/package",
+            "/conda/my-feed/api/v2/package",
+        ] {
+            let request = nuget_push_request(uri, Some("nuget-key-123"));
+            assert!(
+                matches!(extract_visibility_token(&request), ExtractedToken::None),
+                "X-NuGet-ApiKey must be ignored for {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_visibility_token_nuget_api_key_ignored_on_other_methods() {
+        // Scoped to the PUT push and nothing else. A GET/HEAD carrying the
+        // header stays anonymous, so it can never unlock a private-repo read;
+        // POST/PATCH/DELETE on the push route are equally inert, so the header
+        // cannot become a credential for any other verb the router may grow.
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri("/nuget/my-feed/api/v2/package")
+                .header("x-nuget-apikey", "nuget-key-123")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert!(
+                matches!(extract_visibility_token(&request), ExtractedToken::None),
+                "X-NuGet-ApiKey must be ignored on {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_nuget_push_path() {
+        assert!(is_nuget_push_path("/nuget/my-feed/api/v2/package"));
+        assert!(is_nuget_push_path("/nuget/my-feed/api/v2/package/"));
+        // Repo keys are single segments; nothing may follow `package`.
+        assert!(!is_nuget_push_path("/nuget/my-feed/api/v2/package//"));
+        assert!(!is_nuget_push_path("/nuget/my-feed/api/v2/package/x"));
+        assert!(!is_nuget_push_path("/nuget//api/v2/package"));
+        assert!(!is_nuget_push_path("/nuget/my-feed/api/v3/package"));
+        assert!(!is_nuget_push_path("/nuget/my-feed/api/v2"));
+        assert!(!is_nuget_push_path("/nuget"));
+        assert!(!is_nuget_push_path(""));
+        // Other formats never match, whatever the tail looks like.
+        assert!(!is_nuget_push_path("/pypi/my-feed/api/v2/package"));
     }
 
     #[test]
@@ -1961,6 +2510,150 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // GHSA-vvc3: effective-admin is scope-gated at construction
+    //
+    // A principal is an *effective* admin only when it is BOTH owned by an
+    // admin user AND presenting a credential whose scope ceiling grants the
+    // `admin` scope. `with_scope_gated_admin` folds that decision at the two
+    // construction points (`From<Claims>` and `validate_api_token_with_scopes`)
+    // so every downstream `is_admin` read inherits it. These tests are pure
+    // (no DB) and fail before the fold was added.
+    // -----------------------------------------------------------------------
+
+    /// Mirror the `AuthExtension` that `validate_api_token_with_scopes`
+    /// produces for a token owned by an ADMIN user with the given scopes, then
+    /// apply the same construction-time fold the production path applies.
+    fn admin_owned_token_ext(scopes: Vec<String>) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "adminowner".to_string(),
+            email: "adminowner@example.com".to_string(),
+            is_admin: true,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(scopes),
+            allowed_repo_ids: AccessScope::Admin,
+            iat_ms: None,
+        }
+        .with_scope_gated_admin()
+    }
+
+    fn claims_with(is_admin: bool, scopes: Option<Vec<String>>) -> Claims {
+        Claims {
+            sub: Uuid::new_v4(),
+            username: "principal".to_string(),
+            email: "principal@example.com".to_string(),
+            is_admin,
+            allowed_repo_ids: None,
+            iat: 1000,
+            iat_ms: None,
+            exp: 2000,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+            scan_pull_repo: None,
+            scopes,
+        }
+    }
+
+    #[test]
+    fn test_scoped_admin_read_token_is_not_effective_admin() {
+        let ext = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        assert!(!ext.is_admin);
+        assert!(ext.require_admin().is_err());
+    }
+
+    #[test]
+    fn test_scoped_admin_token_with_admin_scope_is_admin() {
+        let ext = admin_owned_token_ext(vec!["admin".to_string()]);
+        assert!(ext.is_admin);
+        assert!(ext.require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_scoped_admin_token_with_wildcard_scope_is_admin() {
+        let ext = admin_owned_token_ext(vec!["*".to_string()]);
+        assert!(ext.is_admin);
+        assert!(ext.require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_interactive_admin_jwt_preserves_admin() {
+        // scopes = None (interactive login) is unrestricted: admin preserved.
+        let ext = AuthExtension::from(claims_with(true, None));
+        assert!(ext.is_admin);
+        assert!(ext.require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_non_admin_scoped_token_is_not_admin() {
+        // Owner is a non-admin: the fold is a no-op (already `false`).
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "user".to_string(),
+            email: "user@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(vec!["read:artifacts".to_string()]),
+            allowed_repo_ids: AccessScope::Restricted(vec![]),
+            iat_ms: None,
+        }
+        .with_scope_gated_admin();
+        assert!(!ext.is_admin);
+    }
+
+    #[test]
+    fn test_exchanged_jwt_from_read_token_cannot_launder_admin() {
+        // A JWT exchanged from a read-scoped API token carries
+        // `is_api_token = false` but inherits the token's `Some(scopes)`
+        // ceiling. The `From<Claims>` fold must still demote it.
+        let ext = AuthExtension::from(claims_with(true, Some(vec!["read:artifacts".to_string()])));
+        assert!(!ext.is_api_token);
+        assert!(!ext.is_admin);
+        assert!(ext.require_admin().is_err());
+    }
+
+    #[test]
+    fn test_scoped_admin_read_token_denied_self_or_admin_on_other_user() {
+        let ext = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        let other = Uuid::new_v4();
+        // Acting on ANOTHER user's resource is denied (no effective admin).
+        assert!(ext.require_self_or_admin(other, "denied").is_err());
+        // Acting on its OWN resource is still allowed.
+        assert!(ext.require_self_or_admin(ext.user_id, "denied").is_ok());
+    }
+
+    #[test]
+    fn test_scoped_admin_read_token_cannot_mint_admin_only_scopes() {
+        // The mint-escalation gate keys on the *effective* admin flag: a
+        // read-scoped admin-owned token is treated as a non-admin caller and
+        // may not grant `admin`.
+        let ext = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        assert!(crate::services::token_service::enforce_admin_only_scopes(
+            &["admin".to_string()],
+            ext.is_admin,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_route_level_admin_gate_403_for_scoped_read_token_2xx_for_admin_scope() {
+        // Route-level shape: admin handlers gate on `require_admin()`, whose
+        // `Authorization` error maps to HTTP 403. A read-scoped admin-owned
+        // token (previously bypassable) is now forbidden; an admin-scoped one
+        // passes the gate.
+        let read_tok = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        let err = read_tok
+            .require_admin()
+            .expect_err("read token must be denied");
+        assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+
+        let admin_tok = admin_owned_token_ext(vec!["admin".to_string()]);
+        assert!(admin_tok.require_admin().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
     // AuthExtension scope and repo helpers
     // -----------------------------------------------------------------------
 
@@ -1996,6 +2689,89 @@ mod tests {
     fn test_has_scope_admin_grants_all() {
         let ext = make_api_token_ext(vec!["admin".to_string()], None);
         assert!(ext.has_scope("delete:artifacts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // AuthExtension::enforce_mint_ceiling (#2996)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mint_ceiling_interactive_none_scopes_unrestricted() {
+        // Interactive/UI/CI principals (`scopes: None`) are action-unrestricted:
+        // the ceiling never bites, so console token minting is unaffected.
+        let ext = AuthExtension::from(claims_with(false, None));
+        assert!(ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .is_ok());
+        assert!(ext
+            .enforce_mint_ceiling(&["read:repositories".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mint_ceiling_scoped_token_cannot_exceed_itself() {
+        // A read-scoped API token may re-mint its own scope but not escalate
+        // to a scope it does not hold.
+        let ext = make_api_token_ext(vec!["read:artifacts".to_string()], None);
+        assert!(ext
+            .enforce_mint_ceiling(&["read:artifacts".to_string()])
+            .is_ok());
+        let err = ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .expect_err("read token must not mint write");
+        assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_mint_ceiling_exchanged_jwt_inherits_token_ceiling() {
+        // A JWT exchanged from a read-scoped API token (#2430) carries
+        // `is_api_token = false` but `Some(scopes)`: the ceiling still binds.
+        let ext = AuthExtension::from(claims_with(false, Some(vec!["read:artifacts".to_string()])));
+        assert!(!ext.is_api_token);
+        assert!(ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .is_err());
+    }
+
+    #[test]
+    fn test_mint_ceiling_wildcard_and_admin_scope_cover_everything() {
+        let star = make_api_token_ext(vec!["*".to_string()], None);
+        assert!(star
+            .enforce_mint_ceiling(&["write:artifacts".to_string(), "read:users".to_string()])
+            .is_ok());
+        let admin_scope = make_api_token_ext(vec!["admin".to_string()], None);
+        assert!(admin_scope
+            .enforce_mint_ceiling(&["delete:artifacts".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mint_ceiling_effective_admin_bypasses() {
+        // An effective admin (admin owner + admin-granting credential) is not
+        // held to the ceiling.
+        let ext = admin_owned_token_ext(vec!["admin".to_string()]);
+        assert!(ext.is_admin);
+        assert!(ext
+            .enforce_mint_ceiling(&["write:users".to_string()])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mint_ceiling_admin_owned_narrow_token_still_bound() {
+        // GHSA-vvc3 interaction: an admin-OWNED but narrowly-scoped token has
+        // `is_admin = false` after the scope-gated fold, so it is held to its
+        // token's ceiling rather than laundered up to the owner's admin.
+        let ext = admin_owned_token_ext(vec!["read:artifacts".to_string()]);
+        assert!(!ext.is_admin);
+        assert!(ext
+            .enforce_mint_ceiling(&["write:artifacts".to_string()])
+            .is_err());
+    }
+
+    #[test]
+    fn test_mint_ceiling_empty_request_ok() {
+        let ext = make_api_token_ext(vec!["read:artifacts".to_string()], None);
+        assert!(ext.enforce_mint_ceiling(&[]).is_ok());
     }
 
     // #1316: pin the authorization decision now that `has_scope` delegates to
@@ -2419,6 +3195,50 @@ mod tests {
         assert_eq!(extract_repo_key("pypi/my-repo/simple"), "my-repo");
     }
 
+    #[test]
+    fn test_extract_repo_key_conda_token_channel() {
+        // /conda/t/<TOKEN>/<repo_key>/... must resolve to the real repo key,
+        // not the literal "t" segment that the generic rule would return.
+        assert_eq!(
+            extract_repo_key("/conda/t/abc123token/my-channel/noarch/repodata.json"),
+            "my-channel"
+        );
+        assert_eq!(
+            extract_repo_key("/conda/t/abc123token/my-channel/channeldata.json"),
+            "my-channel"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_key_conda_non_token_unchanged() {
+        // A plain conda channel (no /t/ prefix) is unaffected.
+        assert_eq!(
+            extract_repo_key("/conda/my-channel/noarch/repodata.json"),
+            "my-channel"
+        );
+        // A conda channel that merely happens to be named "t" (no token
+        // segment shape) still resolves to that key when addressed plainly.
+        assert_eq!(extract_repo_key("/conda/t"), "");
+    }
+
+    #[test]
+    fn test_extract_conda_url_token() {
+        assert_eq!(
+            extract_conda_url_token("/conda/t/abc123token/my-channel/noarch/repodata.json"),
+            Some("abc123token")
+        );
+        // Non-conda paths carry no URL token.
+        assert_eq!(extract_conda_url_token("/pypi/t/abc/my-repo/simple"), None);
+        // Plain conda channel (no /t/) carries no URL token.
+        assert_eq!(
+            extract_conda_url_token("/conda/my-channel/noarch/repodata.json"),
+            None
+        );
+        // Empty token segment is not a credential.
+        assert_eq!(extract_conda_url_token("/conda/t//my-channel"), None);
+        assert_eq!(extract_conda_url_token("/conda/t"), None);
+    }
+
     // -----------------------------------------------------------------------
     // should_allow_repo_access
     // -----------------------------------------------------------------------
@@ -2548,6 +3368,62 @@ mod tests {
     #[test]
     fn test_is_write_method_options_is_not_write() {
         assert!(!is_write_method(&Method::OPTIONS));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_non_mutating_format_post
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_non_mutating_lfs_batch_is_exempt() {
+        assert!(is_non_mutating_format_post("/lfs/myrepo/objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_conan_authenticate_is_exempt() {
+        assert!(is_non_mutating_format_post(
+            "/conan/myrepo/v2/users/authenticate"
+        ));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_object_put_is_not_exempt() {
+        // The actual object upload (PUT /lfs/<repo>/objects/<oid>) is a real
+        // write and must NOT be exempted from the mutation gate.
+        assert!(!is_non_mutating_format_post(
+            "/lfs/myrepo/objects/abcdef0123456789"
+        ));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_verify_is_not_exempt() {
+        assert!(!is_non_mutating_format_post("/lfs/myrepo/verify"));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_batch_missing_repo_key_is_not_exempt() {
+        assert!(!is_non_mutating_format_post("/lfs//objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_conan_upload_is_not_exempt() {
+        // A conan artifact upload path must remain write-gated.
+        assert!(!is_non_mutating_format_post(
+            "/conan/myrepo/v2/conans/pkg/1.0/user/channel/upload_urls"
+        ));
+    }
+
+    #[test]
+    fn test_non_mutating_other_format_batch_is_not_exempt() {
+        // The exemption is scoped to the git-lfs and conan prefixes only.
+        assert!(!is_non_mutating_format_post("/npm/myrepo/objects/batch"));
+    }
+
+    #[test]
+    fn test_non_mutating_lfs_batch_trailing_segment_is_not_exempt() {
+        assert!(!is_non_mutating_format_post(
+            "/lfs/myrepo/objects/batch/extra"
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -3717,7 +4593,8 @@ mod tests {
         let jwt = mint_access_jwt(secret, user_id, "ci-user");
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
 
-        let resolved = try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic)).await;
+        let resolved =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false).await;
 
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
@@ -3733,6 +4610,302 @@ mod tests {
             }
             other => panic!("expected jwt fallback to authenticate basic password, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2786: API-token-as-password Basic auth on the generic API middleware.
+    //
+    // These DB-backed tests wire `auth_middleware` to a real pool-backed
+    // `AuthService` (NOT `make_test_auth_service`, whose lazy pool surfaces a
+    // transient overload on the token-validation path) so the token fallback
+    // is exercised deterministically. Each returns early when `DATABASE_URL`
+    // is unset, matching the rest of the DB-backed suite.
+    // -----------------------------------------------------------------------
+
+    /// Run `request` through `auth_middleware` backed by `auth_service`.
+    async fn run_auth_middleware_with_service(
+        auth_service: Arc<AuthService>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::Response<axum::body::Body> {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+        let app: Router = Router::new()
+            .route(
+                "/probe",
+                any(|| async { (StatusCode::OK, "handler-reached") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                auth_service,
+                auth_middleware,
+            ));
+        app.oneshot(request).await.unwrap()
+    }
+
+    fn basic_get(username: &str, password: &str) -> axum::http::Request<axum::body::Body> {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", username, password));
+        axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", format!("Basic {}", encoded))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// Insert an OIDC-provisioned service account with NO local password and
+    /// return its id + username. Mirrors how OIDC provisioning creates SAs.
+    async fn insert_oidc_service_account(pool: &sqlx::PgPool) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let username = format!("ph-oidc-sa-{}", id);
+        sqlx::query(
+            r#"INSERT INTO users
+               (id, username, email, password_hash, auth_provider,
+                is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, NULL, 'oidc', false, true, true)"#,
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{}@test.local", username))
+        .execute(pool)
+        .await
+        .expect("insert oidc service account");
+        (id, username)
+    }
+
+    #[tokio::test]
+    async fn test_2786_oidc_sa_api_token_as_basic_password_rejected_on_generic_api() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = insert_oidc_service_account(&pool).await;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        // A genuinely VALID, unexpired, read-scoped API token for the SA. The
+        // point of this test is that a valid token is refused as the Basic
+        // password on the /api/v1 management API — not merely that a bad token
+        // is rejected (that is covered separately below).
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+
+        let resp =
+            run_auth_middleware_with_service(auth_service, basic_get(&username, &token)).await;
+        let status = resp.status();
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        // #2806: an API token must NOT authenticate as the HTTP Basic password
+        // on the management API (`auth_middleware`). The #2798 fallback that
+        // accepted it here over-reached the #2786 need (which only covers the
+        // format/registry endpoints, handled by `repo_visibility_middleware`).
+        // The token still works as a `Bearer`/`X-Api-Key` credential and on the
+        // format endpoints; here it must be refused with 401.
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a valid API token as the Basic password must be refused on /api/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2786_invalid_token_as_basic_password_is_rejected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = insert_oidc_service_account(&pool).await;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        // A syntactically token-shaped but non-existent secret (>= 8 chars so
+        // it reaches the DB-prefix lookup rather than the short-circuit).
+        let resp = run_auth_middleware_with_service(
+            auth_service,
+            basic_get(&username, "deadbeef_not_a_real_token_value"),
+        )
+        .await;
+        let status = resp.status();
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an invalid API token in the password position must still be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2786_expired_token_as_basic_password_is_rejected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = insert_oidc_service_account(&pool).await;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        let (token, token_id) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], Some(1))
+            .await
+            .expect("generate api token");
+        // Force the token to be expired.
+        sqlx::query("UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect("expire token");
+
+        let resp =
+            run_auth_middleware_with_service(auth_service, basic_get(&username, &token)).await;
+        let status = resp.status();
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an expired API token in the password position must still be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2786_local_password_basic_auth_still_works() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Local user with a real bcrypt password: the token fallback must not
+        // regress ordinary username/password Basic auth.
+        let user_id = Uuid::new_v4();
+        let username = format!("ph-local-{}", user_id);
+        let password = "correct horse battery staple";
+        let hash = AuthService::hash_password(password)
+            .await
+            .expect("hash password");
+        sqlx::query(
+            r#"INSERT INTO users
+               (id, username, email, password_hash, auth_provider,
+                is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{}@test.local", username))
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("insert local user");
+
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(crate::config::Config::default()),
+        ));
+        let resp =
+            run_auth_middleware_with_service(auth_service, basic_get(&username, password)).await;
+        let status = resp.status();
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a real local password must still authenticate via Basic auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2786_basic_api_token_resolves_when_allowed_format_path() {
+        // Format/registry path (`allow_basic_api_token=true`): a valid API
+        // token presented as the Basic password resolves to the token owner.
+        // This is the #2786 customer need that `repo_visibility_middleware`
+        // preserves; it MUST keep working after the /api/v1 boundary fix.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = insert_oidc_service_account(&pool).await;
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("any:{}", token));
+
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), true).await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        match outcome {
+            AuthOutcome::Resolved(ext) => assert!(
+                ext.is_api_token,
+                "format path must resolve the api-token-as-Basic-password to the token owner"
+            ),
+            other => panic!("expected Resolved(is_api_token) on the format path, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_2786_basic_api_token_refused_when_disallowed_api_v1_boundary() {
+        // /api/v1 optional/admin path (`allow_basic_api_token=false`): the SAME
+        // valid API token as the Basic password is NOT resolved as a token — the
+        // resolver falls through to InvalidCredential (bcrypt fails: SA has no
+        // local password; JWT fails: not a JWT; api-token branch is skipped).
+        // This is the management-API Basic-auth boundary (#2806).
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = insert_oidc_service_account(&pool).await;
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let (token, _tid) = auth_service
+            .generate_api_token(user_id, "ci", vec!["read:artifacts".into()], None)
+            .await
+            .expect("generate api token");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("any:{}", token));
+
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false).await;
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert!(
+            matches!(outcome, AuthOutcome::InvalidCredential),
+            "api-token-as-Basic-password must NOT resolve on /api/v1, got: {outcome:?}"
+        );
     }
 
     async fn run_through_auth_middleware(
@@ -4120,7 +5293,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_resolve_auth_outcome_no_credential_for_none() {
         let auth_service = make_test_auth_service();
-        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::None).await;
+        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::None, false).await;
         assert!(matches!(outcome, AuthOutcome::NoCredential));
     }
 
@@ -4197,7 +5370,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_resolve_auth_outcome_invalid_for_garbage_scheme() {
         let auth_service = make_test_auth_service();
-        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::Invalid).await;
+        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::Invalid, false).await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
     }
 
@@ -4211,7 +5384,7 @@ mod tests {
         // genuine-invalid case from the pool-timeout -> Overloaded case (#2125).
         let auth_service = make_test_auth_service();
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("badtok")).await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Bearer("badtok"), false).await;
         assert!(
             matches!(outcome, AuthOutcome::InvalidCredential),
             "Bearer that fails every validator must produce InvalidCredential, got: {:?}",
@@ -4226,7 +5399,7 @@ mod tests {
         // (the pool-timeout -> Overloaded case is covered separately, #2125).
         let auth_service = make_test_auth_service();
         let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("badtok")).await;
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::ApiKey("badtok"), false).await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
     }
 
@@ -4236,9 +5409,12 @@ mod tests {
         // Invalid, not NoCredential. The client tried to authenticate; we
         // owe them a 401.
         let auth_service = make_test_auth_service();
-        let outcome =
-            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic("not-base64-at-all"))
-                .await;
+        let outcome = try_resolve_auth_outcome(
+            &auth_service,
+            ExtractedToken::Basic("not-base64-at-all"),
+            false,
+        )
+        .await;
         assert!(matches!(outcome, AuthOutcome::InvalidCredential));
     }
 
@@ -4253,7 +5429,8 @@ mod tests {
         // `InvalidCredential` (see the tests above).
         let creds = base64::engine::general_purpose::STANDARD.encode("alice:secret");
         let auth_service = make_test_auth_service();
-        let outcome = try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&creds)).await;
+        let outcome =
+            try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&creds), false).await;
         assert!(
             matches!(outcome, AuthOutcome::Overloaded),
             "pool-timeout during Basic auth pre-check must be Overloaded, got: {:?}",

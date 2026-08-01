@@ -48,6 +48,14 @@ pub struct OidcConfigRow {
     /// When true, the OIDC `groups` claim values are reflected as
     /// Artifact Keeper group memberships (auto-creating groups on first
     /// sight). Otherwise legacy role mapping is used.
+    ///
+    /// SECURITY: groups are found-or-created by NAME, so enabling this
+    /// trusts the IdP's group taxonomy — an IdP-supplied group name that
+    /// collides with a privileged local group joins the user into that
+    /// local group. Ensure privileged local group names can't be shadowed
+    /// by IdP-emittable names (see SECURITY.md "SSO group mapping trusts
+    /// the IdP group taxonomy"). Does not grant `is_admin` (that is only
+    /// via `admin_group`).
     pub map_groups_to_groups: bool,
     /// Opt-in compatibility flag (migration 144): when true, ID tokens
     /// signed with RSA keys shorter than 2048 bits are accepted via a
@@ -76,6 +84,13 @@ pub struct LdapConfigRow {
     pub groups_attribute: String,
     pub admin_group_dn: Option<String>,
     pub use_starttls: bool,
+    /// Skip TLS certificate verification for this provider's LDAPS/STARTTLS
+    /// handshake (migration 174, #2782). Defaults false (secure-by-default).
+    pub insecure_skip_verify: bool,
+    /// Inline PEM CA certificate/chain trusted for this provider's LDAPS/
+    /// STARTTLS handshake (migration 174, #2782). NULL/empty = system trust
+    /// store (plus any `LDAP_CA_CERT_PATH` fallback).
+    pub ca_certificate: Option<String>,
     pub is_enabled: bool,
     pub priority: i32,
     pub created_at: DateTime<Utc>,
@@ -112,6 +127,22 @@ pub struct SamlConfigRow {
     /// historical relative path. Defaults to false so existing
     /// configurations keep their pre-138 wire format.
     pub use_absolute_acs_url: bool,
+    /// When true, SAML assertion group values are reflected as Artifact
+    /// Keeper group memberships (auto-created, tagged
+    /// `external_source = 'saml'`, reconciled per login). Mirrors the OIDC
+    /// flag from #1094; defaults to false so existing providers keep the
+    /// admin-role-only group behavior (migration 157, #2333).
+    ///
+    /// SECURITY: groups are found-or-created by NAME, so enabling this
+    /// trusts the IdP's group taxonomy — a signed group claim whose name
+    /// collides with a privileged local group joins the user into that
+    /// local group, and (because prune is scoped to
+    /// `external_source = 'saml'`) that membership persists until an
+    /// operator removes it. Ensure privileged local group names can't be
+    /// shadowed by IdP-emittable names (see SECURITY.md "SSO group mapping
+    /// trusts the IdP group taxonomy"). Does not grant `is_admin` (that is
+    /// only via `admin_group`).
+    pub map_groups_to_groups: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -124,6 +155,7 @@ redacted_debug!(SamlConfigRow {
     redact certificate,
     show sp_entity_id,
     show use_absolute_acs_url,
+    show map_groups_to_groups,
     show is_enabled,
 });
 
@@ -185,6 +217,15 @@ pub struct LdapConfigResponse {
     pub groups_attribute: String,
     pub admin_group_dn: Option<String>,
     pub use_starttls: bool,
+    /// Opt-in flag (migration 174, #2782): when true, TLS certificate
+    /// verification is skipped for this provider's LDAPS/STARTTLS handshake.
+    /// Defaults false (secure-by-default). Matches Harbor's "insecure skip
+    /// verify"; only enable for trusted networks / private CAs you cannot
+    /// import.
+    pub insecure_skip_verify: bool,
+    /// Whether a custom inline CA certificate is configured for this provider
+    /// (migration 174, #2782). The PEM itself is not returned.
+    pub has_ca_certificate: bool,
     pub is_enabled: bool,
     pub priority: i32,
     pub created_at: DateTime<Utc>,
@@ -211,6 +252,10 @@ pub struct SamlConfigResponse {
     /// emits an absolute ACS URL. Defaults to false so existing providers
     /// keep their pre-138 wire format.
     pub use_absolute_acs_url: bool,
+    /// Opt-in flag (see migration 157, #2333): when true, SAML assertion
+    /// group values are reflected as Artifact Keeper group memberships,
+    /// mirroring the OIDC flag from #1094. Defaults to false.
+    pub map_groups_to_groups: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -284,6 +329,15 @@ pub struct CreateLdapConfigRequest {
     pub groups_attribute: Option<String>,
     pub admin_group_dn: Option<String>,
     pub use_starttls: Option<bool>,
+    /// Opt-in (migration 174, #2782): skip TLS certificate verification for
+    /// this provider's LDAPS/STARTTLS handshake. Defaults false
+    /// (secure-by-default). Only enable for trusted networks / private CAs
+    /// you cannot import.
+    pub insecure_skip_verify: Option<bool>,
+    /// Inline PEM CA certificate/chain to trust for this provider's LDAPS/
+    /// STARTTLS handshake (migration 174, #2782). Send an empty string to
+    /// clear a previously stored certificate.
+    pub ca_certificate: Option<String>,
     pub is_enabled: Option<bool>,
     pub priority: Option<i32>,
 }
@@ -304,6 +358,12 @@ pub struct UpdateLdapConfigRequest {
     pub groups_attribute: Option<String>,
     pub admin_group_dn: Option<String>,
     pub use_starttls: Option<bool>,
+    /// See `CreateLdapConfigRequest::insecure_skip_verify` (migration 174,
+    /// #2782). Omit to leave the stored value unchanged.
+    pub insecure_skip_verify: Option<bool>,
+    /// Inline PEM CA certificate/chain (migration 174, #2782). Omit to leave
+    /// unchanged; send an empty string to clear.
+    pub ca_certificate: Option<String>,
     pub is_enabled: Option<bool>,
     pub priority: Option<i32>,
 }
@@ -327,6 +387,10 @@ pub struct CreateSamlConfigRequest {
     /// emits an absolute ACS URL for stricter IdPs that reject the
     /// historical relative path. Defaults to false.
     pub use_absolute_acs_url: Option<bool>,
+    /// Opt-in flag (see migration 157, #2333): when true, SAML assertion
+    /// group values are reflected as Artifact Keeper group memberships.
+    /// Defaults to false.
+    pub map_groups_to_groups: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -345,6 +409,7 @@ pub struct UpdateSamlConfigRequest {
     pub admin_group: Option<String>,
     pub is_enabled: Option<bool>,
     pub use_absolute_acs_url: Option<bool>,
+    pub map_groups_to_groups: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -749,6 +814,7 @@ impl AuthConfigService {
                    user_base_dn, user_filter, group_base_dn, group_filter,
                    email_attribute, display_name_attribute, username_attribute,
                    groups_attribute, admin_group_dn, use_starttls,
+                   insecure_skip_verify, ca_certificate,
                    is_enabled, priority, created_at, updated_at
             FROM ldap_configs
             ORDER BY priority, name
@@ -768,6 +834,7 @@ impl AuthConfigService {
                    user_base_dn, user_filter, group_base_dn, group_filter,
                    email_attribute, display_name_attribute, username_attribute,
                    groups_attribute, admin_group_dn, use_starttls,
+                   insecure_skip_verify, ca_certificate,
                    is_enabled, priority, created_at, updated_at
             FROM ldap_configs
             WHERE id = $1
@@ -792,6 +859,7 @@ impl AuthConfigService {
                    user_base_dn, user_filter, group_base_dn, group_filter,
                    email_attribute, display_name_attribute, username_attribute,
                    groups_attribute, admin_group_dn, use_starttls,
+                   insecure_skip_verify, ca_certificate,
                    is_enabled, priority, created_at, updated_at
             FROM ldap_configs
             WHERE id = $1
@@ -843,6 +911,8 @@ impl AuthConfigService {
         let use_starttls = req.use_starttls.unwrap_or(false);
         let is_enabled = req.is_enabled.unwrap_or(true);
         let priority = req.priority.unwrap_or(0);
+        let insecure_skip_verify = req.insecure_skip_verify.unwrap_or(false);
+        let ca_certificate = req.ca_certificate.filter(|c| !c.is_empty());
 
         let row = sqlx::query_as::<_, LdapConfigRow>(
             r#"
@@ -850,12 +920,13 @@ impl AuthConfigService {
                                       user_base_dn, user_filter, group_base_dn, group_filter,
                                       email_attribute, display_name_attribute, username_attribute,
                                       groups_attribute, admin_group_dn, use_starttls,
-                                      is_enabled, priority)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                                      is_enabled, priority, insecure_skip_verify, ca_certificate)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
             RETURNING id, name, server_url, bind_dn, bind_password_encrypted,
                       user_base_dn, user_filter, group_base_dn, group_filter,
                       email_attribute, display_name_attribute, username_attribute,
                       groups_attribute, admin_group_dn, use_starttls,
+                      insecure_skip_verify, ca_certificate,
                       is_enabled, priority, created_at, updated_at
             "#,
         )
@@ -876,6 +947,8 @@ impl AuthConfigService {
         .bind(use_starttls)
         .bind(is_enabled)
         .bind(priority)
+        .bind(insecure_skip_verify)
+        .bind(&ca_certificate)
         .fetch_one(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to create LDAP config: {e}")))?;
@@ -894,6 +967,7 @@ impl AuthConfigService {
                    user_base_dn, user_filter, group_base_dn, group_filter,
                    email_attribute, display_name_attribute, username_attribute,
                    groups_attribute, admin_group_dn, use_starttls,
+                   insecure_skip_verify, ca_certificate,
                    is_enabled, priority, created_at, updated_at
             FROM ldap_configs
             WHERE id = $1
@@ -924,6 +998,15 @@ impl AuthConfigService {
         let use_starttls = req.use_starttls.unwrap_or(existing.use_starttls);
         let is_enabled = req.is_enabled.unwrap_or(existing.is_enabled);
         let priority = req.priority.unwrap_or(existing.priority);
+        let insecure_skip_verify = req
+            .insecure_skip_verify
+            .unwrap_or(existing.insecure_skip_verify);
+        // Omitted => keep existing; empty string => clear; non-empty => replace.
+        let ca_certificate = match req.ca_certificate {
+            Some(c) if c.is_empty() => None,
+            Some(c) => Some(c),
+            None => existing.ca_certificate,
+        };
 
         // Preserve existing encrypted password if not provided
         let bind_password_hex: Option<String> = if let Some(new_pw) = &req.bind_password {
@@ -940,12 +1023,14 @@ impl AuthConfigService {
                 user_base_dn = $5, user_filter = $6, group_base_dn = $7, group_filter = $8,
                 email_attribute = $9, display_name_attribute = $10, username_attribute = $11,
                 groups_attribute = $12, admin_group_dn = $13, use_starttls = $14,
-                is_enabled = $15, priority = $16, updated_at = NOW()
-            WHERE id = $17
+                is_enabled = $15, priority = $16, insecure_skip_verify = $17,
+                ca_certificate = $18, updated_at = NOW()
+            WHERE id = $19
             RETURNING id, name, server_url, bind_dn, bind_password_encrypted,
                       user_base_dn, user_filter, group_base_dn, group_filter,
                       email_attribute, display_name_attribute, username_attribute,
                       groups_attribute, admin_group_dn, use_starttls,
+                      insecure_skip_verify, ca_certificate,
                       is_enabled, priority, created_at, updated_at
             "#,
         )
@@ -965,6 +1050,8 @@ impl AuthConfigService {
         .bind(use_starttls)
         .bind(is_enabled)
         .bind(priority)
+        .bind(insecure_skip_verify)
+        .bind(&ca_certificate)
         .bind(id)
         .fetch_one(pool)
         .await
@@ -999,6 +1086,7 @@ impl AuthConfigService {
                       user_base_dn, user_filter, group_base_dn, group_filter,
                       email_attribute, display_name_attribute, username_attribute,
                       groups_attribute, admin_group_dn, use_starttls,
+                      insecure_skip_verify, ca_certificate,
                       is_enabled, priority, created_at, updated_at
             "#,
         )
@@ -1012,30 +1100,104 @@ impl AuthConfigService {
         Ok(Self::ldap_row_to_response(row))
     }
 
-    /// Attempt a TCP connection to the LDAP server to verify reachability.
+    /// Test an LDAP provider configuration end-to-end (#2486).
+    ///
+    /// Runs in two stages:
+    /// 1. SSRF-vet and TCP-probe the configured host/port (unchanged
+    ///    behaviour: generic failure messages, no port-scan oracle).
+    /// 2. If a bind DN and password are stored for this provider, perform a
+    ///    REAL LDAP simple bind with the stored (decrypted) credentials,
+    ///    honouring the configured STARTTLS/TLS settings — the same code
+    ///    path the login flow uses. A rejected bind now reports failure;
+    ///    raw TCP reachability alone is no longer reported as success.
+    ///
+    /// When no service account is configured, only reachability can be
+    /// verified (user auth on such providers is direct-bind, which cannot be
+    /// tested without a user credential), and the message says so
+    /// explicitly.
+    ///
+    /// Note: the bind stage re-dials by hostname via the LDAP client, so a
+    /// DNS rebind between the vetted probe and the bind is a residual — the
+    /// same exposure as the login path, which dials the stored URL on every
+    /// login attempt.
     pub async fn test_ldap_connection(pool: &PgPool, id: Uuid) -> Result<LdapTestResult> {
-        let row = sqlx::query_as::<_, LdapConfigRow>(
-            r#"
-            SELECT id, name, server_url, bind_dn, bind_password_encrypted,
-                   user_base_dn, user_filter, group_base_dn, group_filter,
-                   email_attribute, display_name_attribute, username_attribute,
-                   groups_attribute, admin_group_dn, use_starttls,
-                   is_enabled, priority, created_at, updated_at
-            FROM ldap_configs
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to get LDAP config: {e}")))?
-        .ok_or_else(|| AppError::NotFound(format!("LDAP config {id} not found")))?;
+        let start = std::time::Instant::now();
+        let (row, bind_password) = Self::get_ldap_decrypted(pool, id).await?;
 
         // Parse host and port from server_url (e.g. ldap://host:389 or ldaps://host:636)
-        let url = &row.server_url;
-        let (host, port) = Self::parse_ldap_url(url)?;
+        let (host, port) = Self::parse_ldap_url(&row.server_url)?;
 
-        Self::probe_ldap_endpoint(&host, port).await
+        let probe = Self::probe_ldap_endpoint(&host, port).await?;
+        if !probe.success {
+            return Ok(probe);
+        }
+
+        let has_bind_creds = row.bind_dn.as_deref().is_some_and(|dn| !dn.is_empty())
+            && bind_password.as_deref().is_some_and(|pw| !pw.is_empty());
+        if !has_bind_creds {
+            return Ok(LdapTestResult {
+                success: true,
+                message: format!(
+                    "Connected to {host}:{port}; no bind DN/password configured, \
+                     so credentials were not verified"
+                ),
+                response_time_ms: probe.response_time_ms,
+            });
+        }
+
+        let svc = crate::services::ldap_service::LdapService::from_db_config(
+            pool.clone(),
+            &row.name,
+            &row.server_url,
+            row.bind_dn.as_deref(),
+            bind_password.as_deref(),
+            &row.user_base_dn,
+            &row.user_filter,
+            row.group_base_dn.as_deref(),
+            row.group_filter.as_deref(),
+            &row.username_attribute,
+            &row.email_attribute,
+            &row.display_name_attribute,
+            &row.groups_attribute,
+            row.admin_group_dn.as_deref(),
+            row.use_starttls,
+            row.insecure_skip_verify,
+            row.ca_certificate.as_deref(),
+        );
+
+        let bind_result = svc.verify_bind().await;
+        Ok(Self::bind_result_to_test_result(
+            bind_result,
+            start.elapsed().as_millis() as u64,
+        ))
+    }
+
+    /// Map the outcome of the verification bind to the API test result.
+    ///
+    /// Pure helper so the pass/fail decision is unit-testable. Messages stay
+    /// generic: no raw LDAP/OS error text (logged server-side instead) and
+    /// never the bind credentials.
+    fn bind_result_to_test_result(bind_result: Result<()>, elapsed_ms: u64) -> LdapTestResult {
+        match bind_result {
+            Ok(()) => LdapTestResult {
+                success: true,
+                message: "Connection and LDAP bind successful".to_string(),
+                response_time_ms: elapsed_ms,
+            },
+            Err(AppError::Authentication(_)) => LdapTestResult {
+                success: false,
+                message: "LDAP bind rejected: check the bind DN and bind password".to_string(),
+                response_time_ms: elapsed_ms,
+            },
+            Err(e) => {
+                tracing::warn!(target: "security", error = %e, "LDAP test: bind stage failed");
+                LdapTestResult {
+                    success: false,
+                    message: "LDAP connection failed during bind".to_string(),
+                    response_time_ms: elapsed_ms,
+                }
+            }
+        }
     }
 
     /// Resolve, SSRF-vet, and probe a TCP connection to `host:port`.
@@ -1139,6 +1301,8 @@ impl AuthConfigService {
             groups_attribute: row.groups_attribute,
             admin_group_dn: row.admin_group_dn,
             use_starttls: row.use_starttls,
+            insecure_skip_verify: row.insecure_skip_verify,
+            has_ca_certificate: row.ca_certificate.is_some_and(|c| !c.is_empty()),
             is_enabled: row.is_enabled,
             priority: row.priority,
             created_at: row.created_at,
@@ -1156,7 +1320,7 @@ impl AuthConfigService {
             SELECT id, name, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
-                   is_enabled, use_absolute_acs_url, created_at, updated_at
+                   is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             FROM saml_configs
             ORDER BY name
             "#,
@@ -1174,7 +1338,7 @@ impl AuthConfigService {
             SELECT id, name, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
-                   is_enabled, use_absolute_acs_url, created_at, updated_at
+                   is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             FROM saml_configs
             WHERE id = $1
             "#,
@@ -1194,7 +1358,7 @@ impl AuthConfigService {
             SELECT id, name, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
-                   is_enabled, use_absolute_acs_url, created_at, updated_at
+                   is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             FROM saml_configs
             WHERE id = $1
             "#,
@@ -1222,18 +1386,19 @@ impl AuthConfigService {
         let require_signed_assertions = req.require_signed_assertions.unwrap_or(true);
         let is_enabled = req.is_enabled.unwrap_or(true);
         let use_absolute_acs_url = req.use_absolute_acs_url.unwrap_or(false);
+        let map_groups_to_groups = req.map_groups_to_groups.unwrap_or(false);
 
         let row = sqlx::query_as::<_, SamlConfigRow>(
             r#"
             INSERT INTO saml_configs (id, name, entity_id, sso_url, slo_url, certificate,
                                       name_id_format, attribute_mapping, sp_entity_id,
                                       sign_requests, require_signed_assertions, admin_group,
-                                      is_enabled, use_absolute_acs_url)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                                      is_enabled, use_absolute_acs_url, map_groups_to_groups)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING id, name, entity_id, sso_url, slo_url, certificate,
                       name_id_format, attribute_mapping, sp_entity_id,
                       sign_requests, require_signed_assertions, admin_group,
-                      is_enabled, use_absolute_acs_url, created_at, updated_at
+                      is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -1250,6 +1415,7 @@ impl AuthConfigService {
         .bind(&req.admin_group)
         .bind(is_enabled)
         .bind(use_absolute_acs_url)
+        .bind(map_groups_to_groups)
         .fetch_one(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to create SAML config: {e}")))?;
@@ -1267,7 +1433,7 @@ impl AuthConfigService {
             SELECT id, name, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
-                   is_enabled, use_absolute_acs_url, created_at, updated_at
+                   is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             FROM saml_configs
             WHERE id = $1
             "#,
@@ -1295,6 +1461,9 @@ impl AuthConfigService {
         let use_absolute_acs_url = req
             .use_absolute_acs_url
             .unwrap_or(existing.use_absolute_acs_url);
+        let map_groups_to_groups = req
+            .map_groups_to_groups
+            .unwrap_or(existing.map_groups_to_groups);
 
         let row = sqlx::query_as::<_, SamlConfigRow>(
             r#"
@@ -1303,12 +1472,12 @@ impl AuthConfigService {
                 certificate = $5, name_id_format = $6, attribute_mapping = $7,
                 sp_entity_id = $8, sign_requests = $9, require_signed_assertions = $10,
                 admin_group = $11, is_enabled = $12, use_absolute_acs_url = $13,
-                updated_at = NOW()
-            WHERE id = $14
+                map_groups_to_groups = $14, updated_at = NOW()
+            WHERE id = $15
             RETURNING id, name, entity_id, sso_url, slo_url, certificate,
                       name_id_format, attribute_mapping, sp_entity_id,
                       sign_requests, require_signed_assertions, admin_group,
-                      is_enabled, use_absolute_acs_url, created_at, updated_at
+                      is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             "#,
         )
         .bind(&name)
@@ -1324,6 +1493,7 @@ impl AuthConfigService {
         .bind(&admin_group)
         .bind(is_enabled)
         .bind(use_absolute_acs_url)
+        .bind(map_groups_to_groups)
         .bind(id)
         .fetch_one(pool)
         .await
@@ -1357,7 +1527,7 @@ impl AuthConfigService {
             RETURNING id, name, entity_id, sso_url, slo_url, certificate,
                       name_id_format, attribute_mapping, sp_entity_id,
                       sign_requests, require_signed_assertions, admin_group,
-                      is_enabled, use_absolute_acs_url, created_at, updated_at
+                      is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             "#,
         )
         .bind(toggle.enabled)
@@ -1386,6 +1556,7 @@ impl AuthConfigService {
             admin_group: row.admin_group,
             is_enabled: row.is_enabled,
             use_absolute_acs_url: row.use_absolute_acs_url,
+            map_groups_to_groups: row.map_groups_to_groups,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -1761,6 +1932,8 @@ impl From<CreateLdapConfigRequest> for UpdateLdapConfigRequest {
             groups_attribute: c.groups_attribute,
             admin_group_dn: c.admin_group_dn,
             use_starttls: c.use_starttls,
+            insecure_skip_verify: c.insecure_skip_verify,
+            ca_certificate: c.ca_certificate,
             is_enabled: c.is_enabled,
             priority: c.priority,
         }
@@ -1906,6 +2079,8 @@ mod tests {
             groups_attribute: "memberOf".to_string(),
             admin_group_dn: Some("cn=admins,ou=groups,dc=example,dc=com".to_string()),
             use_starttls: false,
+            insecure_skip_verify: false,
+            ca_certificate: None,
             is_enabled: true,
             priority: 0,
             created_at: now,
@@ -1966,6 +2141,7 @@ mod tests {
             admin_group: Some("admins".to_string()),
             is_enabled: true,
             use_absolute_acs_url: false,
+            map_groups_to_groups: false,
             created_at: now,
             updated_at: now,
         }
@@ -2061,6 +2237,48 @@ mod tests {
     fn test_parse_ldap_url_invalid_port() {
         let result = AuthConfigService::parse_ldap_url("ldap://myhost:notaport");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // bind_result_to_test_result (#2486): the test-connection endpoint must
+    // report the TRUE bind outcome, with generic credential-free messages.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bind_result_mapping_success() {
+        let res = AuthConfigService::bind_result_to_test_result(Ok(()), 12);
+        assert!(res.success);
+        assert_eq!(res.message, "Connection and LDAP bind successful");
+        assert_eq!(res.response_time_ms, 12);
+    }
+
+    #[test]
+    fn test_bind_result_mapping_rejected_bind_is_failure() {
+        // A rejected bind (bad bind DN/password) must NOT report success —
+        // this is the exact bug in #2486, where TCP reachability alone was
+        // reported as "Connection Successful".
+        let res = AuthConfigService::bind_result_to_test_result(
+            Err(AppError::Authentication("Invalid credentials".into())),
+            7,
+        );
+        assert!(!res.success);
+        assert!(res.message.contains("bind DN"));
+        assert_eq!(res.response_time_ms, 7);
+    }
+
+    #[test]
+    fn test_bind_result_mapping_connection_error_is_generic() {
+        // Connection-level details (raw OS/TLS errors) stay server-side.
+        let res = AuthConfigService::bind_result_to_test_result(
+            Err(AppError::Internal(
+                "LDAP connection failed: os error 111 secret-internal-detail".into(),
+            )),
+            3,
+        );
+        assert!(!res.success);
+        assert!(!res.message.contains("secret-internal-detail"));
+        assert!(!res.message.contains("os error"));
+        assert_eq!(res.message, "LDAP connection failed during bind");
     }
 
     // -----------------------------------------------------------------------
@@ -2306,6 +2524,8 @@ mod tests {
             groups_attribute: "memberOf".to_string(),
             admin_group_dn: None,
             use_starttls: false,
+            insecure_skip_verify: false,
+            has_ca_certificate: false,
             is_enabled: true,
             priority: 0,
             created_at: now,
@@ -2314,6 +2534,8 @@ mod tests {
         let json_str = serde_json::to_string(&resp).unwrap();
         assert!(json_str.contains("\"has_bind_password\":true"));
         assert!(json_str.contains("\"use_starttls\":false"));
+        assert!(json_str.contains("\"insecure_skip_verify\":false"));
+        assert!(json_str.contains("\"has_ca_certificate\":false"));
     }
 
     #[test]
@@ -2334,6 +2556,7 @@ mod tests {
             admin_group: None,
             is_enabled: true,
             use_absolute_acs_url: false,
+            map_groups_to_groups: false,
             created_at: now,
             updated_at: now,
         };
@@ -2401,6 +2624,8 @@ mod tests {
             groups_attribute: "memberOf".to_string(),
             admin_group_dn: None,
             use_starttls: false,
+            insecure_skip_verify: false,
+            ca_certificate: None,
             is_enabled: true,
             priority: 0,
             created_at: chrono::Utc::now(),
@@ -2429,6 +2654,7 @@ mod tests {
             admin_group: None,
             is_enabled: true,
             use_absolute_acs_url: false,
+            map_groups_to_groups: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2621,6 +2847,8 @@ mod tests {
             groups_attribute: None,
             admin_group_dn: None,
             use_starttls: Some(true),
+            insecure_skip_verify: Some(true),
+            ca_certificate: Some("-----BEGIN CERTIFICATE-----".to_string()),
             is_enabled: Some(true),
             priority: Some(0),
         };
@@ -2630,6 +2858,11 @@ mod tests {
         assert_eq!(u.user_base_dn, Some("ou=users".to_string()));
         assert_eq!(u.bind_dn, Some("cn=admin".to_string()));
         assert_eq!(u.use_starttls, Some(true));
+        assert_eq!(u.insecure_skip_verify, Some(true));
+        assert_eq!(
+            u.ca_certificate.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----")
+        );
     }
 
     // =======================================================================
@@ -3077,6 +3310,7 @@ mod tests {
                 admin_group: None,
                 is_enabled: Some(true),
                 use_absolute_acs_url: None,
+                map_groups_to_groups: None,
             }
         }
 
@@ -3177,6 +3411,7 @@ mod tests {
                 admin_group: None,
                 is_enabled: None,
                 use_absolute_acs_url: None,
+                map_groups_to_groups: None,
             };
             let updated = AuthConfigService::update_saml(&pool, created.id, update)
                 .await
@@ -3212,6 +3447,7 @@ mod tests {
                 admin_group: None,
                 is_enabled: None,
                 use_absolute_acs_url: Some(false),
+                map_groups_to_groups: None,
             };
             let updated = AuthConfigService::update_saml(&pool, created.id, update)
                 .await
@@ -3261,6 +3497,247 @@ mod tests {
                 "toggle must not zero out the new column (the RETURNING field list pins this)"
             );
             cleanup_saml(&pool, created.id).await;
+        }
+
+        // -------------------------------------------------------------------
+        // SAML map_groups_to_groups column (migration 157, #2333). Same SQL
+        // touchpoints as the use_absolute_acs_url suite above: defaults on
+        // create, explicit create, get round-trip, get_decrypted, update
+        // preserve-existing, update flip, list.
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn test_create_saml_defaults_map_groups_to_groups_to_false() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let req = make_saml_create_req("mg-default");
+            let resp = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            assert!(
+                !resp.map_groups_to_groups,
+                "omitted map_groups_to_groups must default to false (migration 157 invariant)"
+            );
+            cleanup_saml(&pool, resp.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_saml_map_groups_to_groups_round_trips_create_get_decrypted_list() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("mg-roundtrip");
+            req.map_groups_to_groups = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+            assert!(created.map_groups_to_groups);
+
+            let fetched = AuthConfigService::get_saml(&pool, created.id)
+                .await
+                .expect("get_saml");
+            assert!(fetched.map_groups_to_groups);
+
+            // get_saml_decrypted is what saml_acs reads the flag from.
+            let row = AuthConfigService::get_saml_decrypted(&pool, created.id)
+                .await
+                .expect("get_saml_decrypted");
+            assert!(row.map_groups_to_groups);
+
+            let listed = AuthConfigService::list_saml(&pool)
+                .await
+                .expect("list_saml");
+            let found = listed
+                .iter()
+                .find(|r| r.id == created.id)
+                .expect("created row must appear in list_saml");
+            assert!(found.map_groups_to_groups);
+
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_saml_preserves_and_flips_map_groups_to_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_create_req("mg-update");
+            req.map_groups_to_groups = Some(true);
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+
+            // An update that does not mention the flag must preserve it.
+            let update = UpdateSamlConfigRequest {
+                name: Some(format!("mg-renamed-{}", created.id)),
+                entity_id: None,
+                sso_url: None,
+                slo_url: None,
+                certificate: None,
+                name_id_format: None,
+                attribute_mapping: None,
+                sp_entity_id: None,
+                sign_requests: None,
+                require_signed_assertions: None,
+                admin_group: None,
+                is_enabled: None,
+                use_absolute_acs_url: None,
+                map_groups_to_groups: None,
+            };
+            let updated = AuthConfigService::update_saml(&pool, created.id, update)
+                .await
+                .expect("update_saml");
+            assert!(
+                updated.map_groups_to_groups,
+                "map_groups_to_groups must survive an update that does not mention it"
+            );
+
+            // An explicit update must flip it.
+            let flip = UpdateSamlConfigRequest {
+                name: None,
+                entity_id: None,
+                sso_url: None,
+                slo_url: None,
+                certificate: None,
+                name_id_format: None,
+                attribute_mapping: None,
+                sp_entity_id: None,
+                sign_requests: None,
+                require_signed_assertions: None,
+                admin_group: None,
+                is_enabled: None,
+                use_absolute_acs_url: None,
+                map_groups_to_groups: Some(false),
+            };
+            let flipped = AuthConfigService::update_saml(&pool, created.id, flip)
+                .await
+                .expect("update_saml flip");
+            assert!(!flipped.map_groups_to_groups);
+
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        async fn cleanup_ldap(pool: &PgPool, id: Uuid) {
+            let _ = sqlx::query("DELETE FROM ldap_configs WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+
+        fn make_create_ldap_req(suffix: &str) -> CreateLdapConfigRequest {
+            CreateLdapConfigRequest {
+                name: format!("ldap-tls-test-{suffix}"),
+                server_url: "ldaps://ad.test.local:636".to_string(),
+                bind_dn: Some("cn=svc,dc=test,dc=local".to_string()),
+                bind_password: Some("secret".to_string()),
+                user_base_dn: "ou=users,dc=test,dc=local".to_string(),
+                user_filter: None,
+                group_base_dn: None,
+                group_filter: None,
+                email_attribute: None,
+                display_name_attribute: None,
+                username_attribute: None,
+                groups_attribute: None,
+                admin_group_dn: None,
+                use_starttls: None,
+                insecure_skip_verify: None,
+                ca_certificate: None,
+                is_enabled: Some(true),
+                priority: Some(0),
+            }
+        }
+
+        /// #2782: the per-provider TLS trust columns must round-trip through
+        /// create/get and be independently updatable (skip-verify toggle and
+        /// inline CA), including clearing the CA with an empty string.
+        #[tokio::test]
+        async fn test_ldap_tls_options_round_trip_and_update() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+
+            // Defaults: secure-by-default (skip-verify off, no CA).
+            let created = AuthConfigService::create_ldap(&pool, make_create_ldap_req("defaults"))
+                .await
+                .expect("create_ldap");
+            assert!(!created.insecure_skip_verify);
+            assert!(!created.has_ca_certificate);
+
+            // Opt in to both skip-verify and an inline CA.
+            let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+            let enabled = AuthConfigService::update_ldap(
+                &pool,
+                created.id,
+                UpdateLdapConfigRequest {
+                    name: None,
+                    server_url: None,
+                    bind_dn: None,
+                    bind_password: None,
+                    user_base_dn: None,
+                    user_filter: None,
+                    group_base_dn: None,
+                    group_filter: None,
+                    email_attribute: None,
+                    display_name_attribute: None,
+                    username_attribute: None,
+                    groups_attribute: None,
+                    admin_group_dn: None,
+                    use_starttls: None,
+                    insecure_skip_verify: Some(true),
+                    ca_certificate: Some(pem.to_string()),
+                    is_enabled: None,
+                    priority: None,
+                },
+            )
+            .await
+            .expect("update_ldap enable");
+            assert!(enabled.insecure_skip_verify);
+            assert!(enabled.has_ca_certificate);
+
+            // The stored PEM survives a fresh read; the decrypted getter also
+            // exposes it for the login/test-connection paths.
+            let (row, _pw) = AuthConfigService::get_ldap_decrypted(&pool, created.id)
+                .await
+                .expect("get_ldap_decrypted");
+            assert!(row.insecure_skip_verify);
+            assert_eq!(row.ca_certificate.as_deref(), Some(pem));
+
+            // Clearing the CA (empty string) drops it; omitting skip-verify
+            // leaves it unchanged.
+            let cleared = AuthConfigService::update_ldap(
+                &pool,
+                created.id,
+                UpdateLdapConfigRequest {
+                    name: None,
+                    server_url: None,
+                    bind_dn: None,
+                    bind_password: None,
+                    user_base_dn: None,
+                    user_filter: None,
+                    group_base_dn: None,
+                    group_filter: None,
+                    email_attribute: None,
+                    display_name_attribute: None,
+                    username_attribute: None,
+                    groups_attribute: None,
+                    admin_group_dn: None,
+                    use_starttls: None,
+                    insecure_skip_verify: None,
+                    ca_certificate: Some(String::new()),
+                    is_enabled: None,
+                    priority: None,
+                },
+            )
+            .await
+            .expect("update_ldap clear ca");
+            assert!(cleared.insecure_skip_verify);
+            assert!(!cleared.has_ca_certificate);
+
+            cleanup_ldap(&pool, created.id).await;
         }
     }
 }

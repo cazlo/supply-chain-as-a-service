@@ -374,7 +374,12 @@ pub async fn verify_totp(
             AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
                 .user(claims.sub)
                 .resource(claims.sub)
-                .details(serde_json::json!({ "reason": "totp_not_enabled" })),
+                .details_typed(
+                    crate::services::audit_export::details::AuthDetails::failed_login(
+                        None,
+                        Some("totp_not_enabled"),
+                    ),
+                ),
         )
         .await;
         return Err(AppError::Authentication(
@@ -455,10 +460,14 @@ pub async fn verify_totp(
                 AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
                     .user(claims.sub)
                     .resource(claims.sub)
-                    .details(serde_json::json!({
-                        "reason": "invalid_totp_code",
-                        "method": "totp",
-                    })),
+                    .details_typed(crate::services::audit_export::details::AuthDetails {
+                        username: None,
+                        path: None,
+                        method: Some("totp".to_owned()),
+                        reason: Some("invalid_totp_code".to_owned()),
+                        provider: None,
+                        auth_method: None,
+                    }),
             )
             .await;
             return Err(AppError::Authentication("Invalid TOTP code".to_string()));
@@ -1569,8 +1578,10 @@ mod totp_audit_tests {
         )
         .await;
 
-        let enabled = tdh::audit_count(&pool, user_id, "TOTP_ENABLED").await;
-        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for each.
+        let enabled = tdh::audit_count_eventually(&pool, user_id, "TOTP_ENABLED", 1).await;
+        let invalidated =
+            tdh::audit_count_eventually(&pool, user_id, "SESSIONS_INVALIDATED", 1).await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
 
@@ -1611,8 +1622,10 @@ mod totp_audit_tests {
         )
         .await;
 
-        let disabled = tdh::audit_count(&pool, user_id, "TOTP_DISABLED").await;
-        let invalidated = tdh::audit_count(&pool, user_id, "SESSIONS_INVALIDATED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for each.
+        let disabled = tdh::audit_count_eventually(&pool, user_id, "TOTP_DISABLED", 1).await;
+        let invalidated =
+            tdh::audit_count_eventually(&pool, user_id, "SESSIONS_INVALIDATED", 1).await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
 
@@ -1660,8 +1673,9 @@ mod totp_audit_tests {
         )
         .await;
 
-        let logins = tdh::audit_count(&pool, user_id, "LOGIN").await;
-        let failed = tdh::audit_count(&pool, user_id, "LOGIN_FAILED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for each.
+        let logins = tdh::audit_count_eventually(&pool, user_id, "LOGIN", 1).await;
+        let failed = tdh::audit_count_eventually(&pool, user_id, "LOGIN_FAILED", 1).await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
 
@@ -1704,7 +1718,8 @@ mod totp_audit_tests {
         )
         .await;
 
-        let failed = tdh::audit_count(&pool, user_id, "LOGIN_FAILED").await;
+        // #2522: audit writes are fire-and-forget (spawned) — poll for it.
+        let failed = tdh::audit_count_eventually(&pool, user_id, "LOGIN_FAILED", 1).await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
 

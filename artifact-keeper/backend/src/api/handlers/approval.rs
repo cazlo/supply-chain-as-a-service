@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::api::dto::Pagination;
 use crate::api::handlers::promotion::validate_promotion_repos;
-use crate::api::handlers::repositories::require_visible;
+use crate::api::handlers::repositories::{require_repo_id_visible, require_visible};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -444,13 +444,13 @@ pub async fn request_approval(
             .evaluate_artifact(req.artifact_id, source_repo.id)
             .await
         {
-            Ok(eval) => Some(serde_json::json!({
-                "passed": eval.passed,
-                "action": format!("{:?}", eval.action).to_lowercase(),
-                "violations": eval.violations,
-                "cve_summary": eval.cve_summary,
-                "license_summary": eval.license_summary,
-            })),
+            Ok(eval) => Some(build_policy_result_json(
+                eval.passed,
+                &format!("{:?}", eval.action).to_lowercase(),
+                &eval.violations,
+                &eval.cve_summary,
+                &eval.license_summary,
+            )),
             Err(e) => {
                 tracing::warn!("Policy evaluation failed during approval request: {}", e);
                 None
@@ -532,17 +532,32 @@ pub async fn request_approval(
 )]
 pub async fn list_pending_approvals(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<PendingQuery>,
 ) -> Result<Json<ApprovalListResponse>> {
-    let page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).min(100);
-    let offset = ((page - 1) * per_page) as i64;
+    let (page, per_page, offset) = normalize_approval_pagination(query.page, query.per_page);
+
+    // Cross-repo authorization (#2443): when filtered by source repository, gate
+    // on that repo's visibility. The unfiltered form spans every repo, so it is
+    // admin-only (mirrors the health dashboard aggregate).
+    if query.source_repository.is_none() {
+        auth.require_admin()?;
+    }
 
     let (rows, total): (Vec<ApprovalRow>, i64) = if let Some(ref source_key) =
         query.source_repository
     {
         let repo_service = RepositoryService::new(state.db.clone());
-        let source = repo_service.get_by_key(source_key).await?;
+        let source = repo_service
+            .get_by_key(source_key)
+            .await
+            .map_err(|e| match e {
+                AppError::NotFound(_) => {
+                    AppError::NotFound(format!("Repository '{}' not found", source_key))
+                }
+                other => other,
+            })?;
+        require_visible(&source, &Some(auth.clone()), &repo_service).await?;
 
         let rows: Vec<ApprovalRow> = sqlx::query_as(&format!(
                 "{} WHERE pa.status = 'pending' AND pa.source_repo_id = $1 ORDER BY pa.requested_at DESC LIMIT $2 OFFSET $3",
@@ -585,7 +600,7 @@ pub async fn list_pending_approvals(
         (rows, total.0)
     };
 
-    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let total_pages = compute_approval_total_pages(total, per_page);
 
     Ok(Json(ApprovalListResponse {
         items: rows.into_iter().map(|r| r.into_response()).collect(),
@@ -615,6 +630,7 @@ pub async fn list_pending_approvals(
 )]
 pub async fn get_approval(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(approval_id): Path<Uuid>,
 ) -> Result<Json<ApprovalResponse>> {
     let row: ApprovalRow = sqlx::query_as(&format!("{} WHERE pa.id = $1", SELECT_APPROVAL))
@@ -623,6 +639,19 @@ pub async fn get_approval(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Approval request not found".to_string()))?;
+
+    // Cross-repo authorization (#2443): an approval discloses the artifact +
+    // source/target repo pairing. Resolve the source repo (the promotion origin
+    // the write path `request_approval` already gates on) and apply the same
+    // visibility check. A caller who cannot see the source repo gets the SAME
+    // 404 as a missing approval so the id is not a cross-tenant existence oracle.
+    require_repo_id_visible(
+        &state.db,
+        &auth,
+        row.source_repo_id,
+        "Approval request not found",
+    )
+    .await?;
 
     Ok(Json(row.into_response()))
 }
@@ -681,12 +710,7 @@ pub async fn approve_promotion(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Approval request not found".to_string()))?;
 
-    if approval.status != "pending" {
-        return Err(AppError::Conflict(format!(
-            "Approval request has already been {}",
-            approval.status
-        )));
-    }
+    check_reviewable(&approval.status).map_err(AppError::Conflict)?;
 
     // Separation of duties (four-eyes). The requester of a promotion must not be
     // the principal who approves it. Without this an admin-capable principal can
@@ -796,6 +820,22 @@ pub async fn approve_promotion(
         }
     }
 
+    // Cross-repository write guard (#2511): the approval-execute copy re-uses the
+    // SOURCE artifact's flat storage key when writing into the TARGET repo. On a
+    // shared-namespace cloud backend that key may already be owned by a third
+    // repository, so an approval-grant holder could overwrite/collide another
+    // repo's object. This is the same guard the per-format upload handlers apply;
+    // it is skipped for repo-isolated (filesystem) backends. The tenant-access
+    // gate above governs who may execute the approval — this closes the residual
+    // write attribution hole.
+    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+        &state.db,
+        target_repo.id,
+        &target_repo.storage_backend,
+        &artifact.storage_key,
+    )
+    .await?;
+
     // Copy storage content
     let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
     let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
@@ -864,7 +904,7 @@ pub async fn approve_promotion(
     .bind(source_repo.id)
     .bind(target_repo.id)
     .bind(auth.user_id)
-    .bind(serde_json::json!({"approved_via": "approval_workflow", "approval_id": approval_id.to_string()}))
+    .bind(build_promotion_history_metadata(&approval_id.to_string()))
     .bind(&req.notes)
     .execute(&state.db)
     .await
@@ -949,13 +989,7 @@ pub async fn reject_promotion(
 
     match current_status {
         None => return Err(AppError::NotFound("Approval request not found".to_string())),
-        Some((status,)) if status != "pending" => {
-            return Err(AppError::Conflict(format!(
-                "Approval request has already been {}",
-                status
-            )))
-        }
-        _ => {}
+        Some((status,)) => check_reviewable(&status).map_err(AppError::Conflict)?,
     }
 
     let now = Utc::now();
@@ -1008,42 +1042,42 @@ pub async fn reject_promotion(
 )]
 pub async fn list_approval_history(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ApprovalHistoryQuery>,
 ) -> Result<Json<ApprovalListResponse>> {
-    let page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).min(100);
-    let offset = ((page - 1) * per_page) as i64;
+    // Cross-repo authorization (#2443): the unfiltered history spans every repo,
+    // so it is admin-only (mirrors the health dashboard aggregate); the
+    // per-source-repo form is gated on that repo's visibility below.
+    if query.source_repository.is_none() {
+        auth.require_admin()?;
+    }
 
-    // Build WHERE clauses dynamically
-    let mut conditions: Vec<String> = vec![];
-    let mut bind_idx = 1u32;
+    let (page, per_page, offset) = normalize_approval_pagination(query.page, query.per_page);
 
     if let Some(ref status) = query.status {
-        if !["pending", "approved", "rejected"].contains(&status.as_str()) {
-            return Err(AppError::Validation(format!(
-                "Invalid status '{}'. Must be one of: pending, approved, rejected",
-                status
-            )));
-        }
-        conditions.push(format!("pa.status = ${}", bind_idx));
-        bind_idx += 1;
+        validate_approval_status(status).map_err(AppError::Validation)?;
     }
 
     let source_repo_id: Option<Uuid> = if let Some(ref source_key) = query.source_repository {
         let repo_service = RepositoryService::new(state.db.clone());
-        let repo = repo_service.get_by_key(source_key).await?;
-        conditions.push(format!("pa.source_repo_id = ${}", bind_idx));
-        bind_idx += 1;
+        let repo = repo_service
+            .get_by_key(source_key)
+            .await
+            .map_err(|e| match e {
+                AppError::NotFound(_) => {
+                    AppError::NotFound(format!("Repository '{}' not found", source_key))
+                }
+                other => other,
+            })?;
+        require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
         Some(repo.id)
     } else {
         None
     };
 
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conditions.join(" AND "))
-    };
+    let (conditions, bind_idx) =
+        build_history_where_clauses(&query.status, source_repo_id.is_some(), 1);
+    let where_clause = build_where_clause(&conditions);
 
     let list_sql = format!(
         "{}{} ORDER BY pa.requested_at DESC LIMIT ${} OFFSET ${}",
@@ -1082,7 +1116,7 @@ pub async fn list_approval_history(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let total_pages = compute_approval_total_pages(total, per_page);
 
     Ok(Json(ApprovalListResponse {
         items: rows.into_iter().map(|r| r.into_response()).collect(),
@@ -1123,6 +1157,108 @@ pub struct ApprovalApiDoc;
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Pure helpers (single source of truth; unit tests pin these against
+// hardcoded literals so a change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Normalize pagination parameters with defaults and bounds.
+fn normalize_approval_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, i64) {
+    let page = page.unwrap_or(1).max(1);
+    let per_page = per_page.unwrap_or(20).min(100);
+    let offset = ((page - 1) * per_page) as i64;
+    (page, per_page, offset)
+}
+
+/// Compute total pages from total items and per_page.
+fn compute_approval_total_pages(total: i64, per_page: u32) -> u32 {
+    ((total as f64) / (per_page as f64)).ceil() as u32
+}
+
+/// Validate that a status filter is valid for approval queries.
+fn validate_approval_status(status: &str) -> std::result::Result<(), String> {
+    if !["pending", "approved", "rejected"].contains(&status) {
+        return Err(format!(
+            "Invalid status '{}'. Must be one of: pending, approved, rejected",
+            status
+        ));
+    }
+    Ok(())
+}
+
+/// Check if an approval is in a reviewable state (must be "pending").
+fn check_reviewable(current_status: &str) -> std::result::Result<(), String> {
+    if current_status != "pending" {
+        return Err(format!(
+            "Approval request has already been {}",
+            current_status
+        ));
+    }
+    Ok(())
+}
+
+/// Build the policy result JSON from an evaluation result.
+fn build_policy_result_json<V, C, L>(
+    passed: bool,
+    action: &str,
+    violations: &[V],
+    cve_summary: &C,
+    license_summary: &L,
+) -> serde_json::Value
+where
+    V: serde::Serialize,
+    C: serde::Serialize,
+    L: serde::Serialize,
+{
+    serde_json::json!({
+        "passed": passed,
+        "action": action,
+        "violations": violations,
+        "cve_summary": cve_summary,
+        "license_summary": license_summary,
+    })
+}
+
+/// Build the promotion history metadata JSON for an approved promotion.
+fn build_promotion_history_metadata(approval_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "approved_via": "approval_workflow",
+        "approval_id": approval_id,
+    })
+}
+
+/// Build dynamic WHERE clauses for the approval history query.
+/// Returns (conditions, bind_index_after).
+fn build_history_where_clauses(
+    status: &Option<String>,
+    has_source_repo: bool,
+    start_bind_idx: u32,
+) -> (Vec<String>, u32) {
+    let mut conditions = Vec::new();
+    let mut bind_idx = start_bind_idx;
+
+    if status.is_some() {
+        conditions.push(format!("pa.status = ${}", bind_idx));
+        bind_idx += 1;
+    }
+
+    if has_source_repo {
+        conditions.push(format!("pa.source_repo_id = ${}", bind_idx));
+        bind_idx += 1;
+    }
+
+    (conditions, bind_idx)
+}
+
+/// Combine conditions into a SQL WHERE clause string.
+fn build_where_clause(conditions: &[String]) -> String {
+    if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1273,102 +1409,6 @@ mod tests {
                 && body.contains("SET consumed_at = NOW()"),
             "try_consume_approval must claim an approved+unconsumed row via SET consumed_at"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Normalize pagination parameters with defaults and bounds.
-    fn normalize_approval_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, i64) {
-        let page = page.unwrap_or(1).max(1);
-        let per_page = per_page.unwrap_or(20).min(100);
-        let offset = ((page - 1) * per_page) as i64;
-        (page, per_page, offset)
-    }
-
-    /// Compute total pages from total items and per_page.
-    fn compute_approval_total_pages(total: i64, per_page: u32) -> u32 {
-        ((total as f64) / (per_page as f64)).ceil() as u32
-    }
-
-    /// Validate that a status filter is valid for approval queries.
-    fn validate_approval_status(status: &str) -> std::result::Result<(), String> {
-        if !["pending", "approved", "rejected"].contains(&status) {
-            return Err(format!(
-                "Invalid status '{}'. Must be one of: pending, approved, rejected",
-                status
-            ));
-        }
-        Ok(())
-    }
-
-    /// Check if an approval is in a reviewable state (must be "pending").
-    fn check_reviewable(current_status: &str) -> std::result::Result<(), String> {
-        if current_status != "pending" {
-            return Err(format!(
-                "Approval request has already been {}",
-                current_status
-            ));
-        }
-        Ok(())
-    }
-
-    /// Build the policy result JSON from an evaluation result.
-    fn build_policy_result_json(
-        passed: bool,
-        action: &str,
-        violations: &[String],
-        cve_summary: &serde_json::Value,
-        license_summary: &serde_json::Value,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "passed": passed,
-            "action": action,
-            "violations": violations,
-            "cve_summary": cve_summary,
-            "license_summary": license_summary,
-        })
-    }
-
-    /// Build the promotion history metadata JSON for an approved promotion.
-    fn build_promotion_history_metadata(approval_id: &str) -> serde_json::Value {
-        serde_json::json!({
-            "approved_via": "approval_workflow",
-            "approval_id": approval_id,
-        })
-    }
-
-    /// Build dynamic WHERE clauses for the approval history query.
-    /// Returns (conditions, bind_index_after).
-    fn build_history_where_clauses(
-        status: &Option<String>,
-        has_source_repo: bool,
-        start_bind_idx: u32,
-    ) -> (Vec<String>, u32) {
-        let mut conditions = Vec::new();
-        let mut bind_idx = start_bind_idx;
-
-        if status.is_some() {
-            conditions.push(format!("pa.status = ${}", bind_idx));
-            bind_idx += 1;
-        }
-
-        if has_source_repo {
-            conditions.push(format!("pa.source_repo_id = ${}", bind_idx));
-            bind_idx += 1;
-        }
-
-        (conditions, bind_idx)
-    }
-
-    /// Combine conditions into a SQL WHERE clause string.
-    fn build_where_clause(conditions: &[String]) -> String {
-        if conditions.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", conditions.join(" AND "))
-        }
     }
 
     #[test]
@@ -1595,6 +1635,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1621,6 +1662,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1657,6 +1699,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1683,6 +1726,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1718,6 +1762,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1744,6 +1789,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1898,7 +1944,7 @@ mod tests {
 
     #[test]
     fn test_build_policy_result_json_passed() {
-        let json = build_policy_result_json(
+        let json = build_policy_result_json::<String, _, _>(
             true,
             "allow",
             &[],
@@ -1928,7 +1974,7 @@ mod tests {
 
     #[test]
     fn test_build_policy_result_json_all_fields_present() {
-        let json = build_policy_result_json(
+        let json = build_policy_result_json::<String, _, _>(
             true,
             "warn",
             &[],
@@ -2354,6 +2400,93 @@ mod tests {
                 .bind(user)
                 .execute(pool)
                 .await;
+        }
+
+        /// #2443: `get_approval` must gate on the approval's source-repo
+        /// visibility. A caller who cannot see the source repo gets the SAME
+        /// existence-hiding 404 as a missing approval; a member gets 200.
+        #[tokio::test]
+        async fn test_get_approval_cross_tenant_authz_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr2443-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr2443-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "s2443", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "t2443", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let requester = make_requester(&pool, "2443").await;
+            let member = make_requester(&pool, "2443m").await;
+            let outsider = make_requester(&pool, "2443o").await;
+            grant_repo(&pool, member, src).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_string_lossy().as_ref());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "pkg2443").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let denied = get_approval(
+                State(state.clone()),
+                Extension(tdh::make_auth(outsider, "o2443")),
+                Path(approval),
+            )
+            .await;
+            assert!(
+                matches!(denied, Err(AppError::NotFound(_))),
+                "non-member of source repo must 404: {denied:?}"
+            );
+
+            let seen = get_approval(
+                State(state),
+                Extension(tdh::make_auth(member, "m2443")),
+                Path(approval),
+            )
+            .await;
+            assert!(
+                seen.is_ok(),
+                "member of source repo must see approval: {seen:?}"
+            );
+
+            cleanup(&pool, &[src, tgt], requester).await;
+            cleanup_user(&pool, member).await;
+            cleanup_user(&pool, outsider).await;
+        }
+
+        /// #2443: the unfiltered pending-approvals aggregate is admin-only; a
+        /// non-admin gets 403 while an admin gets 200.
+        #[tokio::test]
+        async fn test_list_pending_unfiltered_admin_only_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let user = make_requester(&pool, "2443lp").await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            let denied = list_pending_approvals(
+                State(state.clone()),
+                Extension(tdh::make_auth(user, "lp2443")),
+                Query(PendingQuery {
+                    page: None,
+                    per_page: None,
+                    source_repository: None,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(denied, Err(AppError::Authorization(_))),
+                "unfiltered pending list must be admin-only: {denied:?}"
+            );
+            let admin_ok = list_pending_approvals(
+                State(state),
+                Extension(tdh::admin_auth(user, "lp2443")),
+                Query(PendingQuery {
+                    page: None,
+                    per_page: None,
+                    source_repository: None,
+                }),
+            )
+            .await;
+            assert!(admin_ok.is_ok(), "admin sees the aggregate: {admin_ok:?}");
+            cleanup_user(&pool, user).await;
         }
 
         /// The gap PR #1940 closed: approving a rule-UNMET promotion must be

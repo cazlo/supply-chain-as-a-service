@@ -580,7 +580,7 @@ async fn new_upload_url(
     Path(repo_key): Path<String>,
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic_scope(auth, "pub", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "pub", "write:artifacts")?.user_id;
     let _repo = resolve_pub_repo(&state.db, &repo_key).await?;
 
     let upload_url = format!(
@@ -611,7 +611,7 @@ async fn upload_package(
     base_url: RequestBaseUrl,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "pub", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "pub", "write:artifacts")?.user_id;
     let repo = resolve_pub_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -647,15 +647,19 @@ async fn upload_package(
 
     // Extract pubspec.yaml from the staged archive on disk, decoding the gzip
     // stream incrementally so we never hold the whole archive in memory.
-    let pubspec = extract_pubspec_from_staged(staged.path())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid Pub package: {}", e),
-            )
-                .into_response()
-        })?;
+    // #2561: permit held across the blocking decode, fast-fail 503 on saturation.
+    let pubspec = crate::util::bounded_archive::with_ingest_extraction_async(|| {
+        extract_pubspec_from_staged(staged.path())
+    })
+    .await
+    .map_err(|e| e.into_response())?
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid Pub package: {}", e),
+        )
+            .into_response()
+    })?;
 
     let pkg_name = &pubspec.name;
     let pkg_version = &pubspec.version;
@@ -964,39 +968,24 @@ async fn proxy_pub_meta_get(
 fn extract_pubspec_from_reader<R: std::io::Read>(
     reader: R,
 ) -> Result<crate::formats::r#pub::PubSpec, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    use tar::Archive;
+    // Bound the gzip/tar decompression: total-byte budget + entry-count cap +
+    // per-metadata-entry cap so a crafted package cannot inflate unbounded
+    // during metadata parsing (#2556).
+    let contents = crate::util::bounded_archive::read_metadata_from_tar_gz(reader, |path| {
+        path.file_name()
+            .map(|n| n == "pubspec.yaml")
+            .unwrap_or(false)
+    })
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "pubspec.yaml not found in archive".to_string())?;
 
-    let decoder = GzDecoder::new(reader);
-    let mut archive = Archive::new(decoder);
+    let contents =
+        String::from_utf8(contents).map_err(|e| format!("Failed to read pubspec.yaml: {}", e))?;
 
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("Failed to read archive: {}", e))?;
+    let pubspec: crate::formats::r#pub::PubSpec = serde_yaml::from_str(&contents)
+        .map_err(|e| format!("Failed to parse pubspec.yaml: {}", e))?;
 
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("Failed to read archive entry: {}", e))?;
-        let path = entry
-            .path()
-            .map_err(|e| format!("Failed to read entry path: {}", e))?
-            .to_string_lossy()
-            .to_string();
-
-        if path == "pubspec.yaml" || path.ends_with("/pubspec.yaml") {
-            let mut contents = String::new();
-            entry
-                .read_to_string(&mut contents)
-                .map_err(|e| format!("Failed to read pubspec.yaml: {}", e))?;
-
-            let pubspec: crate::formats::r#pub::PubSpec = serde_yaml::from_str(&contents)
-                .map_err(|e| format!("Failed to parse pubspec.yaml: {}", e))?;
-
-            return Ok(pubspec);
-        }
-    }
-
-    Err("pubspec.yaml not found in archive".to_string())
+    Ok(pubspec)
 }
 
 /// Extract pubspec.yaml from a staged tar.gz archive on disk. The blocking
@@ -1787,6 +1776,114 @@ mod tests {
         fx.teardown().await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The Dart `pub` client reads `archive_url` from the package listing and
+    // fetches the archive from it. The `build_pub_*` unit tests only prove the
+    // builder emits a string; routing that `archive_url` against the REAL router
+    // (mounted where `api::routes` nests it, `/pub`) proves a `pub` client can
+    // download the published package.
+    // -----------------------------------------------------------------------
+
+    /// The pub routes mounted exactly where `api::routes` nests them. The
+    /// advertised `archive_url` is absolute and carries the `/pub` prefix.
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/pub", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request (dropping any fragment).
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_advertised_archive_url_resolves_against_real_router() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+
+        let name = "test_pkg";
+        let version = "1.0.0";
+        let pubspec_yaml = "name: test_pkg\nversion: 1.0.0\n";
+        let mut tar_data = Vec::new();
+        {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use tar::Builder as TarBuilder;
+
+            let encoder = GzEncoder::new(&mut tar_data, Compression::default());
+            let mut tar = TarBuilder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            tar.append_data(&mut header, "pubspec.yaml", pubspec_yaml.as_bytes())
+                .unwrap();
+            let encoder = tar.into_inner().unwrap();
+            encoder.finish().unwrap();
+        }
+        let archive = bytes::Bytes::from(tar_data);
+
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            &format!("pub/{name}/{version}/{name}-{version}.tar.gz"),
+            &format!("{name}/{version}/{name}-{version}.tar.gz"),
+            name,
+            version,
+            "application/gzip",
+            archive.clone(),
+            fx.user_id,
+        )
+        .await;
+
+        let info_path = format!("/pub/{}/api/packages/{}", fx.repo_key, name);
+        let info_doc_url = format!("http://ak.test{info_path}");
+        let (info_status, info_body) = tdh::send(
+            tdh::router_anon(mounted_router(), fx.state.clone()),
+            tdh::get(info_path.clone()),
+        )
+        .await;
+        let info: serde_json::Value = serde_json::from_slice(&info_body).unwrap_or_default();
+        let archive_url = info["versions"][0]["archive_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let (dl_status, dl_body) = if archive_url.is_empty() {
+            (StatusCode::NOT_FOUND, bytes::Bytes::new())
+        } else {
+            let path = resolve_advertised(&info_doc_url, &archive_url);
+            tdh::send(
+                tdh::router_anon(mounted_router(), fx.state.clone()),
+                tdh::get(path),
+            )
+            .await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(info_status, StatusCode::OK, "package info");
+        assert!(
+            !archive_url.is_empty(),
+            "listing must advertise an archive_url"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised archive_url ({archive_url}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            &archive[..],
+            "the advertised archive_url must serve the published package bytes"
+        );
     }
 }
 

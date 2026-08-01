@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::handlers::repositories::require_repo_id_visible;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::repository::RepositoryFormat;
 use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
 use crate::services::repository_service::RepositoryService;
 use crate::services::signing_service::{normalize_key_type, CreateKeyRequest, SigningService};
@@ -34,6 +36,10 @@ pub fn router() -> Router<SharedState> {
             "/repositories/:repo_id/public-key",
             get(get_repo_public_key),
         )
+        // Deliberate per-artifact attestation (#2535). Admin-only, and the SOLE
+        // writer of the `used_for_signing` marker the promotion require_signature
+        // gate reads.
+        .route("/artifacts/:artifact_id/sign", post(sign_artifact))
 }
 
 // --- Request/Response DTOs ---
@@ -126,17 +132,6 @@ async fn create_key(
 ) -> Result<Json<SigningKeyPublic>> {
     require_signing_admin(&auth)?;
 
-    // Validate a repository-scoped key names an existing repository before
-    // handing off to the signing service. Without this, a nonexistent
-    // repository_id hits the FK constraint at INSERT and surfaces as an opaque
-    // 500 DATABASE_ERROR; `get_by_id` returns a clean NotFound (404) instead.
-    // Global keys (repository_id = None) carry no FK and skip the lookup.
-    if let Some(repo_id) = payload.repository_id {
-        RepositoryService::new(state.db.clone())
-            .get_by_id(repo_id)
-            .await?;
-    }
-
     // Normalize the key family / algorithm pair before handing off to the
     // signing service. Clients commonly send the algorithm variant
     // ("rsa2048"/"rsa4096") as the key_type; without normalization that value
@@ -145,6 +140,25 @@ async fn create_key(
     // returns a clean Validation (400) instead.
     let (key_type, algorithm) =
         resolve_key_type_and_algorithm(payload.key_type, payload.algorithm)?;
+
+    // Validate a repository-scoped key names an existing repository before
+    // handing off to the signing service. Without this, a nonexistent
+    // repository_id hits the FK constraint at INSERT and surfaces as an opaque
+    // 500 DATABASE_ERROR; `get_by_id` returns a clean NotFound (404) instead.
+    // Global keys (repository_id = None) carry no FK and skip the lookup.
+    if let Some(repo_id) = payload.repository_id {
+        let repo = RepositoryService::new(state.db.clone())
+            .get_by_id(repo_id)
+            .await?;
+
+        // Fail fast on an impossible signing config (#2651): a repository whose
+        // metadata is OpenPGP-signed (Debian InRelease/Release.gpg, RPM
+        // repomd.xml.asc) can only ever be served with a key_type='gpg' key.
+        // Accepting an rsa/ed25519 key here lets the repo boot green and then
+        // fail every anonymous `apt`/`dnf` metadata poll at request time.
+        // Reject the combination at config time with an actionable error.
+        validate_key_type_for_repo_format(&repo.format, &key_type).map_err(AppError::Validation)?;
+    }
 
     let svc = signing_service(&state);
     let key = svc
@@ -185,6 +199,38 @@ fn resolve_key_type_and_algorithm(
         }
     });
     Ok((family, algorithm))
+}
+
+/// Reject a signing `key_type` that can never satisfy `format`'s metadata
+/// signing, at key-creation (config) time rather than at anonymous request time
+/// (#2651).
+///
+/// Debian (`InRelease`/`Release.gpg`) and RPM (`repomd.xml.asc`) metadata is
+/// signed with OpenPGP (`SigningService::sign_openpgp_*`), which can only load a
+/// `key_type='gpg'` key. An `rsa`/`ed25519` key holds PKCS#8 RSA material that
+/// the OpenPGP path can never parse, so such a key lets the repository boot
+/// green and then fail every `apt`/`dnf` metadata poll — a fail-open config
+/// trap. This turns that latent request-time failure into an actionable 400 at
+/// the point an operator configures the key.
+///
+/// Formats that sign metadata with raw RSA (Conda, Alpine, via
+/// `SigningService::sign_data`) and content-signing formats never need OpenPGP,
+/// so they still accept `rsa`/`ed25519` keys — the guard is scoped to the
+/// OpenPGP metadata formats only.
+fn validate_key_type_for_repo_format(
+    format: &RepositoryFormat,
+    key_type: &str,
+) -> std::result::Result<(), String> {
+    let requires_openpgp = matches!(format, RepositoryFormat::Debian | RepositoryFormat::Rpm);
+    if requires_openpgp && key_type != "gpg" {
+        return Err(format!(
+            "key_type='{key_type}' cannot sign {format:?} repository metadata. \
+             Debian/RPM metadata (InRelease, Release.gpg, repomd.xml.asc) is OpenPGP-signed \
+             and requires a signing key with key_type='gpg'. Supported key_type for this \
+             repository format: gpg."
+        ));
+    }
+    Ok(())
 }
 
 /// Get a signing key by ID.
@@ -288,6 +334,7 @@ async fn rotate_key(
     Extension(auth): Extension<AuthExtension>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<SigningKeyPublic>> {
+    require_signing_admin(&auth)?;
     let svc = signing_service(&state);
     let new_key = svc.rotate_key(key_id, Some(auth.user_id)).await?;
     Ok(Json(new_key))
@@ -335,9 +382,15 @@ async fn get_public_key(
 )]
 async fn get_repo_signing_config(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(repo_id): Path<Uuid>,
 ) -> Result<Json<SigningConfigResponse>> {
+    // Cross-repo authorization (#2443): a repo's signing config reveals whether
+    // signatures are required and which key signs its artifacts. Gate on the
+    // repo's visibility before reading. Missing repo and not-visible repo return
+    // the SAME existence-hiding 404 so the id is not a cross-tenant oracle.
+    require_repo_id_visible(&state.db, &auth, repo_id, "Repository not found").await?;
+
     let svc = signing_service(&state);
     let config = svc.get_signing_config(repo_id).await?;
 
@@ -432,6 +485,95 @@ fn signing_service(state: &SharedState) -> SigningService {
     SigningService::new(state.db.clone(), &state.config.jwt_secret)
 }
 
+/// Response from a deliberate per-artifact signing action (#2535).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SignArtifactResponse {
+    pub artifact_id: Uuid,
+    /// The active signing key that produced the attestation.
+    pub key_id: Uuid,
+    pub algorithm: String,
+    /// SHA-256 of the produced signature blob (the blob itself is not persisted).
+    pub signature_sha256: String,
+}
+
+/// `POST /api/v1/signing/artifacts/{artifact_id}/sign` — produce an authorized
+/// signature over the artifact's content with the repository's active signing
+/// key and record the attestation the promotion `require_signature` gate reads
+/// (#2535).
+///
+/// This is the ONLY writer of the per-artifact `used_for_signing` marker, and
+/// it is admin-gated: an artifact can satisfy `require_signature` only through a
+/// deliberate, authenticated signing action over its bytes — never as a side
+/// effect of an (anonymous) repository-metadata read. Format-agnostic: signs
+/// content bytes, so it works for every hosted format, not just the
+/// metadata-signing ones. Proxy-cached remote artifacts (no `artifacts` row)
+/// cannot be signed and therefore stay fail-closed under `require_signature`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/signing/artifacts/{artifact_id}/sign",
+    tag = "signing",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact ID")
+    ),
+    responses(
+        (status = 200, description = "Artifact signed; attestation recorded", body = SignArtifactResponse),
+        (status = 403, description = "Admin privilege required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Artifact not found or not eligible for signing", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Repository has no active signing key/config", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn sign_artifact(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(artifact_id): Path<Uuid>,
+) -> Result<Json<SignArtifactResponse>> {
+    // Admin-only: writing the attestation the require_signature gate trusts is a
+    // trust-model mutation, same gate as the other signing routes.
+    require_signing_admin(&auth)?;
+
+    // Resolve the artifact and its storage location. Proxy-cached remote objects
+    // are listed with synthetic ids and have no `artifacts` row, so they cannot
+    // be signed -> 404 (fail-closed), consistent with SBOM/scan eligibility.
+    let row: Option<(Uuid, String, String, String)> = sqlx::query_as(
+        "SELECT a.repository_id, a.storage_key, r.storage_backend, r.storage_path
+         FROM artifacts a JOIN repositories r ON r.id = a.repository_id
+         WHERE a.id = $1 AND a.is_deleted = false",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let (repository_id, storage_key, backend, path) = row.ok_or_else(|| {
+        AppError::NotFound(crate::api::handlers::sbom::ARTIFACT_NOT_ANALYZABLE_MSG.to_string())
+    })?;
+
+    // Fetch the artifact bytes and sign the content.
+    let location = crate::storage::StorageLocation { backend, path };
+    let storage = state.storage_for_repo(&location)?;
+    let content = storage.get(&storage_key).await.map_err(|e| {
+        AppError::NotFound(format!("Artifact content unavailable for signing: {e}"))
+    })?;
+
+    let signed = signing_service(&state)
+        .sign_artifact_content(repository_id, artifact_id, &content, Some(auth.user_id))
+        .await?
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "Repository has no active signing key or signing config; configure one before signing artifacts"
+                    .to_string(),
+            )
+        })?;
+
+    Ok(Json(SignArtifactResponse {
+        artifact_id,
+        key_id: signed.key_id,
+        algorithm: signed.algorithm,
+        signature_sha256: signed.signature_sha256,
+    }))
+}
+
 /// Admin gate shared by the signing-key/repo-config mutation handlers.
 ///
 /// Minting, deleting, revoking, rotating a repository signing key, or writing
@@ -471,6 +613,7 @@ fn signing_config_fields(
         get_repo_signing_config,
         update_repo_signing_config,
         get_repo_public_key,
+        sign_artifact,
     ),
     components(schemas(
         ListKeysQuery,
@@ -478,6 +621,7 @@ fn signing_config_fields(
         UpdateSigningConfigPayload,
         KeyListResponse,
         SigningConfigResponse,
+        SignArtifactResponse,
     ))
 )]
 pub struct SigningApiDoc;
@@ -507,6 +651,58 @@ mod tests {
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
             iat_ms: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2651: reject an impossible signing config (rsa/ed25519 key on a repo
+    // whose metadata can only be OpenPGP-signed) at key-creation time.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_debian_rejects_rsa_key_type() {
+        // An rsa key holds PKCS#8 RSA material and can never produce the OpenPGP
+        // InRelease/Release.gpg signatures a Debian repo serves, so it must be
+        // rejected at config time rather than failing every anonymous apt poll.
+        let err = validate_key_type_for_repo_format(&RepositoryFormat::Debian, "rsa")
+            .expect_err("rsa must be rejected for Debian metadata signing");
+        assert!(
+            err.contains("rsa"),
+            "error must name the offending key_type: {err}"
+        );
+        assert!(
+            err.contains("gpg"),
+            "error must name the supported key_type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rpm_rejects_rsa_key_type() {
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Rpm, "rsa").is_err());
+    }
+
+    #[test]
+    fn test_debian_rejects_ed25519_key_type() {
+        // ed25519 is not an OpenPGP key either (and is not even generated as a
+        // real ed25519 key — it falls through to RSA keygen), so it also cannot
+        // satisfy the Debian/RPM OpenPGP metadata path.
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Debian, "ed25519").is_err());
+    }
+
+    #[test]
+    fn test_debian_accepts_gpg_key_type() {
+        // gpg is the only key_type the OpenPGP metadata path can load.
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Debian, "gpg").is_ok());
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Rpm, "gpg").is_ok());
+    }
+
+    #[test]
+    fn test_non_openpgp_format_accepts_rsa_key_type() {
+        // Conda/Alpine sign metadata with raw RSA (sign_data), and content-signing
+        // formats never need OpenPGP, so rsa/ed25519 keys stay valid there — the
+        // guard is scoped to the OpenPGP metadata formats only.
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Conda, "rsa").is_ok());
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Alpine, "rsa").is_ok());
+        assert!(validate_key_type_for_repo_format(&RepositoryFormat::Maven, "ed25519").is_ok());
     }
 
     fn admin_jwt() -> AuthExtension {
@@ -580,6 +776,130 @@ mod tests {
         // handlers enforce, so signing-key management still works.
         let ext = admin_jwt();
         assert!(require_signing_admin(&ext).is_ok());
+    }
+
+    /// Source of an `async fn <name>(...)` handler body in this file, sliced up
+    /// to the next `\nasync fn ` boundary. Shared by the admin-gate regression
+    /// guards so a direct predicate test cannot miss the gate being dropped
+    /// from an individual handler (the exact regression class of #1784/#2513).
+    fn signing_handler_body(name: &str) -> &'static str {
+        let src = include_str!("signing.rs");
+        let start = src
+            .find(&format!("async fn {name}("))
+            .unwrap_or_else(|| panic!("{name} handler must exist"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn test_non_admin_blocked_from_rotating_signing_key() {
+        // Regression for #2513: rotate_key previously omitted the admin gate
+        // that create_key, delete_key, revoke_key, and update_repo_signing_config
+        // enforce, letting a non-admin JWT rotate any signing key via
+        // POST /api/v1/signing/keys/{id}/rotate — which deactivates the old key
+        // AND repoints repository_signing_config to a fresh key, moving the repo
+        // trust anchor. rotate_key now calls require_signing_admin(&auth)? first.
+        // (1) sanity: the gate itself rejects a non-admin.
+        let ext = non_admin_jwt();
+        match require_signing_admin(&ext) {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!(
+                "expected 403 Authorization for non-admin rotate, got {:?}",
+                other
+            ),
+        }
+        // (2) load-bearing assertion: pin that `rotate_key` ITSELF calls the
+        // gate. A bare predicate check (1) does NOT catch the gate being dropped
+        // from `rotate_key` — which is exactly the #2513 regression. Assert the
+        // gate appears inside rotate_key's body so removing it fails the suite.
+        assert!(
+            signing_handler_body("rotate_key").contains("require_signing_admin"),
+            "rotate_key MUST call require_signing_admin (admin gate) — #2513 regression guard"
+        );
+    }
+
+    #[test]
+    fn test_admin_allowed_to_rotate_signing_key() {
+        // Legitimate use: an admin passes the same gate, so key rotation still
+        // works for the intended (admin) caller.
+        assert!(require_signing_admin(&admin_jwt()).is_ok());
+    }
+
+    #[test]
+    fn test_every_signing_mutation_handler_requires_admin() {
+        // Uniform-gate guard: every state-changing signing handler must call
+        // require_signing_admin. This is the load-bearing invariant behind both
+        // #1784 (revoke) and #2513 (rotate) — a future mutation added to this
+        // surface cannot silently forget the admin gate without failing here.
+        for name in [
+            "create_key",
+            "delete_key",
+            "revoke_key",
+            "rotate_key",
+            "update_repo_signing_config",
+            "sign_artifact",
+        ] {
+            assert!(
+                signing_handler_body(name).contains("require_signing_admin"),
+                "{name} MUST call require_signing_admin (admin gate) — CWE-862 regression guard"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openapi_paths_all_have_non_empty_tags() {
+        // #2721: the exported OpenAPI operation for POST
+        // /signing/artifacts/{id}/sign must carry a non-empty `tags` array.
+        // Spectral's error-severity `operation-tags` rule fails the SDK
+        // generation pipeline on any operation with `tags: []`, so every path
+        // in this doc must be tagged — pin the whole surface, not just the one
+        // handler that regressed, so a future untagged sibling also trips here.
+        let doc = serde_json::to_value(SigningApiDoc::openapi())
+            .expect("SigningApiDoc serializes to JSON");
+        let paths = doc["paths"]
+            .as_object()
+            .expect("openapi doc has a paths object");
+        assert!(
+            !paths.is_empty(),
+            "signing doc must expose at least one path"
+        );
+        for (path, item) in paths {
+            let operations = item.as_object().expect("path item is an object");
+            for method in ["get", "post", "put", "delete", "patch", "head", "options"] {
+                let Some(op) = operations.get(method) else {
+                    continue;
+                };
+                let tags = op["tags"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{method} {path} must declare a tags array"));
+                assert!(
+                    !tags.is_empty(),
+                    "{method} {path} must have a non-empty tags array (#2721)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_admin_blocked_from_signing_artifact() {
+        // #2535: POST /signing/artifacts/{id}/sign is the SOLE writer of the
+        // used_for_signing marker the promotion require_signature gate reads.
+        // It must be admin-only, or an unprivileged caller could attest an
+        // artifact and bypass the gate.
+        // (1) the gate rejects a non-admin.
+        match require_signing_admin(&non_admin_jwt()) {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!("expected 403 Authorization for non-admin sign, got {other:?}"),
+        }
+        // (2) load-bearing: pin that sign_artifact ITSELF calls the gate.
+        assert!(
+            signing_handler_body("sign_artifact").contains("require_signing_admin"),
+            "sign_artifact MUST call require_signing_admin (admin gate) — #2535 bypass guard"
+        );
     }
 
     #[test]
@@ -1078,5 +1398,60 @@ mod tests {
             .bind(user_id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #2443: get_repo_signing_config must gate on repo visibility. A non-member
+    // gets an existence-hiding 404; a member (and admin, and public) gets 200.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_repo_signing_config_cross_tenant_authz_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (member, mname) = tdh::create_user(&pool).await;
+        let (outsider, oname) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, member).await;
+        let sdir = std::env::temp_dir().join(format!("sk2443-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+
+        let denied = get_repo_signing_config(
+            State(state.clone()),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(repo_id),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "non-member must 404: {denied:?}"
+        );
+
+        let seen = get_repo_signing_config(
+            State(state.clone()),
+            Extension(tdh::make_auth(member, &mname)),
+            Path(repo_id),
+        )
+        .await;
+        assert!(seen.is_ok(), "member must see signing config: {seen:?}");
+
+        // Public flip: an unrelated user now passes the gate.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let public = get_repo_signing_config(
+            State(state),
+            Extension(tdh::make_auth(outsider, &oname)),
+            Path(repo_id),
+        )
+        .await;
+        assert!(public.is_ok(), "public repo config is visible: {public:?}");
+
+        tdh::cleanup(&pool, repo_id, member).await;
+        tdh::cleanup_user(&pool, outsider).await;
     }
 }

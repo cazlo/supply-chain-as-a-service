@@ -50,7 +50,7 @@ fn visible_groups_predicate(group_id_expr: &str, user_param: &str) -> String {
             SELECT 1 FROM permissions p
             WHERE p.target_type = 'group' AND p.target_id = {group_id_expr}
               AND (
-                (p.principal_type = 'user' AND p.principal_id = {user_param})
+                (p.principal_type IN ('user', 'service_account') AND p.principal_id = {user_param})
                 OR (p.principal_type = 'group' AND p.principal_id IN (
                     SELECT group_id FROM user_group_members WHERE user_id = {user_param}
                 ))
@@ -103,6 +103,8 @@ pub struct GroupRow {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
+    /// SSO provider owning the group (`oidc`/`saml`/`ldap`); `None` for local groups. IdP owns membership (#2874).
+    pub external_source: Option<String>,
     pub member_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -113,6 +115,8 @@ pub struct GroupResponse {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
+    /// See [`GroupRow::external_source`]; lets the frontend disable member editing for SSO groups.
+    pub external_source: Option<String>,
     pub member_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -124,6 +128,7 @@ impl From<GroupRow> for GroupResponse {
             id: row.id,
             name: row.name,
             description: row.description,
+            external_source: row.external_source,
             member_count: row.member_count,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -233,7 +238,7 @@ pub async fn list_groups(
     };
     let select_sql = format!(
         r#"
-        SELECT g.id, g.name, g.description, g.created_at, g.updated_at,
+        SELECT g.id, g.name, g.description, g.external_source, g.created_at, g.updated_at,
                COALESCE(COUNT(ugm.user_id), 0) as member_count
         FROM groups g
         LEFT JOIN user_group_members ugm ON ugm.group_id = g.id
@@ -299,6 +304,7 @@ pub struct CreatedGroupRow {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
+    pub external_source: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -353,7 +359,7 @@ pub async fn create_group(
         r#"
         INSERT INTO groups (name, description)
         VALUES ($1, $2)
-        RETURNING id, name, description, created_at, updated_at
+        RETURNING id, name, description, external_source, created_at, updated_at
         "#,
     )
     .bind(&payload.name)
@@ -375,6 +381,7 @@ pub async fn create_group(
         id: group.id,
         name: group.name,
         description: group.description,
+        external_source: group.external_source,
         member_count: 0,
         created_at: group.created_at,
         updated_at: group.updated_at,
@@ -432,7 +439,7 @@ pub async fn get_group(
     };
     let group_sql = format!(
         r#"
-        SELECT g.id, g.name, g.description, g.created_at, g.updated_at,
+        SELECT g.id, g.name, g.description, g.external_source, g.created_at, g.updated_at,
                COALESCE(COUNT(ugm.user_id), 0) as member_count
         FROM groups g
         LEFT JOIN user_group_members ugm ON ugm.group_id = g.id
@@ -529,7 +536,7 @@ pub async fn update_group(
         UPDATE groups
         SET name = $2, description = $3, updated_at = NOW()
         WHERE id = $1
-        RETURNING id, name, description, created_at, updated_at
+        RETURNING id, name, description, external_source, created_at, updated_at
         "#,
     )
     .bind(id)
@@ -553,6 +560,7 @@ pub async fn update_group(
         id: group.id,
         name: group.name,
         description: group.description,
+        external_source: group.external_source,
         member_count,
         created_at: group.created_at,
         updated_at: group.updated_at,
@@ -619,6 +627,29 @@ pub struct MembersRequest {
     pub user_ids: Vec<Uuid>,
 }
 
+/// Gate local membership edits from an `external_source` lookup: outer `None`=no group (404),
+/// inner `None`=local (ok), `Some(idp)`=SSO-owned so reject (#2874, IdP owns its membership).
+fn check_membership_editable(external_source: Option<Option<String>>) -> Result<()> {
+    match external_source {
+        None => Err(AppError::NotFound("Group not found".to_string())),
+        Some(None) => Ok(()),
+        Some(Some(source)) => Err(AppError::Conflict(format!(
+            "Group membership is managed by {source} and must be changed in your identity provider"
+        ))),
+    }
+}
+
+/// Look up a group's `external_source` and enforce [`check_membership_editable`].
+async fn ensure_membership_editable(db: &sqlx::PgPool, id: Uuid) -> Result<()> {
+    let external_source =
+        sqlx::query_scalar::<_, Option<String>>("SELECT external_source FROM groups WHERE id = $1")
+            .bind(id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    check_membership_editable(external_source)
+}
+
 /// Add members to a group
 #[utoipa::path(
     post,
@@ -660,6 +691,8 @@ pub async fn add_members(
             ));
         }
     }
+
+    ensure_membership_editable(&state.db, id).await?;
 
     for user_id in payload.user_ids {
         sqlx::query(
@@ -722,6 +755,8 @@ pub async fn remove_members(
             ));
         }
     }
+
+    ensure_membership_editable(&state.db, id).await?;
 
     for user_id in payload.user_ids {
         sqlx::query("DELETE FROM user_group_members WHERE user_id = $1 AND group_id = $2")
@@ -948,6 +983,7 @@ mod tests {
             id,
             name: "developers".to_string(),
             description: Some("Dev team".to_string()),
+            external_source: Some("oidc".to_string()),
             member_count: 5,
             created_at: now,
             updated_at: now,
@@ -956,6 +992,7 @@ mod tests {
         assert_eq!(resp.id, id);
         assert_eq!(resp.name, "developers");
         assert_eq!(resp.description, Some("Dev team".to_string()));
+        assert_eq!(resp.external_source, Some("oidc".to_string()));
         assert_eq!(resp.member_count, 5);
     }
 
@@ -966,6 +1003,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "ops".to_string(),
             description: None,
+            external_source: None,
             member_count: 0,
             created_at: now,
             updated_at: now,
@@ -987,6 +1025,7 @@ mod tests {
             id,
             name: "admins".to_string(),
             description: Some("Admin group".to_string()),
+            external_source: None,
             member_count: 3,
             created_at: now,
             updated_at: now,
@@ -1004,6 +1043,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "test".to_string(),
             description: None,
+            external_source: None,
             member_count: 0,
             created_at: now,
             updated_at: now,
@@ -1080,6 +1120,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 name: "team".to_string(),
                 description: None,
+                external_source: None,
                 member_count: 2,
                 created_at: now,
                 updated_at: now,
@@ -1173,6 +1214,7 @@ mod tests {
                 id: Uuid::nil(),
                 name: "dev".to_string(),
                 description: Some("Developers".to_string()),
+                external_source: None,
                 member_count: 2,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -1199,6 +1241,7 @@ mod tests {
                 id: Uuid::nil(),
                 name: "admins".to_string(),
                 description: None,
+                external_source: None,
                 member_count: 2,
                 created_at: now,
                 updated_at: now,
@@ -1235,6 +1278,7 @@ mod tests {
                 id: Uuid::nil(),
                 name: "empty".to_string(),
                 description: None,
+                external_source: None,
                 member_count: 0,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -1257,6 +1301,7 @@ mod tests {
                 id,
                 name: "ops".to_string(),
                 description: Some("Operations".to_string()),
+                external_source: None,
                 member_count: 1,
                 created_at: now,
                 updated_at: now,
@@ -1288,6 +1333,7 @@ mod tests {
                 id: Uuid::nil(),
                 name: "large".to_string(),
                 description: None,
+                external_source: None,
                 member_count: 500,
                 created_at: now,
                 updated_at: now,
@@ -1456,6 +1502,26 @@ mod tests {
     }
 
     #[test]
+    fn test_membership_editable_local_group_ok() {
+        // external_source IS NULL -> operator-managed -> editable.
+        assert!(check_membership_editable(Some(None)).is_ok());
+    }
+
+    #[test]
+    fn test_membership_editable_sso_group_rejected() {
+        // external_source set -> owned by the IdP -> 409 Conflict (#2874).
+        let err = check_membership_editable(Some(Some("oidc".to_string()))).unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)));
+    }
+
+    #[test]
+    fn test_membership_editable_missing_group_not_found() {
+        // no row -> 404, matching the other group handlers.
+        let err = check_membership_editable(None).unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
     fn test_remove_members_permission_admin_bypasses() {
         let auth = make_auth(true);
         assert!(check_permission_gate(auth.is_admin, &[], "admin"));
@@ -1577,7 +1643,9 @@ mod tests {
         let sql = visible_groups_predicate("g.id", "$2");
         assert!(sql.contains("FROM permissions p"));
         assert!(sql.contains("p.target_type = 'group'"));
-        assert!(sql.contains("p.principal_type = 'user'"));
+        // Direct-principal arm honours both human users and service accounts
+        // (both reference `users(id)` and are keyed by the caller's own id).
+        assert!(sql.contains("p.principal_type IN ('user', 'service_account')"));
         assert!(sql.contains("p.principal_type = 'group'"));
     }
 
@@ -1722,14 +1790,86 @@ mod tests {
             "admin must read any group"
         );
 
+        // #2503 (finding 2): a *direct* service_account-typed grant on a group
+        // must surface that group in the SA's list_groups (not just group-mediated
+        // repo access). The SA is a non-member of `other`, so only the grant can
+        // make it visible; `visible_groups_predicate`'s
+        // `principal_type IN ('user','service_account')` arm is what carries it.
+        let sa_id = Uuid::new_v4();
+        let sa_username = format!("ph-grp-sa-{sa_id}");
+        sqlx::query(
+            r#"INSERT INTO users
+                 (id, username, email, password_hash, auth_provider,
+                  is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, 'unused', 'local', false, true, true)"#,
+        )
+        .bind(sa_id)
+        .bind(&sa_username)
+        .bind(format!("{sa_username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("seed service account");
+        let grant_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO permissions
+                 (id, principal_type, principal_id, target_type, target_id, actions)
+               VALUES ($1, 'service_account', $2, 'group', $3, ARRAY['read'])"#,
+        )
+        .bind(grant_id)
+        .bind(sa_id)
+        .bind(other)
+        .execute(&pool)
+        .await
+        .expect("seed direct SA->group grant");
+
+        let sa_auth = AuthExtension {
+            is_service_account: true,
+            is_api_token: true,
+            ..tdh::make_auth(sa_id, &sa_username)
+        };
+        let sa_listed = list_groups(
+            State(state.clone()),
+            Extension(Some(sa_auth.clone())),
+            Query(list_q()),
+        )
+        .await
+        .expect("SA list ok")
+        .0;
+        let sa_names: Vec<&str> = sa_listed.items.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            sa_names.contains(&other_name.as_str()),
+            "a direct service_account grant on a group must surface it in list_groups: {sa_names:?}"
+        );
+        assert!(
+            !sa_names.contains(&mine_name.as_str()),
+            "SA must NOT see a group it neither belongs to nor holds a grant on: {sa_names:?}"
+        );
+        // get_group over the same direct grant also resolves (not a NotFound leak-avoider).
+        assert!(
+            get_group(
+                State(state.clone()),
+                Extension(Some(sa_auth)),
+                Path(other),
+                Query(get_q()),
+            )
+            .await
+            .is_ok(),
+            "direct SA grant must also make get_group succeed"
+        );
+
         // cleanup (user_group_members cascades on group/user delete).
+        let _ = sqlx::query("DELETE FROM permissions WHERE id = $1")
+            .bind(grant_id)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query("DELETE FROM groups WHERE id IN ($1, $2)")
             .bind(mine)
             .bind(other)
             .execute(&pool)
             .await;
-        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        let _ = sqlx::query("DELETE FROM users WHERE id IN ($1, $2)")
             .bind(user_id)
+            .bind(sa_id)
             .execute(&pool)
             .await;
     }

@@ -37,12 +37,24 @@ pub struct LdapConfig {
     pub display_name_attr: String,
     /// Attribute containing group memberships
     pub groups_attr: String,
+    /// Base DN for group searches / scoping (e.g., ou=groups,dc=example,dc=com).
+    /// When set, group synchronization is enabled (issue #2468).
+    pub group_base_dn: Option<String>,
+    /// Group search filter pattern. `{0}`/`{dn}` expand to the user's DN,
+    /// `{1}`/`{username}` to the username.
+    pub group_filter: Option<String>,
+    /// Attribute that names a group (default `cn`).
+    pub group_name_attr: String,
     /// Group DN for admin role mapping
     pub admin_group_dn: Option<String>,
     /// Use STARTTLS
     pub use_starttls: bool,
     /// Path to a PEM file with custom CA certificates for LDAPS/STARTTLS
     pub ca_cert_path: Option<String>,
+    /// Inline PEM CA certificate(s) trusted for this provider's LDAPS/STARTTLS
+    /// handshake (per-provider config, issue #2782). Takes precedence over
+    /// `ca_cert_path` when set.
+    pub ca_cert_pem: Option<String>,
     /// Skip TLS certificate verification (development only)
     pub no_tls_verify: bool,
 }
@@ -57,6 +69,9 @@ redacted_debug!(LdapConfig {
     show email_attr,
     show display_name_attr,
     show groups_attr,
+    show group_base_dn,
+    show group_filter,
+    show group_name_attr,
     show admin_group_dn,
     show use_starttls,
     show ca_cert_path,
@@ -76,6 +91,14 @@ impl LdapConfig {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
         (ca_cert_path, no_tls_verify)
+    }
+
+    /// Attribute that names a group, from `LDAP_GROUP_ATTRIBUTE` (default `cn`).
+    fn group_name_attr_from_env() -> String {
+        std::env::var("LDAP_GROUP_ATTRIBUTE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "cn".to_string())
     }
 
     /// Create LDAP config from application config
@@ -98,11 +121,19 @@ impl LdapConfig {
                 .unwrap_or_else(|_| "cn".to_string()),
             groups_attr: std::env::var("LDAP_GROUPS_ATTR")
                 .unwrap_or_else(|_| "memberOf".to_string()),
+            group_base_dn: std::env::var("LDAP_GROUP_BASE_DN")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            group_filter: std::env::var("LDAP_GROUP_FILTER")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            group_name_attr: Self::group_name_attr_from_env(),
             admin_group_dn: std::env::var("LDAP_ADMIN_GROUP_DN").ok(),
             use_starttls: std::env::var("LDAP_USE_STARTTLS")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             ca_cert_path,
+            ca_cert_pem: None,
             no_tls_verify,
         })
     }
@@ -175,20 +206,43 @@ impl LdapService {
     #[allow(clippy::too_many_arguments)]
     pub fn from_db_config(
         db: PgPool,
-        _name: &str,
+        name: &str,
         server_url: &str,
         bind_dn: Option<&str>,
         bind_password: Option<&str>,
         user_base_dn: &str,
         user_filter: &str,
+        group_base_dn: Option<&str>,
+        group_filter: Option<&str>,
         username_attr: &str,
         email_attr: &str,
         display_name_attr: &str,
         groups_attr: &str,
         admin_group_dn: Option<&str>,
         use_starttls: bool,
+        insecure_skip_verify: bool,
+        ca_cert_pem: Option<&str>,
     ) -> Self {
-        let (ca_cert_path, no_tls_verify) = LdapConfig::tls_from_env();
+        // Environment variables remain a deployment-wide fallback: the
+        // effective skip-verify is the per-provider toggle OR the env flag,
+        // and an inline per-provider CA (#2782) takes precedence over the
+        // env-configured CA file path.
+        let (env_ca_cert_path, env_no_tls_verify) = LdapConfig::tls_from_env();
+        let no_tls_verify = insecure_skip_verify || env_no_tls_verify;
+        let ca_cert_pem = ca_cert_pem.filter(|v| !v.is_empty()).map(String::from);
+        let ca_cert_path = if ca_cert_pem.is_some() {
+            None
+        } else {
+            env_ca_cert_path
+        };
+        if no_tls_verify {
+            tracing::warn!(
+                provider = %name,
+                "LDAP TLS certificate verification is DISABLED for this provider \
+                 (insecure skip-verify). Connections are vulnerable to \
+                 man-in-the-middle attacks; do not use in production."
+            );
+        }
         let config = LdapConfig {
             url: server_url.to_string(),
             base_dn: user_base_dn.to_string(),
@@ -199,9 +253,13 @@ impl LdapService {
             email_attr: email_attr.to_string(),
             display_name_attr: display_name_attr.to_string(),
             groups_attr: groups_attr.to_string(),
+            group_base_dn: group_base_dn.filter(|v| !v.is_empty()).map(String::from),
+            group_filter: group_filter.filter(|v| !v.is_empty()).map(String::from),
+            group_name_attr: LdapConfig::group_name_attr_from_env(),
             admin_group_dn: admin_group_dn.map(String::from),
             use_starttls,
             ca_cert_path,
+            ca_cert_pem,
             no_tls_verify,
         };
         Self {
@@ -465,9 +523,12 @@ impl LdapService {
 
     /// Build LDAP connection settings with TLS configuration.
     ///
-    /// Supports custom CA certificates via `LDAP_CA_CERT_PATH` (or the shared
-    /// `CUSTOM_CA_CERT_PATH` as fallback) and `LDAP_INSECURE_TLS=true` to skip
-    /// certificate verification for development environments.
+    /// Custom CA certificates come from either an inline per-provider PEM
+    /// (`ca_cert_pem`, #2782) or the `LDAP_CA_CERT_PATH` (or shared
+    /// `CUSTOM_CA_CERT_PATH`) environment fallback; the inline value takes
+    /// precedence. `no_tls_verify` (per-provider skip-verify OR
+    /// `LDAP_INSECURE_TLS=true`) skips certificate verification for
+    /// development environments.
     fn build_conn_settings(&self) -> Result<ldap3::LdapConnSettings> {
         use std::time::Duration;
 
@@ -476,12 +537,23 @@ impl LdapService {
             .set_starttls(self.config.use_starttls)
             .set_no_tls_verify(self.config.no_tls_verify);
 
-        if let Some(ca_path) = &self.config.ca_cert_path {
+        // Inline per-provider PEM wins over the env-configured CA file path.
+        let ca_source: Option<(Vec<u8>, String)> = if let Some(pem) = &self.config.ca_cert_pem {
+            Some((
+                pem.as_bytes().to_vec(),
+                "inline provider configuration".to_string(),
+            ))
+        } else if let Some(ca_path) = &self.config.ca_cert_path {
             let pem_bytes = std::fs::read(ca_path).map_err(|e| {
                 AppError::Config(format!("Failed to read LDAP CA cert at {ca_path}: {e}"))
             })?;
+            Some((pem_bytes, ca_path.clone()))
+        } else {
+            None
+        };
 
-            let certs = Self::parse_pem_certificates(&pem_bytes, ca_path)?;
+        if let Some((pem_bytes, source)) = ca_source {
+            let certs = Self::parse_pem_certificates(&pem_bytes, &source)?;
             let mut builder = native_tls::TlsConnector::builder();
             for cert in &certs {
                 builder.add_root_certificate(cert.clone());
@@ -494,7 +566,7 @@ impl LdapService {
                 .map_err(|e| AppError::Config(format!("Failed to build TLS connector: {e}")))?;
             settings = settings.set_connector(connector);
             tracing::info!(
-                path = %ca_path,
+                source = %source,
                 count = certs.len(),
                 "Loaded custom CA certificate(s) for LDAP"
             );
@@ -571,11 +643,17 @@ impl LdapService {
             .and_then(|v| v.first())
             .cloned();
 
+        // Prefer the exact attribute key (preserves server-returned order for
+        // existing deployments). Active Directory returns large multi-valued
+        // attributes under a ranged key instead (e.g. `memberOf;range=0-1499`,
+        // range retrieval), which the exact lookup misses — fall back to
+        // collecting those values so users in many groups still get their
+        // memberships (issue #2468).
         let groups = entry
             .attrs
             .get(&self.config.groups_attr)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| Self::ranged_attr_values(&entry.attrs, &self.config.groups_attr));
 
         let resolved_username = entry
             .attrs
@@ -698,6 +776,225 @@ impl LdapService {
             .replace('\0', "\\00")
     }
 
+    /// Collect values of a multi-valued attribute returned under Active
+    /// Directory range-retrieval keys (e.g. `memberOf;range=0-1499`).
+    ///
+    /// Keys are matched case-insensitively. Values are sorted for
+    /// deterministic output because `attrs` is an unordered map.
+    fn ranged_attr_values(
+        attrs: &std::collections::HashMap<String, Vec<String>>,
+        name: &str,
+    ) -> Vec<String> {
+        let lname = name.to_ascii_lowercase();
+        let mut out: Vec<String> = attrs
+            .iter()
+            .filter(|(k, _)| {
+                let kl = k.to_ascii_lowercase();
+                kl == lname || (kl.starts_with(&lname) && kl[lname.len()..].starts_with(";range="))
+            })
+            .flat_map(|(_, v)| v.iter().cloned())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Whether group synchronization is configured for this provider
+    /// (issue #2468): a group base DN and/or a group filter is present.
+    pub fn group_sync_configured(&self) -> bool {
+        self.config.group_base_dn.is_some() || self.config.group_filter.is_some()
+    }
+
+    /// Resolve the names of the groups a user belongs to (issue #2468).
+    ///
+    /// Two complementary sources are merged:
+    ///
+    /// 1. The `memberOf` values from the user's own entry (`member_of`) —
+    ///    the Active Directory default, also available on OpenLDAP with the
+    ///    memberOf overlay. Values are group DNs; when `group_base_dn` is
+    ///    configured only DNs under that base are kept, and each DN's first
+    ///    RDN value (the group's `cn`) becomes the group name.
+    /// 2. A group-entry search under `group_base_dn` using the configured
+    ///    `group_filter` (or a default covering RFC 4519 `groupOfNames` /
+    ///    `groupOfUniqueNames`, `posixGroup` and AD `member`). This covers
+    ///    directories without user-side `memberOf`, and lets operators
+    ///    resolve nested AD groups by using the matching-rule-in-chain
+    ///    filter `(member:1.2.840.113556.1.4.1941:={0})`.
+    ///
+    /// Group-search failures are logged and skipped rather than propagated so
+    /// login never breaks on a partially configured directory: whatever came
+    /// from `memberOf` is still returned.
+    pub async fn resolve_group_names(
+        &self,
+        user_dn: &str,
+        username: &str,
+        member_of: &[String],
+    ) -> Vec<String> {
+        let mut names = std::collections::BTreeSet::new();
+
+        for group_dn in member_of {
+            if let Some(base) = &self.config.group_base_dn {
+                if !Self::dn_under_base(group_dn, base) {
+                    continue;
+                }
+            }
+            if let Some(name) = Self::dn_first_rdn_value(group_dn) {
+                names.insert(name);
+            }
+        }
+
+        if self.config.bind_dn.is_some() && self.config.bind_password.is_some() {
+            match self.search_group_names(user_dn, username).await {
+                Ok(found) => names.extend(found),
+                Err(e) => {
+                    tracing::warn!(
+                        user_dn = %user_dn,
+                        error = %e,
+                        "LDAP group search failed; continuing with memberOf-derived groups"
+                    );
+                }
+            }
+        }
+
+        names.into_iter().collect()
+    }
+
+    /// Search group entries the user is a member of and return their names.
+    ///
+    /// Only the group name attribute is requested — never `member` — so
+    /// Active Directory range retrieval on large groups cannot truncate the
+    /// result. Entries missing the name attribute fall back to the first RDN
+    /// value of their DN.
+    async fn search_group_names(&self, user_dn: &str, username: &str) -> Result<Vec<String>> {
+        use ldap3::{Scope, SearchEntry};
+
+        let (bind_dn, bind_pw) = match (&self.config.bind_dn, &self.config.bind_password) {
+            (Some(dn), Some(pw)) => (dn, pw),
+            _ => return Ok(Vec::new()),
+        };
+
+        let search_base = self
+            .config
+            .group_base_dn
+            .as_deref()
+            .unwrap_or(&self.config.base_dn);
+        let filter = self.build_group_filter(user_dn, username);
+
+        let mut ldap = self.connect_and_bind(bind_dn, bind_pw).await?;
+        let (results, _) = ldap
+            .search(
+                search_base,
+                Scope::Subtree,
+                &filter,
+                vec![self.config.group_name_attr.as_str()],
+            )
+            .await
+            .map_err(Self::search_error)?
+            .success()
+            .map_err(Self::search_error)?;
+        ldap.unbind().await.ok();
+
+        let entries: Vec<SearchEntry> = results.into_iter().map(SearchEntry::construct).collect();
+        Ok(Self::group_names_from_entries(
+            &entries,
+            &self.config.group_name_attr,
+        ))
+    }
+
+    /// Map group search entries to group names using the group name
+    /// attribute (case-insensitive), falling back to the first RDN value of
+    /// the entry DN when the attribute is absent.
+    fn group_names_from_entries(entries: &[ldap3::SearchEntry], name_attr: &str) -> Vec<String> {
+        let name_attr = name_attr.to_ascii_lowercase();
+        entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .attrs
+                    .iter()
+                    .find(|(k, _)| k.to_ascii_lowercase() == name_attr)
+                    .and_then(|(_, v)| v.first().cloned())
+                    .or_else(|| Self::dn_first_rdn_value(&entry.dn))
+            })
+            .collect()
+    }
+
+    /// Build the LDAP filter that finds the groups a user belongs to.
+    ///
+    /// The configured `group_filter` supports `{0}`/`{dn}` (the user's DN)
+    /// and `{1}`/`{username}` placeholders, all filter-escaped. A configured
+    /// filter without any user placeholder (e.g. `(objectClass=group)`) is
+    /// treated as a group-object class filter and AND-ed with the default
+    /// membership disjunction — matching every group in the base against the
+    /// user would otherwise grant all groups to everyone. Without a
+    /// configured filter the default membership disjunction is used alone.
+    fn build_group_filter(&self, user_dn: &str, username: &str) -> String {
+        let dn = Self::sanitize_ldap_input(user_dn);
+        let uname = Self::sanitize_ldap_input(username);
+        let membership = format!("(|(member={dn})(uniqueMember={dn})(memberUid={uname}))");
+
+        match &self.config.group_filter {
+            Some(f)
+                if f.contains("{0}")
+                    || f.contains("{dn}")
+                    || f.contains("{1}")
+                    || f.contains("{username}") =>
+            {
+                f.replace("{0}", &dn)
+                    .replace("{dn}", &dn)
+                    .replace("{1}", &uname)
+                    .replace("{username}", &uname)
+            }
+            Some(f) => format!("(&{f}{membership})"),
+            None => membership,
+        }
+    }
+
+    /// Extract the value of the first RDN of a DN
+    /// (`CN=devops_,OU=Global,DC=corp,DC=local` → `devops_`).
+    ///
+    /// Handles backslash-escaped characters (e.g. `CN=a\, b,OU=x`) by
+    /// unescaping them into the returned value.
+    fn dn_first_rdn_value(dn: &str) -> Option<String> {
+        let mut first_rdn = String::new();
+        let mut chars = dn.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        first_rdn.push(escaped);
+                    }
+                }
+                ',' => break,
+                _ => first_rdn.push(c),
+            }
+        }
+        let (_, value) = first_rdn.split_once('=')?;
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    }
+
+    /// Whether `dn` sits under `base` (case-insensitive, tolerant of
+    /// whitespace around RDN separators). An empty base matches everything.
+    fn dn_under_base(dn: &str, base: &str) -> bool {
+        fn normalize(s: &str) -> String {
+            s.split(',')
+                .map(|part| part.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        let dn = normalize(dn);
+        let base = normalize(base);
+        if base.is_empty() {
+            return true;
+        }
+        dn == base || dn.ends_with(&format!(",{base}"))
+    }
+
     /// Check if LDAP is configured and available
     pub fn is_configured(&self) -> bool {
         !self.config.url.is_empty() && !self.config.base_dn.is_empty()
@@ -706,6 +1003,36 @@ impl LdapService {
     /// Get the LDAP server URL (for diagnostics)
     pub fn server_url(&self) -> &str {
         &self.config.url
+    }
+
+    /// Verify the configured service-account credentials via a real LDAP
+    /// simple bind (admin "test connection" flow, #2486).
+    ///
+    /// Unlike [`check_health`], which is a liveness probe that silently
+    /// passes when no service account is configured, this method exists to
+    /// answer "are these settings actually valid?": it connects with the
+    /// configured TLS/STARTTLS settings, performs a simple bind with the
+    /// configured bind DN and password, then unbinds. Error classification
+    /// (via [`Self::connect_and_bind`]) distinguishes a credential rejection
+    /// (`AppError::Authentication`) from connection-level failures
+    /// (`AppError::Internal`), and never includes the bind password.
+    pub async fn verify_bind(&self) -> Result<()> {
+        let (bind_dn, bind_pw) = match (&self.config.bind_dn, &self.config.bind_password) {
+            (Some(dn), Some(pw)) if !dn.is_empty() => (dn.clone(), pw.clone()),
+            _ => {
+                return Err(AppError::Config(
+                    "LDAP bind credentials not configured".into(),
+                ))
+            }
+        };
+        let mut ldap = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.connect_and_bind(&bind_dn, &bind_pw),
+        )
+        .await
+        .map_err(|_| AppError::Internal("LDAP connection test timed out".into()))??;
+        ldap.unbind().await.ok();
+        Ok(())
     }
 
     /// Probe LDAP connectivity by attempting a service-account bind.
@@ -746,6 +1073,7 @@ mod tests {
             environment: "development".into(),
             storage_path: "/tmp/artifacts".into(),
             s3_bucket: None,
+            backup_s3_bucket: None,
             gcs_bucket: None,
             s3_region: None,
             s3_endpoint: None,
@@ -770,6 +1098,7 @@ mod tests {
             demo_mode: false,
             guest_access_enabled: true,
             expose_detailed_health: false,
+            setup_password_hint: None,
             grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
@@ -781,6 +1110,7 @@ mod tests {
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".into(),
             gc_schedule: "0 0 * * * *".into(),
+            storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
@@ -845,6 +1175,9 @@ mod tests {
             npm_packument_cache_fresh_ttl_secs: 300,
             npm_packument_cache_stale_max_secs: 86_400,
             npm_packument_cache_redis_url: None,
+            npm_upstream_feed_enabled: false,
+            npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
+                .into(),
             scan_token_ttl_seconds: 300,
         }
     }
@@ -860,9 +1193,13 @@ mod tests {
             email_attr: "mail".to_string(),
             display_name_attr: "cn".to_string(),
             groups_attr: "memberOf".to_string(),
+            group_base_dn: None,
+            group_filter: None,
+            group_name_attr: "cn".to_string(),
             admin_group_dn: Some("cn=admins,ou=groups,dc=example,dc=com".to_string()),
             use_starttls: false,
             ca_cert_path: None,
+            ca_cert_pem: None,
             no_tls_verify: false,
         }
     }
@@ -1235,12 +1572,16 @@ mod tests {
             Some("password"),
             "ou=users,dc=example,dc=com",
             "(sAMAccountName={username})",
+            Some("ou=groups,dc=example,dc=com"),
+            None,
             "sAMAccountName",
             "mail",
             "displayName",
             "memberOf",
             Some("cn=admins,dc=example,dc=com"),
             false,
+            false,
+            None,
         );
         assert!(!svc.config.no_tls_verify || std::env::var("LDAP_INSECURE_TLS").is_ok());
         assert_eq!(svc.config.url, "ldaps://ad.example.com:636");
@@ -1249,6 +1590,75 @@ mod tests {
             svc.config.admin_group_dn.as_deref(),
             Some("cn=admins,dc=example,dc=com")
         );
+    }
+
+    /// #2782: the per-provider skip-verify toggle must relax verification on
+    /// the resulting connector even when the `LDAP_INSECURE_TLS` env var is
+    /// unset, and a per-provider inline CA must be carried through.
+    #[tokio::test]
+    async fn test_from_db_config_per_provider_skip_verify_and_inline_ca() {
+        const TEST_CA_PEM: &str = include_str!("../../tests/fixtures/test-ca.pem");
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::from_db_config(
+            db,
+            "test-ldap",
+            "ldaps://ad.example.com:636",
+            Some("cn=svc,dc=example,dc=com"),
+            Some("password"),
+            "ou=users,dc=example,dc=com",
+            "(sAMAccountName={username})",
+            None,
+            None,
+            "sAMAccountName",
+            "mail",
+            "displayName",
+            "memberOf",
+            None,
+            false,
+            true,
+            Some(TEST_CA_PEM),
+        );
+        // Per-provider toggle relaxes verification regardless of the env var.
+        assert!(svc.config.no_tls_verify);
+        // Inline PEM is carried and the env file-path fallback is suppressed.
+        assert_eq!(svc.config.ca_cert_pem.as_deref(), Some(TEST_CA_PEM));
+        assert!(svc.config.ca_cert_path.is_none());
+        // The connector builder honours both (parses the inline PEM +
+        // accepts-invalid), i.e. no error is returned.
+        svc.build_conn_settings()
+            .expect("inline CA + skip-verify should build a connector");
+    }
+
+    /// #2782: with the per-provider toggle OFF and no env override, the
+    /// connector must keep verifying certificates (secure-by-default).
+    #[tokio::test]
+    async fn test_from_db_config_default_keeps_verification() {
+        // Only meaningful when the env override is not set in this process.
+        if std::env::var("LDAP_INSECURE_TLS").is_ok() {
+            return;
+        }
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::from_db_config(
+            db,
+            "test-ldap",
+            "ldaps://ad.example.com:636",
+            None,
+            None,
+            "ou=users,dc=example,dc=com",
+            "(sAMAccountName={username})",
+            None,
+            None,
+            "sAMAccountName",
+            "mail",
+            "displayName",
+            "memberOf",
+            None,
+            false,
+            false,
+            None,
+        );
+        assert!(!svc.config.no_tls_verify);
+        assert!(svc.config.ca_cert_pem.is_none());
     }
 
     #[tokio::test]
@@ -1732,6 +2142,288 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_extract_user_from_entry_ad_ranged_member_of() {
+        // Active Directory range retrieval: for users with many group
+        // memberships AD returns the attribute under a ranged key
+        // (`memberOf;range=0-1499`) instead of plain `memberOf`. The groups
+        // must still be picked up (issue #2468).
+        use std::collections::HashMap;
+
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        let entry = ldap3::SearchEntry {
+            dn: "CN=jdoe,OU=Users,DC=corp,DC=local".to_string(),
+            attrs: HashMap::from([
+                ("sAMAccountName".to_string(), vec!["jdoe".to_string()]),
+                (
+                    "memberOf;range=0-1499".to_string(),
+                    vec![
+                        "CN=devops_,OU=Global,DC=corp,DC=local".to_string(),
+                        "CN=qa,OU=Global,DC=corp,DC=local".to_string(),
+                    ],
+                ),
+            ]),
+            bin_attrs: HashMap::new(),
+        };
+        let info = svc.extract_user_from_entry(entry, "jdoe");
+        assert_eq!(
+            info.groups.len(),
+            2,
+            "AD ranged memberOf values must be extracted, got: {:?}",
+            info.groups
+        );
+        assert!(info
+            .groups
+            .contains(&"CN=devops_,OU=Global,DC=corp,DC=local".to_string()));
+    }
+
+    // =======================================================================
+    // Group synchronization (issue #2468): name resolution from AD-shaped
+    // directory data — memberOf DNs, objectClass=group search entries, and
+    // range-retrieval attribute keys.
+    // =======================================================================
+
+    #[test]
+    fn test_dn_first_rdn_value_ad_group_dn() {
+        assert_eq!(
+            LdapService::dn_first_rdn_value("CN=devops_,OU=Global,DC=my_dn,DC=local"),
+            Some("devops_".to_string())
+        );
+        assert_eq!(
+            LdapService::dn_first_rdn_value("cn=developers,ou=groups,dc=example,dc=com"),
+            Some("developers".to_string())
+        );
+        // Escaped comma inside the RDN value stays part of the name.
+        assert_eq!(
+            LdapService::dn_first_rdn_value("CN=Ops\\, Team,OU=Global,DC=corp,DC=local"),
+            Some("Ops, Team".to_string())
+        );
+        assert_eq!(LdapService::dn_first_rdn_value("no-equals-sign"), None);
+        assert_eq!(LdapService::dn_first_rdn_value("CN=,OU=Global"), None);
+    }
+
+    #[test]
+    fn test_dn_under_base_scoping() {
+        // Case-insensitive and whitespace-tolerant, as AD DNs mix casing.
+        assert!(LdapService::dn_under_base(
+            "CN=devops_,OU=Global,DC=my_dn,DC=local",
+            "ou=global,dc=my_dn,dc=local"
+        ));
+        assert!(LdapService::dn_under_base(
+            "CN=qa, OU=Global, DC=my_dn, DC=local",
+            "OU=Global,DC=my_dn,DC=local"
+        ));
+        // A group outside the configured OU must be excluded.
+        assert!(!LdapService::dn_under_base(
+            "CN=other,OU=Elsewhere,DC=my_dn,DC=local",
+            "OU=Global,DC=my_dn,DC=local"
+        ));
+        // Suffix match must respect RDN boundaries.
+        assert!(!LdapService::dn_under_base(
+            "CN=x,OU=NotGlobal,DC=my_dn,DC=local",
+            "OU=Global,DC=my_dn,DC=local"
+        ));
+        assert!(LdapService::dn_under_base("CN=anything,DC=a", ""));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_group_names_from_ad_member_of_scoped_to_base() {
+        // The exact configuration from issue #2468: AD returns memberOf DNs
+        // on the user entry; only groups under LDAP_GROUP_BASE_DN sync, and
+        // the group name is the DN's cn value — not the full DN.
+        let mut config = make_test_ldap_config();
+        config.group_base_dn = Some("OU=Global,DC=my_dn,DC=local".to_string());
+        config.group_filter = Some("(memberOf={0})".to_string());
+        let svc = make_test_service(config);
+        assert!(svc.group_sync_configured());
+
+        // No bind credentials in this config, so only the memberOf path runs.
+        let names = svc
+            .resolve_group_names(
+                "CN=jdoe,OU=Users,DC=my_dn,DC=local",
+                "jdoe",
+                &[
+                    "CN=devops_,OU=Global,DC=my_dn,DC=local".to_string(),
+                    "CN=qa,OU=Global,DC=my_dn,DC=local".to_string(),
+                    // Outside the group base DN: must not sync.
+                    "CN=domain-users,CN=Builtin,DC=my_dn,DC=local".to_string(),
+                ],
+            )
+            .await;
+        assert_eq!(names, vec!["devops_".to_string(), "qa".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_group_names_without_base_uses_all_member_of() {
+        let mut config = make_test_ldap_config();
+        config.group_filter = Some("(member={0})".to_string());
+        let svc = make_test_service(config);
+
+        let names = svc
+            .resolve_group_names(
+                "uid=jdoe,ou=users,dc=example,dc=com",
+                "jdoe",
+                &[
+                    "cn=developers,ou=groups,dc=example,dc=com".to_string(),
+                    "cn=admins,ou=groups,dc=example,dc=com".to_string(),
+                ],
+            )
+            .await;
+        assert_eq!(names, vec!["admins".to_string(), "developers".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_group_sync_configured_only_with_group_config() {
+        let svc = make_test_service(make_test_ldap_config());
+        assert!(
+            !svc.group_sync_configured(),
+            "no group_base_dn/group_filter -> sync stays off (pre-#2468 behaviour)"
+        );
+
+        let mut config = make_test_ldap_config();
+        config.group_base_dn = Some("ou=groups,dc=example,dc=com".to_string());
+        assert!(make_test_service(config).group_sync_configured());
+
+        let mut config = make_test_ldap_config();
+        config.group_filter = Some("(member={0})".to_string());
+        assert!(make_test_service(config).group_sync_configured());
+    }
+
+    #[tokio::test]
+    async fn test_build_group_filter_placeholder_substitution_and_escaping() {
+        let mut config = make_test_ldap_config();
+        config.group_filter = Some("(member={0})".to_string());
+        let svc = make_test_service(config);
+        assert_eq!(
+            svc.build_group_filter("CN=jdoe,OU=Users,DC=corp,DC=local", "jdoe"),
+            "(member=CN=jdoe,OU=Users,DC=corp,DC=local)"
+        );
+
+        // Filter metacharacters in the DN must be escaped (RFC 4515).
+        let mut config = make_test_ldap_config();
+        config.group_filter = Some("(member={0})".to_string());
+        let svc = make_test_service(config);
+        assert_eq!(
+            svc.build_group_filter("CN=a\\, b(x)*,DC=corp", "j*doe"),
+            "(member=CN=a\\5c, b\\28x\\29\\2a,DC=corp)"
+        );
+
+        // AD nested-group resolution: matching-rule-in-chain passes through.
+        let mut config = make_test_ldap_config();
+        config.group_filter = Some("(member:1.2.840.113556.1.4.1941:={0})".to_string());
+        let svc = make_test_service(config);
+        assert_eq!(
+            svc.build_group_filter("CN=jdoe,DC=corp", "jdoe"),
+            "(member:1.2.840.113556.1.4.1941:=CN=jdoe,DC=corp)"
+        );
+
+        // {1}/{username} placeholders (posixGroup style).
+        let mut config = make_test_ldap_config();
+        config.group_filter = Some("(memberUid={1})".to_string());
+        let svc = make_test_service(config);
+        assert_eq!(
+            svc.build_group_filter("uid=jdoe,dc=x", "jdoe"),
+            "(memberUid=jdoe)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_group_filter_static_filter_gets_membership_guard() {
+        // A group-object filter with no user placeholder must NOT match every
+        // group in the base for every user: it is AND-ed with the membership
+        // disjunction instead.
+        let mut config = make_test_ldap_config();
+        config.group_filter = Some("(objectClass=group)".to_string());
+        let svc = make_test_service(config);
+        assert_eq!(
+            svc.build_group_filter("CN=jdoe,DC=corp", "jdoe"),
+            "(&(objectClass=group)(|(member=CN=jdoe,DC=corp)(uniqueMember=CN=jdoe,DC=corp)(memberUid=jdoe)))"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_group_filter_default_covers_ad_and_rfc4519() {
+        let mut config = make_test_ldap_config();
+        config.group_base_dn = Some("ou=groups,dc=example,dc=com".to_string());
+        let svc = make_test_service(config);
+        assert_eq!(
+            svc.build_group_filter("uid=jdoe,dc=example,dc=com", "jdoe"),
+            "(|(member=uid=jdoe,dc=example,dc=com)(uniqueMember=uid=jdoe,dc=example,dc=com)(memberUid=jdoe))"
+        );
+    }
+
+    #[test]
+    fn test_group_names_from_entries_ad_shaped() {
+        use std::collections::HashMap;
+
+        // AD-shaped group entries: objectClass=group, member DNs, cn.
+        let entries = vec![
+            ldap3::SearchEntry {
+                dn: "CN=devops_,OU=Global,DC=my_dn,DC=local".to_string(),
+                attrs: HashMap::from([
+                    ("objectClass".to_string(), vec!["group".to_string()]),
+                    ("cn".to_string(), vec!["devops_".to_string()]),
+                    (
+                        "member".to_string(),
+                        vec!["CN=jdoe,OU=Users,DC=my_dn,DC=local".to_string()],
+                    ),
+                ]),
+                bin_attrs: HashMap::new(),
+            },
+            // AD frequently returns attribute keys with server casing; the
+            // lookup must be case-insensitive.
+            ldap3::SearchEntry {
+                dn: "CN=qa,OU=Global,DC=my_dn,DC=local".to_string(),
+                attrs: HashMap::from([("CN".to_string(), vec!["qa".to_string()])]),
+                bin_attrs: HashMap::new(),
+            },
+            // Entry without the name attribute falls back to the DN's RDN.
+            ldap3::SearchEntry {
+                dn: "CN=release-mgrs,OU=Global,DC=my_dn,DC=local".to_string(),
+                attrs: HashMap::new(),
+                bin_attrs: HashMap::new(),
+            },
+        ];
+        assert_eq!(
+            LdapService::group_names_from_entries(&entries, "cn"),
+            vec![
+                "devops_".to_string(),
+                "qa".to_string(),
+                "release-mgrs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ranged_attr_values_collects_ad_range_keys() {
+        use std::collections::HashMap;
+        let attrs: HashMap<String, Vec<String>> = HashMap::from([
+            (
+                "memberOf;range=0-1499".to_string(),
+                vec!["CN=b,DC=x".to_string(), "CN=a,DC=x".to_string()],
+            ),
+            ("cn".to_string(), vec!["jdoe".to_string()]),
+        ]);
+        assert_eq!(
+            LdapService::ranged_attr_values(&attrs, "memberOf"),
+            vec!["CN=a,DC=x".to_string(), "CN=b,DC=x".to_string()]
+        );
+        // Case-insensitive plain key match too.
+        let attrs: HashMap<String, Vec<String>> =
+            HashMap::from([("memberof".to_string(), vec!["CN=g,DC=x".to_string()])]);
+        assert_eq!(
+            LdapService::ranged_attr_values(&attrs, "memberOf"),
+            vec!["CN=g,DC=x".to_string()]
+        );
+        // Unrelated attributes never leak in.
+        let attrs: HashMap<String, Vec<String>> = HashMap::from([(
+            "memberOfSomethingElse".to_string(),
+            vec!["CN=g,DC=x".to_string()],
+        )]);
+        assert!(LdapService::ranged_attr_values(&attrs, "memberOf").is_empty());
+    }
+
+    #[tokio::test]
     async fn test_extract_user_from_entry_missing_username_attr() {
         use std::collections::HashMap;
 
@@ -1951,5 +2643,309 @@ mod tests {
         let result = svc.check_health().await;
         // Should fail on empty URL check before attempting bind
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_bind (#2486): the admin test-connection flow must perform a real
+    // LDAP bind and report its true outcome, not just TCP reachability.
+    // -----------------------------------------------------------------------
+
+    /// LDAP resultCode for a bindResponse.
+    const LDAP_RC_SUCCESS: u8 = 0x00;
+    /// invalidCredentials (49).
+    const LDAP_RC_INVALID_CREDENTIALS: u8 = 0x31;
+
+    /// Spawn a minimal mock LDAP server on 127.0.0.1 that answers the first
+    /// request with a BER-encoded bindResponse (messageID 1) carrying the
+    /// given resultCode, then drains the connection. This is a server that is
+    /// perfectly REACHABLE over TCP — exactly the case where the old
+    /// TCP-probe-only test reported "Connection Successful" regardless of
+    /// whether the bind credentials were valid.
+    async fn spawn_mock_ldap_server(result_code: u8) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock ldap listener");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                // Read the client's bindRequest (single small frame).
+                let _ = sock.read(&mut buf).await;
+                // SEQUENCE { messageID 1, [APPLICATION 1] bindResponse {
+                //   resultCode <rc>, matchedDN "", diagnosticMessage "" } }
+                let resp = [
+                    0x30,
+                    0x0c,
+                    0x02,
+                    0x01,
+                    0x01,
+                    0x61,
+                    0x07,
+                    0x0a,
+                    0x01,
+                    result_code,
+                    0x04,
+                    0x00,
+                    0x04,
+                    0x00,
+                ];
+                let _ = sock.write_all(&resp).await;
+                let _ = sock.flush().await;
+                // Consume a possible unbindRequest before closing.
+                let _ = sock.read(&mut buf).await;
+            }
+        });
+        port
+    }
+
+    fn make_verify_bind_service(
+        port: u16,
+        bind_dn: Option<&str>,
+        bind_pw: Option<&str>,
+    ) -> LdapService {
+        let mut config = make_test_ldap_config();
+        config.url = format!("ldap://127.0.0.1:{port}");
+        config.bind_dn = bind_dn.map(String::from);
+        config.bind_password = bind_pw.map(String::from);
+        make_test_service(config)
+    }
+
+    #[tokio::test]
+    async fn test_verify_bind_rejected_credentials_reports_failure() {
+        // The server accepts the TCP connection but rejects the bind: the
+        // old reachability-only test reported success here (#2486); the
+        // real bind must surface an authentication failure.
+        let port = spawn_mock_ldap_server(LDAP_RC_INVALID_CREDENTIALS).await;
+        let svc = make_verify_bind_service(
+            port,
+            Some("cn=wrong,dc=example,dc=com"),
+            Some("bad-password"),
+        );
+
+        match svc.verify_bind().await {
+            Err(AppError::Authentication(msg)) => {
+                // The error must never leak the credentials being tested.
+                assert!(!msg.contains("bad-password"));
+                assert!(!msg.contains("cn=wrong"));
+            }
+            other => panic!("expected Authentication error for rejected bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_bind_accepted_credentials_reports_success() {
+        let port = spawn_mock_ldap_server(LDAP_RC_SUCCESS).await;
+        let svc = make_verify_bind_service(
+            port,
+            Some("cn=admin,dc=example,dc=com"),
+            Some("correct-password"),
+        );
+
+        svc.verify_bind()
+            .await
+            .expect("bind accepted by server should verify");
+    }
+
+    #[tokio::test]
+    async fn test_verify_bind_unreachable_server_is_connection_error() {
+        // Reserve an ephemeral port, then drop the listener so the connect
+        // is refused: this must classify as a connection-level error, not a
+        // credential rejection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let svc =
+            make_verify_bind_service(port, Some("cn=admin,dc=example,dc=com"), Some("password"));
+
+        match svc.verify_bind().await {
+            Err(AppError::Internal(_)) => {}
+            other => panic!("expected Internal error for unreachable server, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_bind_without_credentials_is_config_error() {
+        let svc = make_verify_bind_service(1, None, None);
+        match svc.verify_bind().await {
+            Err(AppError::Config(_)) => {}
+            other => panic!("expected Config error without credentials, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Group search against a mock LDAP server returning AD-shaped group
+    // entries (issue #2468): objectClass=group entries named by cn.
+    // -----------------------------------------------------------------------
+
+    /// Encode a single-byte-length BER TLV (content must stay under 128
+    /// bytes, which the short test DNs guarantee).
+    fn ber(tag: u8, content: &[u8]) -> Vec<u8> {
+        assert!(content.len() < 128, "test BER helper: content too long");
+        let mut out = vec![tag, content.len() as u8];
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// Extract the messageID from a client LDAP frame (single-byte forms).
+    fn ldap_message_id(frame: &[u8]) -> u8 {
+        // SEQUENCE { 0x30 len 0x02 idlen id ... }
+        if frame.len() >= 5 && frame[0] == 0x30 && frame[2] == 0x02 {
+            frame[4]
+        } else {
+            1
+        }
+    }
+
+    /// Spawn a mock LDAP server that accepts a bind, then answers the next
+    /// searchRequest with the given AD-shaped group entries (dn + optional
+    /// `cn` value) followed by searchResultDone.
+    async fn spawn_mock_ldap_group_server(groups: Vec<(String, Option<String>)>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock ldap listener");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+
+                // bindRequest -> bindResponse success.
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let bind_id = ldap_message_id(&buf[..n]);
+                let bind_resp = ber(
+                    0x30,
+                    &[
+                        ber(0x02, &[bind_id]),
+                        ber(
+                            0x61,
+                            &[[0x0a, 0x01, 0x00].to_vec(), ber(0x04, b""), ber(0x04, b"")].concat(),
+                        ),
+                    ]
+                    .concat(),
+                );
+                let _ = sock.write_all(&bind_resp).await;
+
+                // searchRequest -> one searchResultEntry per group + done.
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let search_id = ldap_message_id(&buf[..n]);
+                for (dn, cn) in &groups {
+                    // partialAttributeList: cn attribute when present.
+                    let attrs = match cn {
+                        Some(value) => ber(
+                            0x30,
+                            &ber(
+                                0x30,
+                                &[ber(0x04, b"cn"), ber(0x31, &ber(0x04, value.as_bytes()))]
+                                    .concat(),
+                            ),
+                        ),
+                        None => ber(0x30, b""),
+                    };
+                    let entry = ber(
+                        0x30,
+                        &[
+                            ber(0x02, &[search_id]),
+                            ber(0x64, &[ber(0x04, dn.as_bytes()), attrs].concat()),
+                        ]
+                        .concat(),
+                    );
+                    let _ = sock.write_all(&entry).await;
+                }
+                let done = ber(
+                    0x30,
+                    &[
+                        ber(0x02, &[search_id]),
+                        ber(
+                            0x65,
+                            &[[0x0a, 0x01, 0x00].to_vec(), ber(0x04, b""), ber(0x04, b"")].concat(),
+                        ),
+                    ]
+                    .concat(),
+                );
+                let _ = sock.write_all(&done).await;
+                let _ = sock.flush().await;
+
+                // Consume a possible unbindRequest before closing.
+                let _ = sock.read(&mut buf).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn test_resolve_group_names_via_ad_group_search() {
+        // End-to-end over the wire: an AD-shaped directory where the user
+        // entry carried no usable memberOf, so groups come from the group
+        // search under group_base_dn (objectClass=group entries, named by
+        // cn; the third entry has no cn and falls back to its DN RDN).
+        let port = spawn_mock_ldap_group_server(vec![
+            (
+                "CN=devops_,OU=Global,DC=my_dn,DC=local".to_string(),
+                Some("devops_".to_string()),
+            ),
+            (
+                "CN=qa,OU=Global,DC=my_dn,DC=local".to_string(),
+                Some("qa".to_string()),
+            ),
+            (
+                "CN=release-mgrs,OU=Global,DC=my_dn,DC=local".to_string(),
+                None,
+            ),
+        ])
+        .await;
+
+        let mut config = make_test_ldap_config();
+        config.url = format!("ldap://127.0.0.1:{port}");
+        config.bind_dn = Some("CN=svc,OU=Users,DC=my_dn,DC=local".to_string());
+        config.bind_password = Some("secret".to_string());
+        config.group_base_dn = Some("OU=Global,DC=my_dn,DC=local".to_string());
+        config.group_filter = Some("(member={0})".to_string());
+        let svc = make_test_service(config);
+
+        let names = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            svc.resolve_group_names("CN=jdoe,OU=Users,DC=my_dn,DC=local", "jdoe", &[]),
+        )
+        .await
+        .expect("group search must not hang");
+        assert_eq!(
+            names,
+            vec![
+                "devops_".to_string(),
+                "qa".to_string(),
+                "release-mgrs".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_group_names_search_failure_falls_back_to_member_of() {
+        // Group search that cannot even connect must not fail login-time
+        // resolution: the memberOf-derived names still come back.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let mut config = make_test_ldap_config();
+        config.url = format!("ldap://127.0.0.1:{port}");
+        config.bind_dn = Some("CN=svc,DC=my_dn,DC=local".to_string());
+        config.bind_password = Some("secret".to_string());
+        config.group_base_dn = Some("OU=Global,DC=my_dn,DC=local".to_string());
+        let svc = make_test_service(config);
+
+        let names = svc
+            .resolve_group_names(
+                "CN=jdoe,OU=Users,DC=my_dn,DC=local",
+                "jdoe",
+                &["CN=devops_,OU=Global,DC=my_dn,DC=local".to_string()],
+            )
+            .await;
+        assert_eq!(names, vec!["devops_".to_string()]);
     }
 }

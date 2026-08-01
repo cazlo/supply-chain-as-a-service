@@ -37,10 +37,12 @@ fn test_config(storage_path: &str) -> Config {
         environment: "development".into(),
         storage_path: storage_path.into(),
         s3_bucket: None,
+        backup_s3_bucket: None,
         gcs_bucket: None,
         s3_region: None,
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        setup_password_hint: None,
         jwt_expiration_secs: 86400,
         jwt_access_token_expiry_minutes: 30,
         jwt_refresh_token_expiry_days: 7,
@@ -73,6 +75,7 @@ fn test_config(storage_path: &str) -> Config {
         otel_exporter_otlp_endpoint: None,
         otel_service_name: "test".into(),
         gc_schedule: "0 0 * * * *".into(),
+        storage_stats_schedule: "0 0 */4 * * *".into(),
         blob_gc_enabled: false,
         blob_gc_sweep_grace_secs: 3600,
         lifecycle_check_interval_secs: 60,
@@ -136,6 +139,10 @@ fn test_config(storage_path: &str) -> Config {
         npm_packument_cache_fresh_ttl_secs: 300,
         npm_packument_cache_stale_max_secs: 86_400,
         npm_packument_cache_redis_url: None,
+        npm_upstream_feed_enabled: false,
+        npm_upstream_feed_url:
+            artifact_keeper_backend::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
+                .to_string(),
     }
 }
 

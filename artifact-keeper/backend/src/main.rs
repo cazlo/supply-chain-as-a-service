@@ -20,8 +20,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -145,6 +143,16 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         &otel_service_name,
     );
 
+    // Initialize the structured audit-event stream (#2413) from AUDIT_STREAM,
+    // following the same pre-Config env-read pattern as telemetry. Default
+    // `off`; `stdout` opts in to NDJSON audit records on stdout.
+    let _audit_stream_guard =
+        artifact_keeper_backend::services::audit_export::init_audit_stream_from_env();
+    tracing::info!(
+        audit_stream = _audit_stream_guard.mode().name(),
+        "audit event stream configured"
+    );
+
     // Load configuration
     let config = Config::from_env()?;
 
@@ -161,11 +169,27 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     #[cfg(feature = "profiling")]
     tracing::info!("Jemalloc profiling enabled - set _RJEM_MALLOC_CONF=prof:true to activate");
 
-    tracing::info!("Starting Artifact Keeper");
+    tracing::info!(
+        version = artifact_keeper_backend::build_info::VERSION,
+        git = artifact_keeper_backend::build_info::short_sha(),
+        "Starting Artifact Keeper"
+    );
 
     // Connect to database
     let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
+
+    // Reconcile stale/diverged `_sqlx_migrations` ledgers BEFORE the
+    // SKIP_MIGRATIONS gate. These repairs each no-op on fresh and healthy
+    // databases, so running them unconditionally is safe -- and it is
+    // necessary: an operator who applies migrations out-of-band with
+    // SKIP_MIGRATIONS=true still needs the ledger renumbered, otherwise the
+    // v1.5.7/v1.5.8 -> 1.6.0 upgrade aborts (issue #2686) and any later
+    // out-of-band `sqlx migrate` hits the same VersionMismatch the repair
+    // exists to clear.
+    artifact_keeper_backend::migration_repair::repair_legacy_073_checksum(&db_pool).await?;
+    artifact_keeper_backend::migration_repair::repair_release_1_1_9_divergence(&db_pool).await?;
+    artifact_keeper_backend::migration_repair::repair_release_1_5_x_divergence(&db_pool).await?;
 
     // Run migrations (skip with SKIP_MIGRATIONS=true for pre-applied migrations)
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")
@@ -176,9 +200,6 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         tracing::info!("SKIP_MIGRATIONS=true, skipping automatic database migrations");
     } else {
         tracing::info!("Running database migrations...");
-        artifact_keeper_backend::migration_repair::repair_legacy_073_checksum(&db_pool).await?;
-        artifact_keeper_backend::migration_repair::repair_release_1_1_9_divergence(&db_pool)
-            .await?;
         // Some migrations (e.g. CREATE INDEX on a populated `artifacts` table
         // or backfill UPDATEs) take longer than the per-query
         // `statement_timeout` that operators commonly set on their Postgres
@@ -544,6 +565,55 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // One-shot repair for Docker/OCI artifacts imported by migration runs
+    // that pre-date #2457: those runs stored manifest/blob bytes under
+    // generic CAS keys with only `artifacts` rows, so migrated tags were
+    // unpullable (MANIFEST_UNKNOWN). The repair registers them in the OCI
+    // index (`oci_tags`/`oci_blobs`/refs) via the same code path a live
+    // push uses. Additive-only, idempotent (no-op once every candidate has
+    // its `oci_tags` row), and backgrounded so it never delays the HTTP
+    // listener bind (same rationale as the manifest_blob_refs backfill).
+    {
+        let db_pool = db_pool.clone();
+        let storage_registry = storage_registry.clone();
+        tokio::spawn(async move {
+            let repair_stats =
+                artifact_keeper_backend::services::oci_migration_reindex::run_repair(
+                    &db_pool,
+                    storage_registry,
+                )
+                .await;
+            if repair_stats.candidates_failed > 0 || repair_stats.hollow_tags_flagged > 0 {
+                tracing::warn!(
+                    candidates_scanned = repair_stats.candidates_scanned,
+                    manifests_registered = repair_stats.manifests_registered,
+                    blobs_registered = repair_stats.blobs_registered,
+                    children_registered = repair_stats.children_registered,
+                    candidates_skipped = repair_stats.candidates_skipped,
+                    candidates_failed = repair_stats.candidates_failed,
+                    hollow_tags_flagged = repair_stats.hollow_tags_flagged,
+                    orphan_tags_reconciled = repair_stats.orphan_tags_reconciled,
+                    "OCI migration reindex left {} candidate(s) unregistered and \
+                     flagged {} hollow tag(s); those images stay unpullable until \
+                     re-migrated (referenced blobs/child manifests were never \
+                     transferred). See the hollow-repositories WARN above.",
+                    repair_stats.candidates_failed,
+                    repair_stats.hollow_tags_flagged
+                );
+            } else {
+                tracing::info!(
+                    candidates_scanned = repair_stats.candidates_scanned,
+                    manifests_registered = repair_stats.manifests_registered,
+                    blobs_registered = repair_stats.blobs_registered,
+                    children_registered = repair_stats.children_registered,
+                    candidates_skipped = repair_stats.candidates_skipped,
+                    orphan_tags_reconciled = repair_stats.orphan_tags_reconciled,
+                    "OCI migration reindex complete"
+                );
+            }
+        });
+    }
+
     // Initialize security scanner service
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
@@ -649,10 +719,53 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             tracing::info!("Proxy service initialized for remote repositories");
         }
         Err(e) => {
-            tracing::warn!(
-                "Failed to initialize proxy service, remote repositories disabled: {}",
-                e
-            );
+            if artifact_keeper_backend::services::storage_service::backend_supports_proxy_cache(
+                &config.storage_backend,
+            ) {
+                // A backend that *can* back the proxy facade failed for a
+                // transient/optional reason (e.g. missing S3 credentials on a
+                // hosted-only deployment). Preserve the historical graceful
+                // degrade: remote repositories are simply disabled.
+                tracing::warn!(
+                    "Failed to initialize proxy service, remote repositories disabled: {}",
+                    e
+                );
+            } else {
+                // Structural gap (#2670/#1555): this backend has no proxy-cache
+                // StorageService arm (Azure). Booting green here silently
+                // black-holes every remote/proxy repository — the format
+                // handlers skip the upstream fetch when the proxy service is
+                // absent, so requests just fail to find packages with no error.
+                // Fail closed if any remote repository is already configured;
+                // otherwise log loudly so the gap is visible rather than silent.
+                let remote_repo_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM repositories \
+                     WHERE repo_type = 'remote'::repository_type",
+                )
+                .fetch_one(&db_pool)
+                .await?;
+
+                if remote_repo_count > 0 {
+                    return Err(artifact_keeper_backend::error::AppError::Config(format!(
+                        "STORAGE_BACKEND={} cannot serve remote/proxy repositories \
+                         (proxy StorageService unavailable: {}), but {} remote \
+                         repository(ies) are configured. Refusing to start rather than \
+                         boot healthy and silently black-hole their upstream traffic. \
+                         See #1555 for Azure proxy-cache support.",
+                        config.storage_backend, e, remote_repo_count
+                    )));
+                }
+
+                tracing::error!(
+                    backend = %config.storage_backend,
+                    error = %e,
+                    "Remote/proxy repositories are NOT supported on this storage \
+                     backend: the proxy StorageService has no arm for it (#1555). No \
+                     remote repositories are configured yet, so startup continues, \
+                     but any remote repository created later will silently fail to \
+                     proxy upstream content until #1555 is resolved."
+                );
+            }
         }
     }
 
@@ -746,14 +859,28 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         );
     }
 
+    // Start the bounded download-event dispatcher (#2522): a bounded queue +
+    // fixed pool of flush workers that batch-INSERT the download-path
+    // side-effect writes (download_statistics + ARTIFACT_DOWNLOADED audit).
+    // Replaces the per-request `tokio::spawn`s so a download flood against a
+    // slow/failing event store sheds telemetry (bounded, counted) instead of
+    // growing detached tasks + pool connections without bound. Started before
+    // the HTTP servers bind so no request can observe an uninstalled
+    // dispatcher. Sizing: DOWNLOAD_EVENT_QUEUE_DEPTH / DOWNLOAD_EVENT_FLUSH_WORKERS.
+    artifact_keeper_backend::services::download_event_dispatch::start_download_event_dispatch(
+        app_state.db.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     app_state
         .setup_required
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
     let state = Arc::new(app_state);
 
-    // Fan out authorization-cache invalidations from other replicas via
-    // Postgres LISTEN/NOTIFY (migration 142 triggers +
-    // services/cache_invalidation.rs). Awaited so the initial LISTEN and the
+    // Fan out authorization-cache and npm computed-packument invalidations
+    // from other replicas via Postgres LISTEN/NOTIFY (migration 142 triggers
+    // + services/cache_invalidation.rs; the packument event is emitted
+    // application-side on local npm writes, #2490). Awaited so the initial LISTEN and the
     // conservative startup flush complete before requests are served; if the
     // connection fails the spawned task retries with backoff while requests
     // proceed under TTL-bound staleness.
@@ -763,10 +890,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         cache_invalidation::CacheInvalidationHandles {
             repo_cache: state.repo_cache.clone(),
             permission_service: state.permission_service.clone(),
+            npm_packument_cache: state.npm_packument_cache.clone(),
         },
         runtime_shutdown_token.clone(),
     )
     .await;
+
+    // #2249: proactive packument invalidation from npm's replication feed.
+    // Opt-in (NPM_UPSTREAM_FEED_ENABLED); one replica consumes cluster-wide
+    // via an advisory lock. Detached deliberately: lifecycle is governed by
+    // the shutdown token.
+    let _upstream_feed_task =
+        artifact_keeper_backend::services::upstream_feed::spawn_npm_feed_consumer(
+            &config,
+            db_pool.clone(),
+            state.npm_packument_cache.clone(),
+            runtime_shutdown_token.clone(),
+        );
 
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
@@ -1370,6 +1510,9 @@ struct OidcEnvVars {
     redirect_uri: Option<String>,
     username_claim: Option<String>,
     email_claim: Option<String>,
+    map_groups_to_groups: Option<String>,
+    auto_create_users: Option<String>,
+    pkce_enabled: Option<String>,
 }
 
 /// Build a CreateOidcConfigRequest from OIDC_* environment variables.
@@ -1386,6 +1529,9 @@ fn build_oidc_bootstrap_request(
         redirect_uri: std::env::var("OIDC_REDIRECT_URI").ok(),
         username_claim: std::env::var("OIDC_USERNAME_CLAIM").ok(),
         email_claim: std::env::var("OIDC_EMAIL_CLAIM").ok(),
+        map_groups_to_groups: std::env::var("OIDC_MAP_GROUPS_TO_GROUPS").ok(),
+        auto_create_users: std::env::var("OIDC_AUTO_CREATE_USERS").ok(),
+        pkce_enabled: std::env::var("OIDC_PKCE_ENABLED").ok(),
     })
 }
 
@@ -1408,13 +1554,15 @@ fn build_oidc_request_from_values(
         .scopes
         .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>());
 
-    let groups_claim_val = env.groups_claim.unwrap_or_else(|| "groups".to_string());
-
     let mut attr_map = serde_json::Map::new();
-    attr_map.insert(
-        "groups_claim".into(),
-        serde_json::Value::String(groups_claim_val),
-    );
+    // Insert groups_claim ONLY when explicitly configured (mirrors
+    // username_claim/email_claim below). Leaving it absent lets the OIDC
+    // callback's multi-name candidate resolution engage, so an env-bootstrapped
+    // GitLab provider (which publishes under `groups_direct`) syncs groups
+    // without the operator having to set OIDC_GROUPS_CLAIM (#2831).
+    if let Some(claim) = env.groups_claim.filter(|v| !v.is_empty()) {
+        attr_map.insert("groups_claim".into(), serde_json::Value::String(claim));
+    }
     if let Some(uri) = env.redirect_uri {
         attr_map.insert("redirect_uri".into(), serde_json::Value::String(uri));
     }
@@ -1425,6 +1573,17 @@ fn build_oidc_request_from_values(
         attr_map.insert("email_claim".into(), serde_json::Value::String(claim));
     }
 
+    // Provider toggles configurable via env for GitOps/disconnected deploys
+    // (#2792). Absent vars preserve the prior bootstrap defaults so existing
+    // deployments are unaffected: `auto_create_users` stays on, while
+    // `map_groups_to_groups` (#1879, pairs with #2781) and `pkce_enabled` fall
+    // through to the service-layer create defaults (false / true respectively).
+    // Accepts "true"/"1" (case-sensitive, mirroring the LDAP bootstrap).
+    let env_flag = |v: String| v == "true" || v == "1";
+    let map_groups_to_groups = env.map_groups_to_groups.map(env_flag);
+    let pkce_enabled = env.pkce_enabled.map(env_flag);
+    let auto_create_users = Some(env.auto_create_users.map(env_flag).unwrap_or(true));
+
     Some(CreateOidcConfigRequest {
         name,
         issuer_url: issuer,
@@ -1433,9 +1592,9 @@ fn build_oidc_request_from_values(
         scopes,
         attribute_mapping: Some(serde_json::Value::Object(attr_map)),
         is_enabled: Some(true),
-        auto_create_users: Some(true),
-        pkce_enabled: None,
-        map_groups_to_groups: None,
+        auto_create_users,
+        pkce_enabled,
+        map_groups_to_groups,
         allow_legacy_rsa_keys: None,
     })
 }
@@ -1576,6 +1735,11 @@ fn build_ldap_request_from_values(
         groups_attribute: env.groups_attr.filter(|v| !v.is_empty()),
         admin_group_dn: env.admin_group_dn.filter(|v| !v.is_empty()),
         use_starttls: Some(use_starttls),
+        // TLS trust for the env-bootstrapped provider stays governed by the
+        // global LDAP_INSECURE_TLS / LDAP_CA_CERT_PATH env fallback (#2782);
+        // the per-provider overrides are set via the admin SSO API.
+        insecure_skip_verify: None,
+        ca_certificate: None,
         is_enabled: Some(true),
         priority: Some(0),
     })
@@ -1636,12 +1800,50 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         .await
         .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
+    // #2875: detect installs already affected by the pre-fix collision. A row
+    // that is `auth_provider = 'local'` yet still carries a federated
+    // `external_id` is the fingerprint of a federated identity that a prior
+    // build merged into the built-in local admin. We cannot safely un-merge it
+    // automatically (the original local-admin credentials were overwritten and
+    // the federated user's original username is lost), so surface it loudly for
+    // manual remediation. Read-only; never mutates.
+    let collided: Option<(i64,)> = sqlx::query_as(
+        "SELECT COUNT(*) FROM users WHERE auth_provider = 'local' AND external_id IS NOT NULL",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+    if let Some((n,)) = collided {
+        if n > 0 {
+            tracing::error!(
+                collided_accounts = n,
+                "SECURITY (#2875): {n} local account(s) still carry a federated external_id -- the \
+                 fingerprint of an SSO identity merged into a local account by a pre-fix build. \
+                 Review these rows: an operator should verify each account's true owner, reset the \
+                 built-in admin credential, and clear the stray external_id on any account that \
+                 should remain local. See the v1.6.3 advisory.",
+            );
+        }
+    }
+
     // Re-check admin existence while holding the lock (double-check pattern).
-    let admin_row: Option<(bool,)> =
-        sqlx::query_as("SELECT must_change_password FROM users WHERE is_admin = true LIMIT 1")
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+    //
+    // #2875: only a NON-FEDERATED admin counts as "the built-in admin exists".
+    // A federated (SSO) principal always carries `external_id`; if such a user
+    // happens to be admin (e.g. an OIDC user named `admin` under
+    // SKIP_ADMIN_PROVISIONING, or granted admin then demoted), it must NOT be
+    // mistaken for the built-in local admin here -- otherwise the maintenance
+    // branch below would flip its `auth_provider` to 'local' and stamp the
+    // built-in admin password onto it, merging the two identities. Excluding
+    // `external_id IS NOT NULL` routes that case to the create branch, whose
+    // upsert is itself guarded against clobbering a federated row.
+    let admin_row: Option<(bool,)> = sqlx::query_as(
+        "SELECT must_change_password FROM users \
+         WHERE is_admin = true AND external_id IS NULL LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     let demo_mode = matches!(std::env::var("DEMO_MODE").as_deref(), Ok("true" | "1"));
 
@@ -1651,7 +1853,8 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         // already correct but fixes installs that ended up with a wrong value.
         sqlx::query(
             "UPDATE users SET auth_provider = 'local' \
-             WHERE username = 'admin' AND auth_provider != 'local'",
+             WHERE username = 'admin' AND auth_provider != 'local' \
+               AND external_id IS NULL",
         )
         .execute(&mut *tx)
         .await
@@ -1705,13 +1908,20 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
                 } else {
                     // File written successfully, now update the DB hash to match.
                     let password_hash = AuthService::hash_password(&password).await?;
-                    sqlx::query("UPDATE users SET password_hash = $1 WHERE username = 'admin'")
-                        .bind(&password_hash)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            artifact_keeper_backend::error::AppError::Database(e.to_string())
-                        })?;
+                    // #2875: never write the built-in admin password onto a
+                    // federated row; scope strictly to the local, non-federated
+                    // built-in admin.
+                    sqlx::query(
+                        "UPDATE users SET password_hash = $1 \
+                         WHERE username = 'admin' AND auth_provider = 'local' \
+                           AND external_id IS NULL",
+                    )
+                    .bind(&password_hash)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        artifact_keeper_backend::error::AppError::Database(e.to_string())
+                    })?;
                     log_admin_setup_banner(&password_file, Some(&password));
                 }
             }
@@ -1770,7 +1980,15 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
 
     let password_hash = AuthService::hash_password(&password).await?;
 
-    sqlx::query(
+    // #2875: the built-in admin is keyed on username='admin'. If a FEDERATED
+    // (SSO) user already holds that username, the ON CONFLICT upsert must NOT
+    // clobber it -- doing so would stamp the built-in admin password onto the
+    // federated account and flip it to a local login, merging the two
+    // identities into one admin account. The WHERE on DO UPDATE restricts the
+    // update to a genuine local, non-federated row; when the conflicting row is
+    // federated the update is skipped (rows_affected == 0) and we refuse to
+    // provision rather than hijack the identity.
+    let provisioned = sqlx::query(
         r#"
         INSERT INTO users (username, email, password_hash, is_admin, must_change_password, auth_provider)
         VALUES ('admin', 'admin@localhost', $1, true, $2, 'local')
@@ -1778,6 +1996,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             SET password_hash = EXCLUDED.password_hash,
                 must_change_password = EXCLUDED.must_change_password,
                 auth_provider = 'local'
+            WHERE users.auth_provider = 'local' AND users.external_id IS NULL
         "#,
     )
     .bind(&password_hash)
@@ -1785,6 +2004,24 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     .execute(&mut *tx)
     .await
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    if provisioned.rows_affected() == 0 {
+        // The 'admin' username is held by a federated (external_id IS NOT NULL)
+        // account. Refuse to overwrite it. Do NOT abort startup (the federated
+        // account may legitimately be the SSO-managed admin); log loudly and
+        // continue without a built-in local admin.
+        tx.rollback()
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+        tracing::error!(
+            "Refusing to provision the built-in 'admin' user: the username 'admin' is already held \
+             by a federated (SSO) account. Overwriting it would merge that identity with the local \
+             admin (#2875). Rename or remove the federated account, or set \
+             SKIP_ADMIN_PROVISIONING=true to let SSO manage admin access. Continuing without a \
+             built-in local admin."
+        );
+        return Ok(false);
+    }
 
     tx.commit()
         .await
@@ -1844,35 +2081,103 @@ fn write_admin_password_file(
         # Do NOT use this password directly in API calls -- you must login first.\n",
         password
     );
-    std::fs::write(password_file, &file_contents)?;
-    #[cfg(unix)]
-    if let Err(e) = std::fs::set_permissions(password_file, std::fs::Permissions::from_mode(0o600))
-    {
-        tracing::warn!("Failed to set permissions on admin password file: {}", e);
-    }
+    write_file_private(password_file, file_contents.as_bytes())?;
     tracing::info!("Admin password written to: {}", password_file.display());
     Ok(())
 }
 
-/// Log the setup banner with instructions for the admin user.
+/// Write `contents` to `path` so that the file is never observable at
+/// world-readable permissions.
 ///
-/// When `password` is `Some`, the banner echoes the plaintext into logs in
-/// addition to pointing at the file. This trades a small disclosure risk for
-/// onboarding friction: the password is single-use anyway (the API is locked
-/// behind `must_change_password = true` and the first login forces a rotation),
-/// and operators are otherwise stuck spelunking inside the container to find
-/// the file (issue #1009). Set `ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD=true` to
-/// suppress the plaintext echo while keeping the file path hint, which is
-/// useful for shared log aggregators.
-fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str>) {
-    let hide_password = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+/// The bytes go to a freshly created sibling temp file (same directory, so the
+/// final `rename` is atomic), which on unix is opened with mode 0o600 via
+/// `O_CREAT | O_EXCL`. Only after the data is flushed to disk is the temp file
+/// renamed over the target. This closes the TOCTOU window that a
+/// `write()`-then-`set_permissions()` sequence leaves open, during which the
+/// file exists at the process umask (typically world-readable) before the
+/// follow-up chmod. The temp file is removed if any step fails.
+fn write_file_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    // A random suffix keeps the temp name unpredictable (so a co-tenant can't
+    // pre-create it) and avoids collisions with a leftover temp from a crash.
+    let tmp = dir.join(format!(
+        ".{}.tmp.{}.{:016x}",
+        file_name,
+        std::process::id(),
+        rand::rng().random::<u64>(),
+    ));
+
+    let mut file = open_private_new(&tmp)?;
+    let result = file.write_all(contents).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Create a brand-new file for writing, private to the owner where the platform
+/// supports it. `create_new` (O_EXCL) guarantees we are not following a symlink
+/// or clobbering an attacker-planted file.
+#[cfg(unix)]
+fn open_private_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    // Non-unix build (e.g. the Windows service): there is no umask/0o600, so
+    // fall back to a plain exclusive create. The temp+rename still avoids the
+    // partially-written-file window; file ACLs inherit from the parent dir.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Build the banner's password line.
+///
+/// By default the plaintext is NOT echoed to logs -- only a pointer to the file
+/// is shown -- so the initial admin password does not leak into log
+/// aggregators. Operators who want the old behaviour can opt in explicitly with
+/// `ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD=true`.
+fn admin_banner_password_line(password_file: &std::path::Path, password: Option<&str>) -> String {
+    let log_password = std::env::var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD")
         .unwrap_or_default()
         .eq_ignore_ascii_case("true");
 
-    let password_line = match (password, hide_password) {
-        (Some(pw), false) => format!("  Password:  {}\n", pw),
+    match (password, log_password) {
+        (Some(pw), true) => format!("  Password:  {}\n", pw),
         _ => format!("  Password:  see file {}\n", password_file.display()),
-    };
+    }
+}
+
+/// Log the setup banner with instructions for the admin user.
+///
+/// The banner points operators at the password file rather than echoing the
+/// plaintext: the file is written 0o600 and the password is single-use anyway
+/// (the API is locked behind `must_change_password = true` and the first login
+/// forces a rotation). Set `ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD=true` to also
+/// echo the plaintext into logs (not recommended on shared log aggregators;
+/// issue #1009).
+fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str>) {
+    let password_line = admin_banner_password_line(password_file, password);
 
     tracing::info!(
         "\n\
@@ -1893,8 +2198,9 @@ fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str
           the forced-change-password screen. Alternatively call\n\
           POST /api/v1/auth/login then POST /api/v1/users/<id>/password.\n\
         \n\
-          Set ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD=true to hide the\n\
-          password from logs (file is still written).\n\
+          The password is written only to the file above and is NOT\n\
+          logged. Rotate it on first login. Set\n\
+          ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD=true to also echo it here.\n\
         \n\
         ===========================================================",
         password_line,
@@ -2066,7 +2372,10 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_request_default_groups_claim() {
+    fn test_bootstrap_request_default_groups_claim_absent() {
+        // When OIDC_GROUPS_CLAIM is unset, groups_claim must NOT be persisted,
+        // so the OIDC callback's multi-name candidate fallback can engage for
+        // env-bootstrapped GitLab providers (#2831).
         let req = build_oidc_request_from_values(env(
             Some("https://idp.example.com"),
             Some("client"),
@@ -2075,7 +2384,7 @@ mod tests {
         .unwrap();
 
         let attr = req.attribute_mapping.unwrap();
-        assert_eq!(attr["groups_claim"], "groups");
+        assert!(attr.as_object().unwrap().get("groups_claim").is_none());
     }
 
     #[test]
@@ -2176,6 +2485,115 @@ mod tests {
     }
 
     #[test]
+    fn test_bootstrap_request_default_toggles() {
+        // With none of the toggle env vars set, the bootstrap request preserves
+        // the historical defaults: auto_create_users forced on, and
+        // map_groups_to_groups / pkce_enabled left to the service-layer create
+        // defaults (None -> false / true respectively) (#2792).
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        ))
+        .unwrap();
+
+        assert_eq!(req.auto_create_users, Some(true));
+        assert_eq!(req.map_groups_to_groups, None);
+        assert_eq!(req.pkce_enabled, None);
+    }
+
+    #[test]
+    fn test_bootstrap_request_map_groups_to_groups_enabled() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.map_groups_to_groups = Some("true".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.map_groups_to_groups, Some(true));
+    }
+
+    #[test]
+    fn test_bootstrap_request_map_groups_to_groups_numeric_true() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.map_groups_to_groups = Some("1".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.map_groups_to_groups, Some(true));
+    }
+
+    #[test]
+    fn test_bootstrap_request_map_groups_to_groups_disabled() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.map_groups_to_groups = Some("false".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.map_groups_to_groups, Some(false));
+    }
+
+    #[test]
+    fn test_bootstrap_request_auto_create_users_override() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.auto_create_users = Some("false".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.auto_create_users, Some(false));
+    }
+
+    #[test]
+    fn test_bootstrap_request_auto_create_users_explicit_true() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.auto_create_users = Some("1".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.auto_create_users, Some(true));
+    }
+
+    #[test]
+    fn test_bootstrap_request_pkce_enabled_override() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.pkce_enabled = Some("false".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.pkce_enabled, Some(false));
+    }
+
+    #[test]
+    fn test_bootstrap_request_pkce_enabled_true() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.pkce_enabled = Some("true".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.pkce_enabled, Some(true));
+    }
+
+    #[test]
     fn test_bootstrap_request_all_optional_fields() {
         let req = build_oidc_request_from_values(OidcEnvVars {
             name: Some("Corporate OIDC".into()),
@@ -2187,6 +2605,7 @@ mod tests {
             redirect_uri: Some("https://app.corp.com/sso/callback".into()),
             username_claim: Some("samaccountname".into()),
             email_claim: Some("mail".into()),
+            ..Default::default()
         })
         .unwrap();
 
@@ -2214,9 +2633,10 @@ mod tests {
 
         let attr = req.attribute_mapping.unwrap();
         let obj = attr.as_object().unwrap();
-        // Only groups_claim should be present (it always has a default)
-        assert_eq!(obj.len(), 1);
-        assert!(obj.contains_key("groups_claim"));
+        // With no optional claims set, the attribute_mapping is empty:
+        // groups_claim is now only inserted when explicitly configured (#2831).
+        assert!(obj.is_empty());
+        assert!(!obj.contains_key("groups_claim"));
         assert!(!obj.contains_key("redirect_uri"));
         assert!(!obj.contains_key("username_claim"));
         assert!(!obj.contains_key("email_claim"));
@@ -2361,25 +2781,123 @@ mod tests {
     // tested manually via `--install` / `--uninstall` / `--service` flags.
 
     // -----------------------------------------------------------------------
-    // Regression: issue #1009 -- admin password is echoed to logs by default
-    // and hidden when ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD is set.
+    // GHSA-8523 -- the initial admin password must NOT be echoed to logs by
+    // default (it lands in log aggregators); operators opt IN explicitly.
     // -----------------------------------------------------------------------
 
+    // These two tests mutate the same process-wide env var; serialize them so
+    // parallel execution can't observe each other's toggle.
+    static LOG_PW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn admin_setup_banner_echoes_password_by_default() {
-        // We can't capture tracing output without a subscriber setup, so we
-        // exercise the path the banner takes and verify the env-toggle
-        // contract directly. The actual format is asserted by
-        // `admin_setup_banner_password_line_format`.
-        let saved = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD").ok();
-        std::env::remove_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD");
-        let hidden = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
-            .unwrap_or_default()
-            .eq_ignore_ascii_case("true");
-        assert!(!hidden, "default state must NOT hide the password");
+    fn admin_banner_hides_password_by_default() {
+        let _guard = LOG_PW_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD").ok();
+        std::env::remove_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD");
+
+        let secret = "S3cr3t-Plaintext-Pw!";
+        let line =
+            admin_banner_password_line(std::path::Path::new("/data/admin.password"), Some(secret));
+        assert!(
+            !line.contains(secret),
+            "default banner must NOT contain the plaintext password, got: {line:?}"
+        );
+        assert!(
+            line.contains("see file"),
+            "default banner should point at the file instead"
+        );
+
         if let Some(v) = saved {
-            std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", v);
+            std::env::set_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD", v);
         }
+    }
+
+    #[test]
+    fn admin_banner_echoes_password_when_opted_in() {
+        let _guard = LOG_PW_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD").ok();
+        std::env::set_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD", "true");
+
+        let secret = "S3cr3t-Plaintext-Pw!";
+        let line =
+            admin_banner_password_line(std::path::Path::new("/data/admin.password"), Some(secret));
+        assert!(
+            line.contains(secret),
+            "opt-in banner must echo the plaintext password, got: {line:?}"
+        );
+        // Case-insensitive toggle, matching the other env flags.
+        std::env::set_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD", "TRUE");
+        assert!(admin_banner_password_line(
+            std::path::Path::new("/data/admin.password"),
+            Some(secret)
+        )
+        .contains(secret));
+
+        if let Some(v) = saved {
+            std::env::set_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD", v);
+        } else {
+            std::env::remove_var("ARTIFACT_KEEPER_LOG_ADMIN_PASSWORD");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-8523 -- the admin password file is created private (0o600) with no
+    // world-readable TOCTOU window (atomic temp-create + rename).
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_password_file_is_written_private_and_atomic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("admin.password");
+        let secret = "unit-test-generated-pw";
+
+        write_admin_password_file(&target, secret).unwrap();
+
+        // Final file exists at exactly mode 0o600 -- never world/group readable.
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "admin password file must be 0o600, got {mode:o}"
+        );
+
+        let contents = std::fs::read_to_string(&target).unwrap();
+        assert!(contents.contains(secret), "file must contain the password");
+        assert!(
+            contents.contains("ONE-TIME SETUP"),
+            "file must keep the setup instructions"
+        );
+
+        // The temp file was renamed (not left behind): the only entry is target.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("admin.password")],
+            "no leftover temp file should remain in the directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_private_replaces_existing_target_at_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.txt");
+        // Seed a pre-existing, world-readable file at the target path.
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_file_private(&target, b"new-private-bytes").unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "replacement must be 0o600, got {mode:o}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-private-bytes");
     }
 
     // -----------------------------------------------------------------------
@@ -2414,26 +2932,6 @@ mod tests {
         hasher.update(embedded.as_bytes());
         let hash = hasher.finalize();
         assert_eq!(hash.len(), 48, "SHA-384 produces 48 bytes");
-    }
-
-    #[test]
-    fn admin_setup_banner_hides_password_when_env_set() {
-        let saved = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD").ok();
-        std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", "true");
-        let hidden = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
-            .unwrap_or_default()
-            .eq_ignore_ascii_case("true");
-        assert!(hidden);
-        // TRUE / True / 1-style toggles
-        std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", "TRUE");
-        assert!(std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
-            .unwrap()
-            .eq_ignore_ascii_case("true"));
-        if let Some(v) = saved {
-            std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", v);
-        } else {
-            std::env::remove_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD");
-        }
     }
 
     // -----------------------------------------------------------------------

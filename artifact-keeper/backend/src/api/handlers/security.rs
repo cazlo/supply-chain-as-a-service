@@ -11,7 +11,9 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::artifacts::check_artifact_visibility;
-use crate::api::handlers::repositories::{require_repo_write_access, require_visible};
+use crate::api::handlers::repositories::{
+    require_repo_admin, require_repo_write_access, require_visible,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -201,6 +203,21 @@ pub struct ScanResponse {
     /// satisfaction" in release-gate provenance checks. None for original
     /// (non-reused) scans.
     pub source_scan_id: Option<Uuid>,
+    /// #2471: number of `not_applicable` scanner rows folded into this row.
+    /// `Some(n)` marks a synthetic *summary* row that collapses `n` redundant
+    /// "this scanner does not apply" results (e.g. the image-family scanners
+    /// `filesystem`/`incus`/`openscap` all declining on a Docker image) into a
+    /// single muted "not applicable to this artifact" indication, so the UI
+    /// stops rendering N rows that read as N failures. `None` for every real
+    /// (non-collapsed) scan row. Omitted from the wire when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collapsed_not_applicable_count: Option<i32>,
+    /// #2471: the individual `scan_type` values folded into a summary row,
+    /// sorted and de-duplicated (e.g. `["filesystem","incus","openscap"]`).
+    /// Present only on a synthetic summary row (alongside
+    /// `collapsed_not_applicable_count`); `None` / omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collapsed_scan_types: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +265,84 @@ impl ScanResponse {
             created_at: s.created_at,
             is_reused: s.is_reused,
             source_scan_id: s.source_scan_id,
+            collapsed_not_applicable_count: None,
+            collapsed_scan_types: None,
         }
     }
+}
+
+/// #2471: collapse redundant `not_applicable` scan rows into one summary row
+/// per artifact.
+///
+/// When an artifact is offered to several image-family scanners that decline to
+/// run (`filesystem`, `incus`, `openscap`, ... all returning the dedicated
+/// `not_applicable` status from #1470), the raw scan list carries one
+/// `not_applicable` row per scanner. Operators misread these as N separate
+/// failures. This folds every `not_applicable` row belonging to the same
+/// artifact into a single synthetic summary row that records how many scanners
+/// declined (`collapsed_not_applicable_count`) and which `scan_type`s they were
+/// (`collapsed_scan_types`), so the UI can render one muted "not applicable to
+/// this artifact" indication instead of N ❌-looking rows.
+///
+/// Only groups of **two or more** `not_applicable` rows are collapsed — a lone
+/// `not_applicable` row is not redundant and passes through untouched. Every
+/// non-`not_applicable` row (completed / running / failed / findings) passes
+/// through verbatim. Relative ordering is preserved: the summary row takes the
+/// position of the artifact's *first* (most-recent, since the query is
+/// `created_at DESC`) collapsed row, and inherits that row's `id` so the UI can
+/// still drill into a representative scanner result.
+fn collapse_not_applicable_rows(items: Vec<ScanResponse>) -> Vec<ScanResponse> {
+    const NOT_APPLICABLE: &str = "not_applicable";
+
+    // Count not_applicable rows per artifact so we know which groups qualify.
+    let mut na_per_artifact: std::collections::HashMap<Uuid, usize> =
+        std::collections::HashMap::new();
+    for item in &items {
+        if item.status == NOT_APPLICABLE {
+            *na_per_artifact.entry(item.artifact_id).or_insert(0) += 1;
+        }
+    }
+
+    let mut out: Vec<ScanResponse> = Vec::with_capacity(items.len());
+    // Track which artifacts have already had their summary row emitted.
+    let mut summarized: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+
+    for item in items {
+        let collapses = item.status == NOT_APPLICABLE
+            && na_per_artifact.get(&item.artifact_id).copied().unwrap_or(0) >= 2;
+
+        if !collapses {
+            out.push(item);
+            continue;
+        }
+
+        if summarized.contains(&item.artifact_id) {
+            // A later row of an already-summarized group: fold its scan_type in.
+            if let Some(summary) = out
+                .iter_mut()
+                .find(|r| r.artifact_id == item.artifact_id && r.collapsed_scan_types.is_some())
+            {
+                if let Some(types) = summary.collapsed_scan_types.as_mut() {
+                    types.push(item.scan_type.clone());
+                    types.sort();
+                    types.dedup();
+                    summary.collapsed_not_applicable_count = Some(types.len() as i32);
+                }
+            }
+            continue;
+        }
+
+        // First collapsed row for this artifact: turn it into the summary row.
+        summarized.insert(item.artifact_id);
+        let mut summary = item;
+        summary.collapsed_scan_types = Some(vec![summary.scan_type.clone()]);
+        summary.scan_type = NOT_APPLICABLE.to_string();
+        summary.collapsed_not_applicable_count = Some(1);
+        summary.error_message = Some("Not applicable to this artifact".to_string());
+        out.push(summary);
+    }
+
+    out
 }
 
 impl From<crate::models::security::ScanFinding> for FindingResponse {
@@ -325,6 +418,7 @@ impl From<crate::models::security::ScanConfig> for ScanConfigResponse {
             scan_on_proxy: c.scan_on_proxy,
             block_on_policy_violation: c.block_on_policy_violation,
             severity_threshold: c.severity_threshold,
+            proxy_scan_action: c.proxy_scan_action,
             created_at: c.created_at,
             updated_at: c.updated_at,
         }
@@ -491,6 +585,9 @@ pub struct ScanConfigResponse {
     pub scan_on_proxy: bool,
     pub block_on_policy_violation: bool,
     pub severity_threshold: String,
+    /// #2954: fail-open (default) / fail-closed action for the inline proxy
+    /// scan-on-fetch.
+    pub proxy_scan_action: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -788,7 +885,11 @@ async fn list_scans(
         )
         .await?;
 
-    let items = enrich_scans(&state.db, scans).await?;
+    // #2471: fold redundant per-artifact `not_applicable` rows into a single
+    // muted summary row before returning. `total` is left as the raw DB row
+    // count (it drives pagination); the collapse only shrinks the rows shown on
+    // this page, and the `total >= items.len()` invariant still holds.
+    let items = collapse_not_applicable_rows(enrich_scans(&state.db, scans).await?);
     Ok(Json(ScanListResponse { items, total }))
 }
 
@@ -1175,6 +1276,12 @@ async fn update_repo_security(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // Scan configuration is a repository supply-chain control (scan_enabled /
+    // block_on_policy_violation / severity_threshold): disabling it must be
+    // repository administration, not artifact publishing. Same admin tier and
+    // fail-closed gate as the configuration subresources fixed in #2745
+    // (#2603 sibling, #2750).
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
     let repo = repo.id;
 
     let svc = ScanConfigService::new(state.db.clone());
@@ -1224,7 +1331,11 @@ async fn list_artifact_scans(
         )
         .await?;
 
-    let items = enrich_scans(&state.db, scans).await?;
+    // #2471: fold redundant per-artifact `not_applicable` rows into a single
+    // muted summary row before returning. `total` is left as the raw DB row
+    // count (it drives pagination); the collapse only shrinks the rows shown on
+    // this page, and the `total >= items.len()` invariant still holds.
+    let items = collapse_not_applicable_rows(enrich_scans(&state.db, scans).await?);
     Ok(Json(ScanListResponse { items, total }))
 }
 
@@ -1268,7 +1379,11 @@ async fn list_repo_scans(
         .list_scans(Some(repo), None, query.status.as_deref(), offset, per_page)
         .await?;
 
-    let items = enrich_scans(&state.db, scans).await?;
+    // #2471: fold redundant per-artifact `not_applicable` rows into a single
+    // muted summary row before returning. `total` is left as the raw DB row
+    // count (it drives pagination); the collapse only shrinks the rows shown on
+    // this page, and the `total >= items.len()` invariant still holds.
+    let items = collapse_not_applicable_rows(enrich_scans(&state.db, scans).await?);
     Ok(Json(ScanListResponse { items, total }))
 }
 
@@ -1339,6 +1454,13 @@ mod tests {
             body_of("update_repo_security").contains("require_repo_write_access("),
             "update_repo_security must call require_repo_write_access (xtenant)"
         );
+        assert!(
+            body_of("update_repo_security").contains("require_repo_admin("),
+            "update_repo_security must call require_repo_admin (#2750): scan \
+             configuration is a supply-chain control on the repository-admin \
+             tier; `write` (artifact publishing) must not suffice to disable \
+             scanning or the block-on-severity gate"
+        );
         for reader in ["get_repo_security", "list_repo_scans"] {
             assert!(
                 body_of(reader).contains("require_visible("),
@@ -1346,6 +1468,92 @@ mod tests {
                 reader
             );
         }
+    }
+
+    /// DB-backed (#2750, sibling of #2603): a non-admin member holding only
+    /// `write` (developer role via `grant_repo_access`, no fine-grained `admin`
+    /// grant) is DENIED `update_repo_security`, and the denied request must not
+    /// persist a scan config; granting the repository `admin` action lets it
+    /// through; a global admin always passes. Scan configuration gates the
+    /// vulnerability-scanning / block-on-severity supply chain, so write-level
+    /// access (artifact publishing) must not suffice to disable it.
+    #[tokio::test]
+    async fn update_repo_security_requires_repo_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        // Write-level membership only (developer role): passes the tenant gate.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = tdh::make_auth(user_id, &username);
+
+        // The exploit shape: turn scanning and the block-on-severity gate off.
+        let body = || UpsertScanConfigRequest {
+            scan_enabled: Some(false),
+            block_on_policy_violation: Some(false),
+            ..Default::default()
+        };
+
+        // 1) Write-only member -> 403, and nothing persisted.
+        let denied = update_repo_security(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path(key.clone()),
+            Json(body()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "write-only member must be denied (403) update_repo_security: {denied:?}"
+        );
+        let persisted = ScanConfigService::new(pool.clone())
+            .get_config(repo_id)
+            .await
+            .expect("get_config");
+        assert!(
+            persisted.is_none(),
+            "denied update_repo_security must not persist a scan config"
+        );
+
+        // 2) Grant repository `admin` -> allowed. Rebuild state so the
+        // permission-service cache (which recorded the pre-grant deny above)
+        // is empty and the new grant is resolved from the database.
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = update_repo_security(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path(key.clone()),
+            Json(body()),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "repo-admin member must pass update_repo_security: {allowed:?}"
+        );
+
+        // 3) Global admin -> allowed.
+        let admin = tdh::admin_auth(Uuid::new_v4(), "root");
+        let admin_ok = update_repo_security(
+            State(state.clone()),
+            Extension(Some(admin)),
+            Path(key.clone()),
+            Json(UpsertScanConfigRequest {
+                scan_enabled: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            admin_ok.is_ok(),
+            "global admin must pass update_repo_security: {admin_ok:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Admin gate on the GLOBAL security-policy write handlers. The global
@@ -1792,6 +2000,150 @@ mod tests {
         assert_eq!(resp.created_at, created);
         assert_eq!(resp.started_at, started);
         assert_eq!(resp.completed_at, completed);
+    }
+
+    // -----------------------------------------------------------------------
+    // collapse_not_applicable_rows (#2471)
+    // -----------------------------------------------------------------------
+
+    /// Build a `ScanResponse` for a given artifact/scan_type/status. Keeps the
+    /// collapse tests terse and independent of a DB.
+    fn make_scan_response(artifact_id: Uuid, scan_type: &str, status: &str) -> ScanResponse {
+        let mut resp = scan_result_to_response(make_scan_result(), None, None);
+        resp.artifact_id = artifact_id;
+        resp.scan_type = scan_type.to_string();
+        resp.status = status.to_string();
+        resp
+    }
+
+    /// N `not_applicable` rows for one artifact collapse into a single summary
+    /// row that records the count and the sorted, de-duplicated scan_types,
+    /// while a genuine finding row for the same artifact passes through.
+    #[test]
+    fn test_collapse_folds_multiple_not_applicable_into_one_summary() {
+        let art = Uuid::new_v4();
+        let items = vec![
+            make_scan_response(art, "image", "completed"),
+            make_scan_response(art, "openscap", "not_applicable"),
+            make_scan_response(art, "incus", "not_applicable"),
+            make_scan_response(art, "filesystem", "not_applicable"),
+        ];
+
+        let out = collapse_not_applicable_rows(items);
+
+        // 1 real finding row + 1 summary row.
+        assert_eq!(out.len(), 2);
+        let real = out
+            .iter()
+            .find(|r| r.status == "completed")
+            .expect("finding row survives");
+        assert_eq!(real.scan_type, "image");
+        assert!(real.collapsed_not_applicable_count.is_none());
+
+        let summary = out
+            .iter()
+            .find(|r| r.collapsed_not_applicable_count.is_some())
+            .expect("summary row emitted");
+        assert_eq!(summary.status, "not_applicable");
+        assert_eq!(summary.scan_type, "not_applicable");
+        assert_eq!(summary.collapsed_not_applicable_count, Some(3));
+        assert_eq!(
+            summary.collapsed_scan_types.as_deref(),
+            Some(
+                [
+                    "filesystem".to_string(),
+                    "incus".to_string(),
+                    "openscap".to_string()
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    /// A lone `not_applicable` row is not redundant and must pass through
+    /// unchanged (no synthetic summary, no annotation).
+    #[test]
+    fn test_collapse_leaves_single_not_applicable_untouched() {
+        let art = Uuid::new_v4();
+        let items = vec![
+            make_scan_response(art, "image", "completed"),
+            make_scan_response(art, "filesystem", "not_applicable"),
+        ];
+
+        let out = collapse_not_applicable_rows(items);
+
+        assert_eq!(out.len(), 2);
+        let na = out
+            .iter()
+            .find(|r| r.status == "not_applicable")
+            .expect("na row survives");
+        assert_eq!(na.scan_type, "filesystem");
+        assert!(na.collapsed_not_applicable_count.is_none());
+        assert!(na.collapsed_scan_types.is_none());
+    }
+
+    /// Collapse is scoped per-artifact: two artifacts each with their own
+    /// group of `not_applicable` rows collapse independently.
+    #[test]
+    fn test_collapse_groups_per_artifact() {
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let items = vec![
+            make_scan_response(a1, "incus", "not_applicable"),
+            make_scan_response(a1, "openscap", "not_applicable"),
+            make_scan_response(a2, "filesystem", "not_applicable"),
+            make_scan_response(a2, "openscap", "not_applicable"),
+        ];
+
+        let out = collapse_not_applicable_rows(items);
+
+        assert_eq!(out.len(), 2);
+        for summary in &out {
+            assert_eq!(summary.collapsed_not_applicable_count, Some(2));
+        }
+        assert_ne!(out[0].artifact_id, out[1].artifact_id);
+    }
+
+    /// Rows with no `not_applicable` status are returned verbatim, in order.
+    #[test]
+    fn test_collapse_noop_without_not_applicable() {
+        let art = Uuid::new_v4();
+        let items = vec![
+            make_scan_response(art, "image", "completed"),
+            make_scan_response(art, "dependency", "failed"),
+        ];
+
+        let out = collapse_not_applicable_rows(items);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].scan_type, "image");
+        assert_eq!(out[1].scan_type, "dependency");
+        assert!(out
+            .iter()
+            .all(|r| r.collapsed_not_applicable_count.is_none()));
+    }
+
+    /// The summary row keeps the position and `id` of the artifact's first
+    /// (most-recent) collapsed row so the UI can still drill into a
+    /// representative result and ordering is stable.
+    #[test]
+    fn test_collapse_summary_inherits_first_row_id_and_position() {
+        let art = Uuid::new_v4();
+        let first_na = make_scan_response(art, "incus", "not_applicable");
+        let first_id = first_na.id;
+        let items = vec![
+            first_na,
+            make_scan_response(art, "openscap", "not_applicable"),
+            make_scan_response(art, "image", "completed"),
+        ];
+
+        let out = collapse_not_applicable_rows(items);
+
+        assert_eq!(out.len(), 2);
+        // Summary takes the first slot (where the first not_applicable row was).
+        assert_eq!(out[0].id, first_id);
+        assert_eq!(out[0].collapsed_not_applicable_count, Some(2));
+        assert_eq!(out[1].status, "completed");
     }
 
     // -----------------------------------------------------------------------
@@ -2488,6 +2840,7 @@ mod tests {
                 scan_on_proxy: false,
                 block_on_policy_violation: true,
                 severity_threshold: "high".to_string(),
+                proxy_scan_action: "fail_open".to_string(),
                 created_at: now,
                 updated_at: now,
             }),
@@ -2528,6 +2881,7 @@ mod tests {
             scan_on_proxy: true,
             block_on_policy_violation: false,
             severity_threshold: "medium".to_string(),
+            proxy_scan_action: "fail_closed".to_string(),
             created_at: now,
             updated_at: now,
         };

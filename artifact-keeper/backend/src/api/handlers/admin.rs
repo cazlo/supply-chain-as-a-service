@@ -237,7 +237,32 @@ pub struct ListBackupsQuery {
 pub struct CreateBackupRequest {
     #[serde(rename = "type")]
     pub backup_type: Option<String>,
+    /// Explicit allow-list of repository ids to include in the backup.
+    ///
+    /// When omitted every repository is backed up (subject to
+    /// `exclude_repositories`).
     pub repository_ids: Option<Vec<Uuid>>,
+    /// Repository ids to exclude from a full or incremental backup (#2772).
+    ///
+    /// Airgapped or bandwidth-limited deployments use this to keep specific
+    /// repositories out of the backup. When omitted or empty nothing is
+    /// excluded, so existing behavior is unchanged. If `repository_ids` is
+    /// also supplied the excluded ids are removed from that include list;
+    /// otherwise every repository except the excluded ones is backed up.
+    pub exclude_repositories: Option<Vec<Uuid>>,
+    /// Optional RFC3339 lower bound on artifact modification time (#2789).
+    ///
+    /// When set, the (typically incremental) backup includes only artifacts
+    /// whose `updated_at` is at or after this timestamp, capturing just the
+    /// changes made from the given date/time to now. When omitted every
+    /// artifact is included, so backup behavior is unchanged.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional custom name/label for the backup archive (#2790).
+    ///
+    /// When provided it becomes the identifying part of the archive
+    /// filename. Restricted to letters, digits, `.`, `_`, and `-`; when
+    /// omitted the archive keeps its default `{uuid}` name.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -405,7 +430,10 @@ pub async fn create_backup(
         .create(ServiceCreateBackup {
             backup_type,
             repository_ids: payload.repository_ids,
+            exclude_repository_ids: payload.exclude_repositories,
+            since: payload.since,
             created_by: Some(auth.user_id),
+            name: payload.name,
         })
         .await?;
 
@@ -446,7 +474,9 @@ pub async fn execute_backup(
     Path(id): Path<Uuid>,
 ) -> Result<Json<BackupResponse>> {
     let storage = Arc::new(StorageService::from_config(&state.config).await?);
-    let service = BackupService::new(state.db.clone(), storage);
+    let archive_storage =
+        StorageService::backup_archive_from_config(&state.config, &storage).await?;
+    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
 
     let backup = service.execute(id).await?;
 
@@ -506,7 +536,9 @@ pub async fn restore_backup(
             .await
             .map_err(|e: AppError| e)?,
     );
-    let service = BackupService::new(state.db.clone(), storage);
+    let archive_storage =
+        StorageService::backup_archive_from_config(&state.config, &storage).await?;
+    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
 
     let options = RestoreOptions {
         restore_database: payload.restore_database.unwrap_or(true),
@@ -574,7 +606,9 @@ pub async fn delete_backup(
     Path(id): Path<Uuid>,
 ) -> Result<()> {
     let storage = Arc::new(StorageService::from_config(&state.config).await?);
-    let service = BackupService::new(state.db.clone(), storage);
+    let archive_storage =
+        StorageService::backup_archive_from_config(&state.config, &storage).await?;
+    let service = BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
 
     service.delete(id).await?;
     Ok(())
@@ -1105,7 +1139,10 @@ pub async fn run_cleanup(
 
     if request.cleanup_old_backups.unwrap_or(false) {
         let storage = Arc::new(StorageService::from_config(&state.config).await?);
-        let backup_service = BackupService::new(state.db.clone(), storage);
+        let archive_storage =
+            StorageService::backup_archive_from_config(&state.config, &storage).await?;
+        let backup_service =
+            BackupService::with_archive_storage(state.db.clone(), storage, archive_storage);
         result.backups_deleted = backup_service
             .cleanup(settings.backup_retention_count, settings.retention_days)
             .await? as i64;
@@ -1769,6 +1806,39 @@ mod tests {
     }
 
     #[test]
+    fn test_create_backup_request_custom_name() {
+        let json = r#"{"type": "full", "name": "nightly-prod"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, Some("nightly-prod".to_string()));
+    }
+
+    #[test]
+    fn test_create_backup_request_name_defaults_none() {
+        let json = r#"{"type": "full"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        assert!(req.name.is_none());
+    }
+
+    #[test]
+    fn test_create_backup_request_since_defaults_none() {
+        // #2789: without `since` the backup keeps its default (all artifacts).
+        let json = r#"{"type": "incremental"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        assert!(req.since.is_none());
+    }
+
+    #[test]
+    fn test_create_backup_request_parses_rfc3339_since() {
+        // #2789: an RFC3339 timestamp is accepted and parsed to a UTC instant.
+        let json = r#"{"type": "incremental", "since": "2026-01-15T12:30:00Z"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-01-15T12:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(req.since, Some(expected));
+    }
+
+    #[test]
     fn test_cleanup_request_deserialization() {
         let json = r#"{"cleanup_audit_logs": true, "cleanup_old_backups": false}"#;
         let req: CleanupRequest = serde_json::from_str(json).unwrap();
@@ -1934,14 +2004,22 @@ mod tests {
             client_ip: Some("203.0.113.10".parse().unwrap()),
             user_id: Some(user_id),
             user_agent: Some("admin-dl-test/1.0".to_string()),
+            is_head: false,
         };
         let ctx_anon = crate::api::middleware::download_telemetry::DownloadContext {
             client_ip: Some("203.0.113.11".parse().unwrap()),
             user_id: None,
             user_agent: None,
+            is_head: false,
         };
         crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_authed).await;
         crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_anon).await;
+        // #2522: the two INSERTs are now spawned off the hot path — wait for
+        // both rows to land before asserting on them.
+        assert_eq!(
+            tdh::download_count_eventually(&pool, artifact_id, 2).await,
+            2
+        );
 
         // Filter by artifact: both rows.
         let by_artifact = query_downloads(
@@ -2044,6 +2122,11 @@ mod tests {
 
         crate::services::artifact_service::record_download(&pool, artifact_id, &Default::default())
             .await;
+        // #2522: the INSERT is now spawned — wait for the row before reading it.
+        assert_eq!(
+            tdh::download_count_eventually(&pool, artifact_id, 1).await,
+            1
+        );
 
         let (ip, uid): (Option<String>, Option<Uuid>) = sqlx::query_as(
             "SELECT ip_address, user_id FROM download_statistics WHERE artifact_id = $1",

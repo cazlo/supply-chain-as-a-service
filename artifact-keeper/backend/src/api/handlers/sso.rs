@@ -60,10 +60,17 @@ async fn audit_federated_login(
     provider: &str,
     extra: serde_json::Value,
 ) {
+    let actor_name = extra
+        .get("username")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     let mut entry = AuditEntry::new(action, ResourceType::User)
         .details(federated_login_details(provider, extra));
     if let Some(id) = user_id {
         entry = entry.user(id).resource(id);
+    }
+    if let Some(name) = actor_name {
+        entry = entry.actor_name(name);
     }
     audit_fire_and_forget(state.db.clone(), entry).await;
 }
@@ -451,6 +458,12 @@ async fn oidc_callback_inner(
         .as_str()
         .ok_or_else(|| AppError::Internal("Token response missing id_token".into()))?;
 
+    // Capture the access_token for a later userinfo group fetch (#2831). GitLab
+    // delivers only DIRECT memberships in the id_token; the effective set incl.
+    // inherited subgroups is read from /userinfo with this bearer token. Absent
+    // ⇒ userinfo is skipped and id_token groups are used as-is.
+    let access_token = token_response["access_token"].as_str().map(str::to_owned);
+
     // 5. Verify ID token signature and validate standard claims
     let claims = validate_id_token(
         &http_client,
@@ -468,7 +481,7 @@ async fn oidc_callback_inner(
 
     let username_claim = resolve_oidc_claim_name(attr, "username_claim", "preferred_username");
     let email_claim = resolve_oidc_claim_name(attr, "email_claim", "email");
-    let groups_claim = resolve_oidc_claim_name(attr, "groups_claim", "groups");
+    let group_claim_candidates = oidc_groups_claim_candidates(attr);
 
     let sub = claims["sub"]
         .as_str()
@@ -485,7 +498,7 @@ async fn oidc_callback_inner(
 
     let display_name = claims["name"].as_str().map(|s| s.to_string());
 
-    let groups = extract_oidc_groups(&claims, groups_claim);
+    let id_token_groups = extract_oidc_groups(&claims, &group_claim_candidates);
 
     // Read admin group setting from DB attribute_mapping, falling back to env
     let required_admin_group = attr
@@ -493,6 +506,50 @@ async fn oidc_callback_inner(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| std::env::var("OIDC_ADMIN_GROUP").ok());
+
+    // 6a. Merge in group memberships from the userinfo endpoint (#2831).
+    //
+    // GitLab (and OIDC providers that separate direct vs effective membership)
+    // deliver only DIRECT groups in the id_token (`groups_direct`) and the full
+    // EFFECTIVE set incl. inherited subgroups at `/oauth/userinfo` (`groups`).
+    // Reading the id_token alone misses inherited subgroups, so we also fetch
+    // userinfo (default-on; opt-out via attribute_mapping.fetch_userinfo_groups)
+    // and union the two sets. The fetch is gated so it only fires when groups
+    // are actually consumed (group→group mapping or admin-group elevation), and
+    // is NON-FATAL: any failure degrades to id_token groups only and login still
+    // succeeds.
+    let want_userinfo_groups = (row.map_groups_to_groups || required_admin_group.is_some())
+        && userinfo_groups_enabled(attr);
+
+    let userinfo_groups: Vec<String> = if want_userinfo_groups {
+        match discovery["userinfo_endpoint"].as_str() {
+            None => {
+                tracing::debug!(
+                    "OIDC discovery has no userinfo_endpoint; using id_token groups only"
+                );
+                Vec::new()
+            }
+            Some(endpoint) => match validate_oidc_fetch_url(endpoint, "OIDC userinfo endpoint") {
+                Err(e) => {
+                    tracing::warn!(error = %e, "OIDC userinfo endpoint failed SSRF guard; skipping");
+                    Vec::new()
+                }
+                Ok(()) => {
+                    fetch_userinfo_groups(
+                        &http_client,
+                        endpoint,
+                        access_token.as_deref(),
+                        &group_claim_candidates,
+                    )
+                    .await
+                }
+            },
+        }
+    } else {
+        Vec::new()
+    };
+
+    let groups = merge_group_sets(id_token_groups, userinfo_groups);
 
     // 7. Authenticate via federated flow (find/create user + generate tokens)
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
@@ -633,12 +690,16 @@ pub async fn ldap_login(
         bind_password.as_deref(),
         &row.user_base_dn,
         &row.user_filter,
+        row.group_base_dn.as_deref(),
+        row.group_filter.as_deref(),
         &row.username_attribute,
         &row.email_attribute,
         &row.display_name_attribute,
         &row.groups_attribute,
         row.admin_group_dn.as_deref(),
         row.use_starttls,
+        row.insecure_skip_verify,
+        row.ca_certificate.as_deref(),
     );
 
     // Authenticate against LDAP. A bind/credential failure is the LDAP
@@ -659,6 +720,12 @@ pub async fn ldap_login(
         }
     };
 
+    // Keep copies for the group sync below; the `ldap_user` fields move
+    // into FederatedCredentials.
+    let ldap_dn = ldap_user.dn.clone();
+    let ldap_username = ldap_user.username.clone();
+    let ldap_member_of = ldap_user.groups.clone();
+
     // Sync user to local DB and generate JWT
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (user, tokens) = auth_service
@@ -677,6 +744,30 @@ pub async fn ldap_login(
             },
         )
         .await?;
+
+    // Issue #2468: when group sync is configured (group_base_dn and/or
+    // group_filter set), reflect the user's LDAP/AD groups as Artifact
+    // Keeper group memberships through the shared external-group
+    // reconciler (same mechanism as OIDC #1094 / SAML #2333): groups are
+    // auto-created tagged external_source = 'ldap', memberships upserted,
+    // and stale 'ldap'-managed memberships pruned per provider. Non-fatal:
+    // login still succeeds if the directory or DB hiccups.
+    if ldap_svc.group_sync_configured() {
+        let group_names = ldap_svc
+            .resolve_group_names(&ldap_dn, &ldap_username, &ldap_member_of)
+            .await;
+        if let Err(e) =
+            sync_federated_groups_to_local_groups(&state.db, user.id, id, "ldap", &group_names)
+                .await
+        {
+            tracing::warn!(
+                user_id = %user.id,
+                provider_id = %id,
+                error = %e,
+                "Failed to sync LDAP groups to local groups; user login still succeeds"
+            );
+        }
+    }
 
     audit_federated_login(
         &state,
@@ -901,6 +992,10 @@ pub async fn saml_acs(
         }
     };
 
+    // Keep a copy of the assertion group values for the membership sync
+    // below; `saml_user.groups` itself moves into FederatedCredentials.
+    let saml_groups = saml_user.groups.clone();
+
     // Sync user and generate tokens
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (user, tokens) = auth_service
@@ -928,6 +1023,26 @@ pub async fn saml_acs(
         serde_json::json!({ "username": user.username }),
     )
     .await;
+
+    // Issue #2333 (parity with OIDC #1094): when map_groups_to_groups is
+    // enabled, reflect the SAML assertion group values as Artifact Keeper
+    // group memberships. Auto-create groups (tagged with
+    // external_source = 'saml') on first sight and reconcile membership so
+    // removed groups drop their members. Non-fatal: login still succeeds if
+    // the sync fails.
+    if row.map_groups_to_groups {
+        if let Err(e) =
+            sync_federated_groups_to_local_groups(&state.db, user.id, id, "saml", &saml_groups)
+                .await
+        {
+            tracing::warn!(
+                error = %e,
+                user_id = %user.id,
+                provider_id = %id,
+                "Failed to sync SAML groups to local groups; user login still succeeds"
+            );
+        }
+    }
 
     // Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(
@@ -1110,75 +1225,287 @@ pub(crate) fn resolve_oidc_claim_name<'a>(
         .unwrap_or(default)
 }
 
-/// Extract user groups from JWT claims using the configured groups claim name.
-pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str) -> Vec<String> {
-    claims[groups_claim]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Delimiters used to split a scalar (string) OIDC groups claim into
+/// individual group names. IdPs that flatten a multi-valued claim into one
+/// string use comma / semicolon / whitespace; splitting on all of them covers
+/// the common shapes without needing per-provider configuration. Group names
+/// that legitimately contain a delimiter are only affected when the IdP emits
+/// them as a scalar string — the array form (below) preserves them verbatim.
+const OIDC_GROUP_CLAIM_DELIMS: &[char] = &[',', ';', ' ', '\t', '\n', '\r'];
+
+/// Ordered OIDC groups-claim candidates.
+///
+/// An explicit non-empty `attribute_mapping.groups_claim` pins resolution to
+/// that single claim (behaviour unchanged from today); otherwise fall through
+/// the documented default order `groups` → `groups_direct` → `roles`.
+///
+/// The default order covers the common IdPs without per-provider config:
+/// Keycloak/Okta/Azure publish under `groups`; GitLab (issue #2831) publishes
+/// membership paths under `groups_direct`; some setups map roles under `roles`.
+/// Only the first candidate that yields a non-empty list is used
+/// ([`extract_oidc_groups`]), so a provider that emits several of these keys
+/// resolves deterministically by this precedence.
+pub(crate) fn oidc_groups_claim_candidates(attr: &serde_json::Value) -> Vec<&str> {
+    match attr.get("groups_claim").and_then(|v| v.as_str()) {
+        Some(name) if !name.trim().is_empty() => vec![name],
+        _ => vec!["groups", "groups_direct", "roles"],
+    }
+}
+
+/// Parse a single OIDC claim value into a list of group names.
+///
+/// Handles the two shapes IdPs emit the groups claim in (issue #2781):
+/// - a JSON **array** of names — the standard form (Keycloak/Okta/Azure with a
+///   groups mapper). Only string elements are kept, verbatim. GitLab full
+///   group **paths** (e.g. `"platform/backend"`, issue #2831) pass through
+///   unchanged — the `/` is not a delimiter, so paths are never split.
+/// - a single JSON **string** — some IdPs/claim-mappers emit the groups claim
+///   as one scalar value, either a lone group name (`"admins"`) or a delimited
+///   list (`"admins,developers"` / `"admins developers"`). It is split on the
+///   usual list delimiters (which do NOT include `/`, so a single GitLab path
+///   string stays intact).
+///
+/// Blank entries are discarded and each name is trimmed. Non-string / absent
+/// claims yield no groups.
+fn groups_from_claim(v: &serde_json::Value) -> Vec<String> {
+    match v {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        serde_json::Value::String(s) => s
+            .split(OIDC_GROUP_CLAIM_DELIMS)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Extract user groups from JWT claims, trying each candidate claim name in
+/// order and returning the first that yields a non-empty list.
+///
+/// The candidate list comes from [`oidc_groups_claim_candidates`]: an explicit
+/// single-element slice when a provider configures `groups_claim`, or the
+/// default fallback order otherwise. GitLab (issue #2831) delivers membership
+/// paths under `groups_direct`, so the default order lets it resolve without
+/// per-provider config while explicit configuration is honoured exactly.
+///
+/// The result is passed straight into the shared, namespace-scoped reconciler,
+/// so this never over-grants: names only ever auto-create or attach within this
+/// provider's `external_source='oidc'` namespace and can never bind to an
+/// operator-managed group (#2759).
+pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, candidates: &[&str]) -> Vec<String> {
+    for name in candidates {
+        let groups = groups_from_claim(&claims[*name]);
+        if !groups.is_empty() {
+            return groups;
+        }
+    }
+    Vec::new()
+}
+
+/// Union of the id_token-derived and userinfo-derived OIDC group sets.
+///
+/// Order: id_token (direct) groups first, then any userinfo (effective) groups
+/// not already present. Dedup is exact-string (GitLab paths are preserved
+/// verbatim — no normalization, case-folding, or trimming here). GitLab (issue
+/// #2831) carries only DIRECT memberships in the id_token (`groups_direct`) and
+/// the full EFFECTIVE set including inherited subgroups at `/oauth/userinfo`
+/// (`groups`); the union is what surfaces inherited subgroups.
+pub(crate) fn merge_group_sets(
+    id_token_groups: Vec<String>,
+    userinfo_groups: Vec<String>,
+) -> Vec<String> {
+    let mut out = id_token_groups;
+    for g in userinfo_groups {
+        if !out.iter().any(|e| e == &g) {
+            out.push(g);
+        }
+    }
+    out
+}
+
+/// Whether to fetch groups from the OIDC `/userinfo` endpoint for a provider.
+///
+/// On by default; an operator disables it per-provider with
+/// `attribute_mapping.fetch_userinfo_groups = false` (stored in the free-form
+/// `attribute_mapping` JSON, so this needs no schema column). Absent or
+/// non-boolean ⇒ enabled.
+pub(crate) fn userinfo_groups_enabled(attr: &serde_json::Value) -> bool {
+    attr.get("fetch_userinfo_groups")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// Fetch and extract group memberships from the OIDC userinfo endpoint.
+///
+/// NON-FATAL by contract: every failure path (no access_token / non-200 /
+/// network / timeout / non-JSON / no groups) returns an empty `Vec` after a
+/// `warn!`/`debug!`. It never returns `Err` and never propagates `?`, so a
+/// userinfo outage cannot break login — it degrades to the id_token-only group
+/// set (issue #2831).
+///
+/// SECURITY: the caller MUST have already passed `userinfo_endpoint` through
+/// [`validate_oidc_fetch_url`] (the same SSRF guard used for the token
+/// endpoint). That gate is the sole entry to this function, so the
+/// `Authorization: Bearer <access_token>` is only ever sent to an
+/// SSRF-validated host. `http_client` is the shared [`sso_client`] whose
+/// per-hop redirect policy re-runs the SSRF block-list on every hop and whose
+/// SSRF DNS resolver blocks rebinding; the per-request 10s timeout bounds a
+/// slow/hung userinfo so it cannot pin a login worker.
+///
+/// [`sso_client`]: crate::services::http_client::sso_client
+async fn fetch_userinfo_groups(
+    http_client: &reqwest::Client,
+    userinfo_endpoint: &str,
+    access_token: Option<&str>,
+    candidates: &[&str],
+) -> Vec<String> {
+    let Some(token) = access_token else {
+        tracing::warn!("no access_token for OIDC userinfo; using id_token groups only");
+        return Vec::new();
+    };
+    let resp = match http_client
+        .get(userinfo_endpoint)
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "OIDC userinfo request failed; using id_token groups only");
+            return Vec::new();
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(status = %resp.status(), "OIDC userinfo non-200; using id_token groups only");
+        return Vec::new();
+    }
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "OIDC userinfo not JSON; using id_token groups only");
+            return Vec::new();
+        }
+    };
+    // Same candidate resolution as the id_token path; GitLab delivers the
+    // effective set under `groups` (candidate[0]).
+    extract_oidc_groups(&body, candidates)
 }
 
 /// Reconcile an OIDC user's group memberships against the `groups` table.
-///
-/// For each group name in `oidc_groups`:
-/// - Find the group by name; if missing, auto-create it tagged with
-///   `external_source = 'oidc'` and `external_provider_id = provider_id`.
-/// - Ensure a `user_group_members` row exists.
-///
-/// Then remove the user from any group that:
-/// - is tagged with this same `external_source` + `external_provider_id`, AND
-/// - is not present in `oidc_groups`.
-///
-/// Operator-managed groups (NULL `external_source`) are never modified by
-/// this sync. (Issue #1094.)
+/// Thin wrapper over [`sync_federated_groups_to_local_groups`] with the
+/// `oidc` source tag, preserved so the #1094 call site and tests stay
+/// unchanged.
 pub(crate) async fn sync_oidc_groups_to_local_groups(
     pool: &sqlx::PgPool,
     user_id: Uuid,
     provider_id: Uuid,
     oidc_groups: &[String],
 ) -> Result<()> {
+    sync_federated_groups_to_local_groups(pool, user_id, provider_id, "oidc", oidc_groups).await
+}
+
+/// Reconcile a federated user's group memberships against the `groups` table.
+///
+/// For each group name in `idp_groups`:
+/// - Find the group by name **within this provider's namespace** — i.e. only
+///   a group already tagged with `external_source = source` and
+///   `external_provider_id = provider_id` is reused; if missing, auto-create
+///   it with those tags.
+/// - Ensure a `user_group_members` row exists.
+///
+/// A name collision with any group OUTSIDE that namespace — operator-managed
+/// (`external_source IS NULL`) or owned by another source/provider — is
+/// refused and logged instead of granting membership (issue #2759): matching
+/// by name alone would let an IdP-supplied group name (e.g. an AD `cn` from a
+/// low-privilege OU, #2468) attach a federated user to a same-named
+/// privileged local group the operator created.
+///
+/// Then remove the user from any group that:
+/// - is tagged with this same `external_source` + `external_provider_id`, AND
+/// - is not present in `idp_groups`.
+///
+/// The prune is scoped to `(source, provider_id)`, so SAML-managed and
+/// OIDC-managed memberships never strip each other, and operator-managed
+/// groups (NULL `external_source`) are never modified by this sync.
+/// (Issues #1094, #2333, #2759.)
+pub(crate) async fn sync_federated_groups_to_local_groups(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    provider_id: Uuid,
+    source: &str,
+    idp_groups: &[String],
+) -> Result<()> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Upsert each OIDC group: find-or-create, then ensure membership.
-    let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(oidc_groups.len());
-    for name in oidc_groups {
+    // Upsert each external group: find-or-create, then ensure membership.
+    let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(idp_groups.len());
+    for name in idp_groups {
         if name.trim().is_empty() {
             continue;
         }
 
-        // Find-or-create the group atomically. Concurrent first-logins for
-        // the same brand-new group name from different users would race a
-        // separate SELECT + INSERT, with the loser of the race hitting the
-        // UNIQUE constraint on `groups.name` and aborting the transaction.
-        // ON CONFLICT (name) DO UPDATE … RETURNING id collapses the race
-        // into a single atomic upsert. The `DO UPDATE` (a no-op assignment)
-        // is what makes RETURNING populate for the conflicting row; a plain
-        // DO NOTHING would return zero rows on conflict. Operator-managed
-        // groups (NULL external_source) are reused without modification
-        // because we only assign description/external_source/external_provider_id
-        // when inserting, and the ON CONFLICT branch does not touch those
-        // columns.
-        let (group_id,): (Uuid,) = sqlx::query_as(
+        // Find-or-create the group atomically, scoped to THIS provider's
+        // namespace. Concurrent first-logins for the same brand-new group
+        // name from different users would race a separate SELECT + INSERT,
+        // with the loser of the race hitting the UNIQUE constraint on
+        // `groups.name` and aborting the transaction. ON CONFLICT (name)
+        // DO UPDATE … RETURNING id collapses the race into a single atomic
+        // upsert; the no-op `DO UPDATE` assignment is what makes RETURNING
+        // populate for the conflicting row.
+        //
+        // The DO UPDATE … WHERE clause is the #2759 ownership guard: the
+        // conflicting row is "updated" (and therefore returned) ONLY when it
+        // is already tagged with this same source + provider id. A collision
+        // with an operator-managed group (NULL external_source — the
+        // NULL = $3 comparison is never true) or with a group owned by a
+        // different source/provider returns no row, and membership is
+        // refused below instead of silently attaching the federated user to
+        // a same-named — potentially privileged — local group.
+        let group_id: Option<(Uuid,)> = sqlx::query_as(
             r#"
             INSERT INTO groups (name, description, external_source, external_provider_id)
-            VALUES ($1, $2, 'oidc', $3)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            WHERE groups.external_source = EXCLUDED.external_source
+              AND groups.external_provider_id = EXCLUDED.external_provider_id
             RETURNING id
             "#,
         )
         .bind(name)
-        .bind(format!("Auto-created from OIDC group claim: {name}"))
+        .bind(match source {
+            "saml" => format!("Auto-created from SAML group attribute: {name}"),
+            "ldap" => format!("Auto-created from LDAP group: {name}"),
+            _ => format!("Auto-created from OIDC group claim: {name}"),
+        })
+        .bind(source)
         .bind(provider_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let Some((group_id,)) = group_id else {
+            tracing::warn!(
+                group = %name,
+                source = %source,
+                provider_id = %provider_id,
+                user_id = %user_id,
+                "Refusing to add federated user to name-colliding group not \
+                 managed by this provider (operator-managed or foreign-source \
+                 group of the same name exists); membership not granted (#2759)"
+            );
+            continue;
+        };
 
         sqlx::query(
             r#"
@@ -1196,18 +1523,19 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
         current_group_ids.push(group_id);
     }
 
-    // Remove the user from any OIDC-managed group (same provider) that they
-    // are no longer a member of according to the latest claims. We deliberately
-    // limit the scope to groups marked external_source = 'oidc' AND
-    // external_provider_id = provider_id so we never strip membership in
-    // operator-managed groups or groups owned by other IdPs.
+    // Remove the user from any group managed by this same source (and same
+    // provider) that they are no longer a member of according to the latest
+    // values. We deliberately limit the scope to groups marked
+    // external_source = source AND external_provider_id = provider_id so we
+    // never strip membership in operator-managed groups, groups owned by
+    // other IdPs, or groups managed by the other protocol (SAML vs OIDC).
     sqlx::query(
         r#"
         DELETE FROM user_group_members
         WHERE user_id = $1
           AND group_id IN (
               SELECT id FROM groups
-              WHERE external_source = 'oidc'
+              WHERE external_source = $4
                 AND external_provider_id = $2
                 AND NOT (id = ANY($3))
           )
@@ -1216,6 +1544,7 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
     .bind(user_id)
     .bind(provider_id)
     .bind(&current_group_ids)
+    .bind(source)
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2336,7 +2665,7 @@ mod tests {
         let claims = serde_json::json!({
             "groups": ["admin", "developers", "users"]
         });
-        let groups = extract_oidc_groups(&claims, "groups");
+        let groups = extract_oidc_groups(&claims, &["groups"]);
         assert_eq!(groups, vec!["admin", "developers", "users"]);
     }
 
@@ -2345,29 +2674,68 @@ mod tests {
         let claims = serde_json::json!({
             "roles": ["manager", "viewer"]
         });
-        let groups = extract_oidc_groups(&claims, "roles");
+        let groups = extract_oidc_groups(&claims, &["roles"]);
         assert_eq!(groups, vec!["manager", "viewer"]);
     }
 
     #[test]
     fn test_extract_groups_missing_claim() {
         let claims = serde_json::json!({ "sub": "user-123" });
-        let groups = extract_oidc_groups(&claims, "groups");
+        let groups = extract_oidc_groups(&claims, &["groups"]);
         assert!(groups.is_empty());
     }
 
     #[test]
     fn test_extract_groups_empty_array() {
         let claims = serde_json::json!({ "groups": [] });
-        let groups = extract_oidc_groups(&claims, "groups");
+        let groups = extract_oidc_groups(&claims, &["groups"]);
         assert!(groups.is_empty());
     }
 
     #[test]
-    fn test_extract_groups_non_array_claim() {
+    fn test_extract_groups_single_string_claim() {
+        // Some IdPs emit a lone group as a bare string, not a 1-element array.
+        // This must sync as a single group, not be dropped (#2781).
         let claims = serde_json::json!({ "groups": "admin" });
-        let groups = extract_oidc_groups(&claims, "groups");
-        assert!(groups.is_empty()); // string is not an array
+        let groups = extract_oidc_groups(&claims, &["groups"]);
+        assert_eq!(groups, vec!["admin"]);
+    }
+
+    #[test]
+    fn test_extract_groups_comma_delimited_string() {
+        let claims = serde_json::json!({ "groups": "admin,developers,users" });
+        let groups = extract_oidc_groups(&claims, &["groups"]);
+        assert_eq!(groups, vec!["admin", "developers", "users"]);
+    }
+
+    #[test]
+    fn test_extract_groups_space_delimited_string() {
+        let claims = serde_json::json!({ "groups": "admin developers users" });
+        let groups = extract_oidc_groups(&claims, &["groups"]);
+        assert_eq!(groups, vec!["admin", "developers", "users"]);
+    }
+
+    #[test]
+    fn test_extract_groups_delimited_string_trims_and_drops_blanks() {
+        // Mixed delimiters + stray whitespace must not yield empty entries.
+        let claims = serde_json::json!({ "groups": " admin, ,developers;  users " });
+        let groups = extract_oidc_groups(&claims, &["groups"]);
+        assert_eq!(groups, vec!["admin", "developers", "users"]);
+    }
+
+    #[test]
+    fn test_extract_groups_array_trims_whitespace() {
+        let claims = serde_json::json!({ "groups": [" admin ", "developers", "  "] });
+        let groups = extract_oidc_groups(&claims, &["groups"]);
+        assert_eq!(groups, vec!["admin", "developers"]);
+    }
+
+    #[test]
+    fn test_extract_groups_non_string_scalar_claim() {
+        // A numeric/boolean claim is still not a valid groups value.
+        let claims = serde_json::json!({ "groups": 42 });
+        let groups = extract_oidc_groups(&claims, &["groups"]);
+        assert!(groups.is_empty());
     }
 
     #[test]
@@ -2375,7 +2743,7 @@ mod tests {
         let claims = serde_json::json!({
             "groups": ["admin", 42, "users", null, true]
         });
-        let groups = extract_oidc_groups(&claims, "groups");
+        let groups = extract_oidc_groups(&claims, &["groups"]);
         // Only string values are extracted
         assert_eq!(groups, vec!["admin", "users"]);
     }
@@ -2383,7 +2751,199 @@ mod tests {
     #[test]
     fn test_extract_groups_null_claim() {
         let claims = serde_json::json!({ "groups": null });
-        let groups = extract_oidc_groups(&claims, "groups");
+        let groups = extract_oidc_groups(&claims, &["groups"]);
+        assert!(groups.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // oidc_groups_claim_candidates (multi-name resolution, #2831)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_candidates_explicit_pins_single_claim() {
+        let attr = serde_json::json!({ "groups_claim": "roles" });
+        assert_eq!(oidc_groups_claim_candidates(&attr), vec!["roles"]);
+    }
+
+    #[test]
+    fn test_candidates_absent_uses_default_order() {
+        let attr = serde_json::json!({});
+        assert_eq!(
+            oidc_groups_claim_candidates(&attr),
+            vec!["groups", "groups_direct", "roles"]
+        );
+    }
+
+    #[test]
+    fn test_candidates_empty_string_uses_default_order() {
+        let attr = serde_json::json!({ "groups_claim": "" });
+        assert_eq!(
+            oidc_groups_claim_candidates(&attr),
+            vec!["groups", "groups_direct", "roles"]
+        );
+    }
+
+    #[test]
+    fn test_candidates_whitespace_only_uses_default_order() {
+        let attr = serde_json::json!({ "groups_claim": "   " });
+        assert_eq!(
+            oidc_groups_claim_candidates(&attr),
+            vec!["groups", "groups_direct", "roles"]
+        );
+    }
+
+    #[test]
+    fn test_candidates_non_string_uses_default_order() {
+        let attr = serde_json::json!({ "groups_claim": 42 });
+        assert_eq!(
+            oidc_groups_claim_candidates(&attr),
+            vec!["groups", "groups_direct", "roles"]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_oidc_groups candidate-slice resolution (#2831)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_groups_first_non_empty_candidate_wins() {
+        // `groups` absent/empty, `groups_direct` populated → groups_direct wins.
+        let claims = serde_json::json!({
+            "groups": [],
+            "groups_direct": ["platform", "platform/backend"],
+        });
+        let groups = extract_oidc_groups(&claims, &["groups", "groups_direct", "roles"]);
+        assert_eq!(groups, vec!["platform", "platform/backend"]);
+    }
+
+    #[test]
+    fn test_extract_groups_precedence_groups_over_direct() {
+        // Both present → first candidate (`groups`) wins deterministically.
+        let claims = serde_json::json!({
+            "groups": ["from-groups"],
+            "groups_direct": ["from-direct"],
+        });
+        let groups = extract_oidc_groups(&claims, &["groups", "groups_direct", "roles"]);
+        assert_eq!(groups, vec!["from-groups"]);
+    }
+
+    #[test]
+    fn test_extract_groups_all_candidates_empty() {
+        let claims = serde_json::json!({ "sub": "u1" });
+        let groups = extract_oidc_groups(&claims, &["groups", "groups_direct", "roles"]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_extract_groups_gitlab_paths_preserved_verbatim() {
+        // GitLab full paths must not be split, lowercased, or trimmed of slashes.
+        let claims = serde_json::json!({
+            "groups_direct": ["Platform", "platform/backend", "infra/backend"],
+        });
+        let groups = extract_oidc_groups(&claims, &["groups", "groups_direct", "roles"]);
+        assert_eq!(
+            groups,
+            vec!["Platform", "platform/backend", "infra/backend"]
+        );
+    }
+
+    #[test]
+    fn test_extract_groups_third_candidate_roles_fallback() {
+        let claims = serde_json::json!({ "roles": ["role-team"] });
+        let groups = extract_oidc_groups(&claims, &["groups", "groups_direct", "roles"]);
+        assert_eq!(groups, vec!["role-team"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_group_sets (id_token + userinfo union, #2831)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_group_sets_userinfo_empty_is_id_token_verbatim() {
+        let merged = merge_group_sets(
+            vec!["platform".to_string(), "platform/backend".to_string()],
+            vec![],
+        );
+        assert_eq!(merged, vec!["platform", "platform/backend"]);
+    }
+
+    #[test]
+    fn test_merge_group_sets_id_token_empty_is_userinfo_verbatim() {
+        let merged = merge_group_sets(vec![], vec!["platform".to_string()]);
+        assert_eq!(merged, vec!["platform"]);
+    }
+
+    #[test]
+    fn test_merge_group_sets_union_dedup_id_token_first() {
+        // bob: id_token direct = [platform]; userinfo effective =
+        // [platform, platform/backend] → union with the inherited subgroup,
+        // deduped, id_token order first.
+        let merged = merge_group_sets(
+            vec!["platform".to_string()],
+            vec!["platform".to_string(), "platform/backend".to_string()],
+        );
+        assert_eq!(merged, vec!["platform", "platform/backend"]);
+    }
+
+    #[test]
+    fn test_merge_group_sets_paths_verbatim_case_sensitive() {
+        // Exact-string dedup: differing case is NOT collapsed.
+        let merged = merge_group_sets(vec!["Platform".to_string()], vec!["platform".to_string()]);
+        assert_eq!(merged, vec!["Platform", "platform"]);
+    }
+
+    #[test]
+    fn test_merge_group_sets_both_empty() {
+        let merged = merge_group_sets(vec![], vec![]);
+        assert!(merged.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // userinfo_groups_enabled toggle (#2831)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_userinfo_groups_enabled_default_on() {
+        assert!(userinfo_groups_enabled(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn test_userinfo_groups_enabled_opt_out() {
+        assert!(!userinfo_groups_enabled(
+            &serde_json::json!({ "fetch_userinfo_groups": false })
+        ));
+    }
+
+    #[test]
+    fn test_userinfo_groups_enabled_explicit_true() {
+        assert!(userinfo_groups_enabled(
+            &serde_json::json!({ "fetch_userinfo_groups": true })
+        ));
+    }
+
+    #[test]
+    fn test_userinfo_groups_enabled_non_bool_defaults_on() {
+        assert!(userinfo_groups_enabled(
+            &serde_json::json!({ "fetch_userinfo_groups": "yes" })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_userinfo_groups NON-FATAL contract (#2831)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetch_userinfo_groups_no_access_token_is_empty() {
+        // No access_token ⇒ empty Vec, never a panic/error (login must survive
+        // a missing token). No network is touched on this branch.
+        let client = crate::services::http_client::sso_client();
+        let groups = fetch_userinfo_groups(
+            &client,
+            "https://idp.example.com/oauth/userinfo",
+            None,
+            &["groups", "groups_direct", "roles"],
+        )
+        .await;
         assert!(groups.is_empty());
     }
 
@@ -2595,7 +3155,10 @@ mod tests {
     // =======================================================================
 
     mod sync_db {
-        use super::super::sync_oidc_groups_to_local_groups;
+        use super::super::{
+            extract_oidc_groups, sync_federated_groups_to_local_groups,
+            sync_oidc_groups_to_local_groups,
+        };
         use crate::api::handlers::test_db_helpers as db_helpers;
         use sqlx::PgPool;
         use uuid::Uuid;
@@ -2716,6 +3279,45 @@ mod tests {
             cleanup_user(&pool, user_id).await;
         }
 
+        /// End-to-end proof for #2781: an OIDC id_token whose groups claim is
+        /// a delimited *string* (not an array) must still create + attach
+        /// admin-visible groups. Before the extract fix this list was empty
+        /// and no groups were created; the group lookups below would fail.
+        #[tokio::test]
+        async fn test_string_groups_claim_creates_admin_visible_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let g1 = rand_group_name("eng");
+            let g2 = rand_group_name("ops");
+
+            // Simulate an IdP that emits the groups claim as a single
+            // comma-delimited string rather than a JSON array.
+            let claims = serde_json::json!({ "groups": format!("{g1},{g2}") });
+            let groups = extract_oidc_groups(&claims, &["groups"]);
+            assert_eq!(groups, vec![g1.clone(), g2.clone()]);
+
+            sync_oidc_groups_to_local_groups(&pool, user_id, provider_id, &groups)
+                .await
+                .expect("sync");
+
+            // The Groups admin list selects straight from `groups` with no
+            // external_source filter, so a created+tagged row is admin-visible.
+            let g1_id = group_id_by_name(&pool, &g1).await.expect("g1 created");
+            let g2_id = group_id_by_name(&pool, &g2).await.expect("g2 created");
+            assert!(user_is_in_group(&pool, user_id, g1_id).await);
+            assert!(user_is_in_group(&pool, user_id, g2_id).await);
+            assert_eq!(
+                group_external_source(&pool, g1_id).await.as_deref(),
+                Some("oidc")
+            );
+
+            cleanup_groups(&pool, &[g1_id, g2_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
         #[tokio::test]
         async fn test_sync_skips_empty_and_whitespace_group_names() {
             let Some(pool) = db_helpers::try_pool().await else {
@@ -2750,8 +3352,13 @@ mod tests {
             cleanup_user(&pool, user_id).await;
         }
 
+        /// #2759 contract (flipped from the pre-hardening behaviour, which
+        /// asserted the federated user WAS attached): a name collision with
+        /// an operator-managed group (NULL external_source) must NOT grant
+        /// membership in that group, and the group itself must be left
+        /// untouched.
         #[tokio::test]
-        async fn test_sync_reuses_operator_managed_group_without_modifying_source() {
+        async fn test_sync_never_attaches_federated_user_to_operator_managed_group() {
             let Some(pool) = db_helpers::try_pool().await else {
                 return;
             };
@@ -2776,16 +3383,123 @@ mod tests {
                 std::slice::from_ref(&name),
             )
             .await
-            .expect("sync");
+            .expect("sync must not fail on the collision — it skips the group");
 
-            // The same group id must be reused (not duplicated).
+            // No duplicate group appears (UNIQUE(name)), the operator group
+            // keeps its id and NULL source, and — the point of #2759 — the
+            // federated user is NOT a member of it.
             let found_id = group_id_by_name(&pool, &name).await.expect("found");
             assert_eq!(found_id, preexisting_id);
-            assert!(user_is_in_group(&pool, user_id, found_id).await);
-            // external_source must remain NULL (operator-managed).
             assert!(group_external_source(&pool, found_id).await.is_none());
+            assert!(
+                !user_is_in_group(&pool, user_id, found_id).await,
+                "federated sync must not grant membership in an \
+                 operator-managed group of the same name"
+            );
 
             cleanup_groups(&pool, &[found_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// #2759 via the #2468 LDAP path: an AD `cn` from a low-privilege OU
+        /// (mapped cn-only by the LDAP group sync) colliding with a
+        /// privileged operator-managed local group must not grant that
+        /// group's membership — while legitimate ldap-namespaced groups in
+        /// the SAME sync still create and attach normally.
+        #[tokio::test]
+        async fn test_ldap_cn_collision_with_privileged_operator_group_is_refused() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let privileged = rand_group_name("developers");
+            let legit = rand_group_name("ldap-contractors");
+
+            let privileged_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name, description) VALUES ($1, $2, $3)")
+                .bind(privileged_id)
+                .bind(&privileged)
+                .bind("operator-managed privileged group")
+                .execute(&pool)
+                .await
+                .expect("create privileged group");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                &[privileged.clone(), legit.clone()],
+            )
+            .await
+            .expect("sync succeeds; colliding name is skipped, not fatal");
+
+            assert!(
+                !user_is_in_group(&pool, user_id, privileged_id).await,
+                "AD cn collision must not grant the operator-managed \
+                 privileged group"
+            );
+            // The legitimate group from the same sync still works end to end.
+            let legit_id = group_id_by_name(&pool, &legit).await.expect("legit group");
+            assert!(user_is_in_group(&pool, user_id, legit_id).await);
+            assert_eq!(
+                group_external_source(&pool, legit_id).await.as_deref(),
+                Some("ldap")
+            );
+
+            cleanup_groups(&pool, &[privileged_id, legit_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// #2759 cross-namespace variant: a group owned by a DIFFERENT
+        /// source (or provider) is just as off-limits as an operator-managed
+        /// one — an LDAP sync must not attach to an OIDC-owned group of the
+        /// same name.
+        #[tokio::test]
+        async fn test_sync_never_attaches_to_foreign_source_group() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let name = rand_group_name("cross-src");
+
+            // Group owned by an OIDC provider (same provider UUID to prove
+            // the source participates in the namespace, not just the id).
+            let oidc_group_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO groups (id, name, external_source, external_provider_id) \
+                 VALUES ($1, $2, 'oidc', $3)",
+            )
+            .bind(oidc_group_id)
+            .bind(&name)
+            .bind(provider_id)
+            .execute(&pool)
+            .await
+            .expect("create oidc-owned group");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                std::slice::from_ref(&name),
+            )
+            .await
+            .expect("sync succeeds; foreign-source collision is skipped");
+
+            assert!(
+                !user_is_in_group(&pool, user_id, oidc_group_id).await,
+                "LDAP sync must not attach to an OIDC-owned group of the same name"
+            );
+            assert_eq!(
+                group_external_source(&pool, oidc_group_id).await.as_deref(),
+                Some("oidc"),
+                "foreign group's ownership tags must be untouched"
+            );
+
+            cleanup_groups(&pool, &[oidc_group_id]).await;
             cleanup_user(&pool, user_id).await;
         }
 
@@ -2938,6 +3652,291 @@ mod tests {
             let gid = group_id_by_name(&pool, &name).await.unwrap();
             assert!(user_is_in_group(&pool, user_id, gid).await);
             cleanup_groups(&pool, &[gid]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        // ===================================================================
+        // SAML variant (#2333) — same reconciler via the "saml" source
+        // wrapper. Mirrors the #1094 OIDC suite above; the isolation test is
+        // the one that pins the NEW contract: the prune must be scoped by
+        // external_source, not just provider id.
+        // ===================================================================
+
+        #[tokio::test]
+        async fn test_saml_sync_creates_groups_tagged_saml_and_membership() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let g1 = rand_group_name("saml-eng");
+            let g2 = rand_group_name("saml-ops");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                &[g1.clone(), g2.clone()],
+            )
+            .await
+            .expect("saml sync");
+
+            let g1_id = group_id_by_name(&pool, &g1).await.expect("g1 created");
+            let g2_id = group_id_by_name(&pool, &g2).await.expect("g2 created");
+            assert!(user_is_in_group(&pool, user_id, g1_id).await);
+            assert!(user_is_in_group(&pool, user_id, g2_id).await);
+            // Auto-created groups must be tagged with external_source = 'saml'.
+            assert_eq!(
+                group_external_source(&pool, g1_id).await.as_deref(),
+                Some("saml")
+            );
+            assert_eq!(
+                group_external_source(&pool, g2_id).await.as_deref(),
+                Some("saml")
+            );
+
+            cleanup_groups(&pool, &[g1_id, g2_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        // ===================================================================
+        // LDAP variant (#2468) — same reconciler via the "ldap" source from
+        // the ldap_login handler. Groups resolved from AD memberOf / group
+        // search are auto-created tagged external_source = 'ldap' and stale
+        // ldap-managed memberships are pruned on the next login.
+        // ===================================================================
+
+        #[tokio::test]
+        async fn test_ldap_sync_creates_groups_tagged_ldap_and_prunes() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let devops = rand_group_name("ldap-devops");
+            let qa = rand_group_name("ldap-qa");
+
+            // First login: user is in both AD groups.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                &[devops.clone(), qa.clone()],
+            )
+            .await
+            .expect("first ldap sync");
+
+            let devops_id = group_id_by_name(&pool, &devops).await.expect("devops");
+            let qa_id = group_id_by_name(&pool, &qa).await.expect("qa");
+            assert!(user_is_in_group(&pool, user_id, devops_id).await);
+            assert!(user_is_in_group(&pool, user_id, qa_id).await);
+            assert_eq!(
+                group_external_source(&pool, devops_id).await.as_deref(),
+                Some("ldap")
+            );
+
+            // Second login: dropped from qa in AD -> membership pruned,
+            // devops survives.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "ldap",
+                std::slice::from_ref(&devops),
+            )
+            .await
+            .expect("second ldap sync");
+            assert!(user_is_in_group(&pool, user_id, devops_id).await);
+            assert!(!user_is_in_group(&pool, user_id, qa_id).await);
+
+            cleanup_groups(&pool, &[devops_id, qa_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_saml_sync_prunes_removed_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let eng = rand_group_name("saml-keep");
+            let ops = rand_group_name("saml-drop");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                &[eng.clone(), ops.clone()],
+            )
+            .await
+            .expect("first saml sync");
+            let eng_id = group_id_by_name(&pool, &eng).await.unwrap();
+            let ops_id = group_id_by_name(&pool, &ops).await.unwrap();
+
+            // Second sync drops `ops`: its membership must be pruned while
+            // `eng` survives.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                std::slice::from_ref(&eng),
+            )
+            .await
+            .expect("second saml sync");
+
+            assert!(user_is_in_group(&pool, user_id, eng_id).await);
+            assert!(
+                !user_is_in_group(&pool, user_id, ops_id).await,
+                "membership in a group absent from the latest assertion must be pruned"
+            );
+
+            cleanup_groups(&pool, &[eng_id, ops_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// The #2333 isolation contract: a SAML sync must never strip
+        /// membership in operator-managed groups (NULL external_source) NOR
+        /// in OIDC-managed groups — even when the OIDC group carries the
+        /// SAME provider UUID. This is what the `source` scoping in the
+        /// shared reconciler's DELETE buys over provider-id scoping alone.
+        #[tokio::test]
+        async fn test_saml_sync_isolated_from_operator_and_oidc_memberships() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let saml_name = rand_group_name("saml-owned");
+
+            // Operator-managed group (NULL external_source).
+            let op_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+                .bind(op_id)
+                .bind(rand_group_name("op-managed"))
+                .execute(&pool)
+                .await
+                .expect("create operator group");
+
+            // OIDC-managed group tagged with the SAME provider UUID.
+            let oidc_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO groups (id, name, external_source, external_provider_id) \
+                 VALUES ($1, $2, 'oidc', $3)",
+            )
+            .bind(oidc_id)
+            .bind(rand_group_name("oidc-managed"))
+            .bind(provider_id)
+            .execute(&pool)
+            .await
+            .expect("create oidc group");
+
+            for gid in [op_id, oidc_id] {
+                sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                    .bind(user_id)
+                    .bind(gid)
+                    .execute(&pool)
+                    .await
+                    .expect("seed membership");
+            }
+
+            // A SAML sync that names NEITHER group must leave both intact.
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                std::slice::from_ref(&saml_name),
+            )
+            .await
+            .expect("saml sync");
+
+            assert!(
+                user_is_in_group(&pool, user_id, op_id).await,
+                "operator-managed membership must survive a SAML sync"
+            );
+            assert!(
+                user_is_in_group(&pool, user_id, oidc_id).await,
+                "OIDC-managed membership (same provider UUID) must survive a SAML sync"
+            );
+
+            let saml_id = group_id_by_name(&pool, &saml_name).await.unwrap();
+            cleanup_groups(&pool, &[saml_id, op_id, oidc_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// Symmetric isolation: an OIDC sync must not strip SAML-managed
+        /// memberships either (the pre-#2333 prune would have, had it been
+        /// provider-scoped only).
+        #[tokio::test]
+        async fn test_oidc_sync_isolated_from_saml_memberships() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let saml_name = rand_group_name("saml-side");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                std::slice::from_ref(&saml_name),
+            )
+            .await
+            .expect("saml sync");
+            let saml_id = group_id_by_name(&pool, &saml_name).await.unwrap();
+
+            // An OIDC sync with an empty claim list on the SAME provider UUID
+            // must not prune the SAML-managed membership.
+            sync_oidc_groups_to_local_groups(&pool, user_id, provider_id, &[])
+                .await
+                .expect("oidc sync");
+
+            assert!(
+                user_is_in_group(&pool, user_id, saml_id).await,
+                "SAML-managed membership must survive an OIDC sync on the same provider"
+            );
+
+            cleanup_groups(&pool, &[saml_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_saml_sync_skips_empty_and_whitespace_group_names() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let real = rand_group_name("saml-real");
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "saml",
+                &[
+                    String::new(),
+                    "   ".to_string(),
+                    "\t".to_string(),
+                    real.clone(),
+                ],
+            )
+            .await
+            .expect("saml sync");
+
+            let real_id = group_id_by_name(&pool, &real).await.expect("real group");
+            assert!(user_is_in_group(&pool, user_id, real_id).await);
+            assert!(group_id_by_name(&pool, "").await.is_none());
+            assert!(group_id_by_name(&pool, "   ").await.is_none());
+
+            cleanup_groups(&pool, &[real_id]).await;
             cleanup_user(&pool, user_id).await;
         }
     }

@@ -6,6 +6,7 @@
 mod macros;
 
 pub mod api;
+pub mod build_info;
 pub mod cli;
 pub mod config;
 pub mod db;
@@ -17,6 +18,13 @@ pub mod models;
 pub mod services;
 pub mod storage;
 pub mod telemetry;
+// Test-harness plumbing (DB skip-vs-fail decision, #2924). Always compiled so
+// both the crate's `#[cfg(test)]` unit tests and the out-of-crate integration
+// tests under `backend/tests/` (which see the library without `cfg(test)`) can
+// share one place; `#[doc(hidden)]` because it carries no production behavior.
+#[doc(hidden)]
+pub mod testing;
+pub mod util;
 
 pub use config::Config;
 pub use error::{AppError, Result};

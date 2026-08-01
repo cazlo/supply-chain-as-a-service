@@ -109,7 +109,7 @@ pub struct SystemVersionResponse {
     pub license: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct RepositoryListItem {
     pub key: String,
     #[serde(rename = "type")]
@@ -118,6 +118,22 @@ pub struct RepositoryListItem {
     pub package_type: String,
     pub url: Option<String>,
     pub description: Option<String>,
+    /// For virtual/group repositories: the ordered list of *source-side* member
+    /// repository keys (Nexus `group.memberNames`, Artifactory virtual
+    /// `repositories`). Empty for local/remote repos and for sources that do not
+    /// report membership. These are source names that must be correlated to the
+    /// migrated Artifact Keeper repositories before a virtual repo can be wired
+    /// up (issue #2783).
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// For remote/proxy repositories: the upstream URL the source proxies. This
+    /// is distinct from `url` (which for Nexus is the repo's own browse URL).
+    /// It is threaded into the migrated Artifact Keeper repo's `upstream_url`
+    /// column; a remote repo migrated without it is rejected by the
+    /// `check_upstream_url` constraint (issue #2822). Populated best-effort from
+    /// the Artifactory remote-config `url` / Nexus `proxy.remoteUrl`.
+    #[serde(default)]
+    pub upstream_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -497,7 +513,17 @@ impl ArtifactoryClient {
 
     /// List all repositories
     pub async fn list_repositories(&self) -> Result<Vec<RepositoryListItem>, ArtifactoryError> {
-        self.get("/api/repositories").await
+        let mut items: Vec<RepositoryListItem> = self.get("/api/repositories").await?;
+        // Artifactory's `/api/repositories` reports a remote repo's configured
+        // upstream in the `url` field. Capture it as `upstream_url` so remote
+        // repos migrate with a non-NULL upstream; otherwise Artifact Keeper's
+        // `check_upstream_url` constraint rejects the created repo (issue #2822).
+        for item in items.iter_mut() {
+            if item.repo_type.eq_ignore_ascii_case("remote") {
+                item.upstream_url = item.url.clone();
+            }
+        }
+        Ok(items)
     }
 
     /// Get repository configuration
@@ -814,6 +840,27 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
         path: &str,
     ) -> Result<crate::services::source_registry::ArtifactByteStream, ArtifactoryError> {
         self.download_artifact_stream(repo_key, path).await
+    }
+
+    async fn download_oci_content_stream(
+        &self,
+        repo_key: &str,
+        image: &str,
+        digest: &str,
+        kind: crate::services::source_registry::OciContentKind,
+    ) -> Result<crate::services::source_registry::ArtifactByteStream, ArtifactoryError> {
+        // Artifactory exposes each Docker repository through its Docker
+        // Registry v2 REST API at `api/docker/<repo>/v2/<image>/{blobs|manifests}/<digest>`.
+        // `download_artifact_stream` joins `<base>/<repo>/<path>`, so pass the
+        // API prefix as the repo segment and the image-relative remainder as
+        // the path. In practice the migration enumerates Artifactory blobs and
+        // child manifests as their own items, so the referenced-content walker
+        // dedups them and never calls this — it exists for correctness if the
+        // enumeration ever misses a referenced digest.
+        crate::services::source_registry::validate_oci_content_ref(image, digest)?;
+        let api_repo = format!("api/docker/{}/v2", repo_key);
+        let path = format!("{}/{}/{}", image, kind.path_segment(), digest);
+        self.download_artifact_stream(&api_repo, &path).await
     }
 
     async fn get_properties(

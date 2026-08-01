@@ -51,6 +51,7 @@ fn test_config(storage_path: &str) -> Config {
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
         storage_path: storage_path.into(),
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        setup_password_hint: None,
         ..Default::default()
     }
 }
@@ -352,7 +353,7 @@ async fn resolve_virtual_manifest_rejects_digest_ref_mismatch_and_falls_through(
     let res = resolve_virtual_manifest(&state, virt_id, "myimage", &digest, None).await;
 
     match res {
-        Some((returned_digest, _ct, body)) => {
+        Some((returned_digest, _ct, body, _member)) => {
             assert_eq!(
                 returned_digest, digest,
                 "returned digest must equal requested digest"

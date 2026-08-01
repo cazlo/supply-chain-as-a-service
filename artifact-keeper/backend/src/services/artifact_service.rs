@@ -388,6 +388,48 @@ impl ArtifactService {
         Ok(())
     }
 
+    /// Verify client-declared `x-checksum-*` headers against digests already
+    /// computed by the streaming stage pass, without re-reading the body.
+    ///
+    /// Semantically identical to [`Self::verify_checksums`] (same case-insensitive
+    /// comparison, same per-algorithm error messages) but takes the precomputed
+    /// [`ContentDigests`] instead of a full in-memory buffer. The streaming
+    /// upload path computes SHA-256/SHA-1/MD5 in a single pass while spooling the
+    /// body to scratch (#2517), so this makes the extra hashing passes that
+    /// `verify_checksums` performed unnecessary.
+    pub fn verify_declared_digests(
+        digests: &ContentDigests,
+        declared_sha256: Option<&str>,
+        declared_sha1: Option<&str>,
+        declared_md5: Option<&str>,
+    ) -> Result<()> {
+        if let Some(declared) = declared_sha256 {
+            if !declared.eq_ignore_ascii_case(&digests.sha256) {
+                return Err(AppError::Validation(format!(
+                    "SHA-256 checksum mismatch: declared {} but actual content hashes to {}",
+                    declared, digests.sha256
+                )));
+            }
+        }
+        if let Some(declared) = declared_sha1 {
+            if !declared.eq_ignore_ascii_case(&digests.sha1) {
+                return Err(AppError::Validation(format!(
+                    "SHA-1 checksum mismatch: declared {} but actual content hashes to {}",
+                    declared, digests.sha1
+                )));
+            }
+        }
+        if let Some(declared) = declared_md5 {
+            if !declared.eq_ignore_ascii_case(&digests.md5) {
+                return Err(AppError::Validation(format!(
+                    "MD5 checksum mismatch: declared {} but actual content hashes to {}",
+                    declared, digests.md5
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Generate content-addressable storage key from checksum
     pub fn storage_key_from_checksum(checksum: &str) -> String {
         // Use first 4 chars for directory sharding: ab/cd/abcd...
@@ -741,6 +783,31 @@ impl ArtifactService {
             None
         };
 
+        // Atomic quota admission (#2523). The authoritative quota check runs
+        // here, in the same transaction as the artifact INSERT, holding a
+        // `FOR UPDATE` lock on the repository's usage-ledger row. This closes
+        // the over-admission race: the preflight `check_quota` above is an
+        // unlocked best-effort early reject, so two concurrent near-limit
+        // uploads can both pass it; here the second admission blocks on the
+        // first's lock and, once the first's INSERT commits, observes those
+        // bytes and is rejected when the quota would be exceeded.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let admission = self
+            .repo_service
+            .check_quota_locked(&mut tx, repository_id, path, size_bytes)
+            .await?;
+        if !admission.allowed {
+            // Drop `tx` (rolls back). The content blob is content-addressed;
+            // if this upload orphaned it, storage GC reclaims it.
+            return Err(AppError::QuotaExceeded(
+                "Repository storage quota exceeded".to_string(),
+            ));
+        }
+
         // Create artifact record.
         //
         // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
@@ -788,9 +855,15 @@ impl ArtifactService {
             storage_key,
             uploaded_by
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Commit the admission + INSERT together, releasing the ledger-row
+        // lock. Everything below is a post-commit side effect on the pool.
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         // #2367: append an immutable revision to `artifact_versions` for
         // versioning-enabled Generic/Mlmodel repos. Identical-bytes
@@ -810,11 +883,17 @@ impl ArtifactService {
         )
         .await;
 
-        // Check quota warning threshold after successful upload
-        if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
-            if let Some(quota) = repo.quota_bytes {
-                if let Ok(current_usage) = self.repo_service.get_storage_usage(repository_id).await
-                {
+        // Check quota warning threshold after successful upload.
+        //
+        // PF-007 (#2523): reuse the usage computed during atomic admission
+        // instead of re-running the full 3-way aggregate here. `base_usage`
+        // excludes the row we just wrote at `path`, so post-upload usage is
+        // `base_usage + size_bytes`. It is `Some` only when a finite quota is
+        // set (the only case a warning can fire).
+        if let Some(base_usage) = admission.base_usage {
+            if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
+                if let Some(quota) = repo.quota_bytes {
+                    let current_usage = base_usage + size_bytes;
                     if crate::services::repository_service::exceeds_quota_warning_threshold(
                         current_usage,
                         quota,
@@ -837,11 +916,31 @@ impl ArtifactService {
 
         // Populate packages / package_versions tables (non-blocking)
         if let Some(ref ver) = artifact.version {
+            // #2723: Maven/Gradle grouped listings key the catalog `packages`
+            // row on `groupId:artifactId`. The dedicated Maven upload handler
+            // already records that form; normalize this generic finalize path
+            // (replication / migration / generic push) to match instead of
+            // persisting the bare artifactId or filename, which would split a
+            // single component across multiple grouped rows.
+            let package_name = match self.repo_service.get_by_id(artifact.repository_id).await {
+                Ok(repo)
+                    if matches!(
+                        repo.format,
+                        RepositoryFormat::Maven | RepositoryFormat::Gradle
+                    ) =>
+                {
+                    crate::formats::maven::MavenHandler::grouped_package_name(
+                        &artifact.path,
+                        &artifact.name,
+                    )
+                }
+                _ => artifact.name.clone(),
+            };
             let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
             pkg_svc
                 .try_create_or_update_from_artifact(
                     artifact.repository_id,
-                    &artifact.name,
+                    &package_name,
                     ver,
                     artifact.size_bytes,
                     &artifact.checksum_sha256,
@@ -1043,13 +1142,16 @@ impl ArtifactService {
             };
             let mut entry = AuditEntry::new(AuditAction::ArtifactUploaded, ResourceType::Artifact)
                 .resource(artifact.id)
-                .details(serde_json::json!({
-                    "repository_id": artifact.repository_id.to_string(),
-                    "path": artifact.path,
-                    "name": artifact.name,
-                    "version": artifact.version,
-                    "size_bytes": artifact.size_bytes,
-                }));
+                .resource_name(artifact.path.clone())
+                .details_typed(crate::services::audit_export::details::ArtifactDetails {
+                    repository_id: artifact.repository_id,
+                    path: artifact.path.clone(),
+                    name: artifact.name.clone(),
+                    version: artifact.version.clone(),
+                    size_bytes: u64::try_from(artifact.size_bytes).ok(),
+                    digest: Some(format!("sha256:{}", artifact.checksum_sha256)),
+                    uploaded_by: artifact.uploaded_by,
+                });
             if let Some(uid) = uploaded_by {
                 entry = entry.user(uid);
             }
@@ -1361,34 +1463,43 @@ impl ArtifactService {
             client_ip: ip_address.and_then(|s| s.parse().ok()),
             user_id,
             user_agent: user_agent.map(str::to_string),
+            is_head: false,
         };
         record_download(&self.db, artifact_id, &ctx).await;
 
         // Best-effort audit trail (#2366). An `ARTIFACT_DOWNLOADED` event is the
         // per-access record auditors need to answer "who fetched this artifact,
-        // and when?". Fire-and-forget: a download must never fail because the
-        // audit table is unavailable, mirroring the download-statistics write
-        // above. The IP is parsed leniently; a malformed value is simply omitted.
+        // and when?". Routed through the bounded download-event dispatcher
+        // (#2522) rather than a per-request spawn: a download must never fail
+        // (or slow) because the audit table is unavailable, and a flood must
+        // never grow tasks/connections without bound — mirroring the
+        // download-statistics write above. Only this download hot-path emitter
+        // uses the dispatcher; the non-hot-path `audit_fire_and_forget` call
+        // sites (auth/user/token lifecycle) keep their existing spawn. The IP
+        // is parsed leniently; a malformed value is simply omitted.
         {
-            use crate::services::audit_service::{
-                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
-            };
+            use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
+            use crate::services::download_event_dispatch::{try_enqueue, DownloadEvent};
             let mut entry =
                 AuditEntry::new(AuditAction::ArtifactDownloaded, ResourceType::Artifact)
                     .resource(artifact_id)
-                    .details(serde_json::json!({
-                        "repository_id": artifact_info.repository_id.to_string(),
-                        "path": artifact_info.path,
-                        "name": artifact_info.name,
-                        "version": artifact_info.version,
-                    }));
+                    .resource_name(artifact_info.path.clone())
+                    .details_typed(crate::services::audit_export::details::ArtifactDetails {
+                        repository_id: artifact_info.repository_id,
+                        path: artifact_info.path.clone(),
+                        name: artifact_info.name.clone(),
+                        version: artifact_info.version.clone(),
+                        size_bytes: u64::try_from(artifact_info.size_bytes).ok(),
+                        digest: Some(format!("sha256:{}", artifact_info.checksum_sha256)),
+                        uploaded_by: artifact_info.uploaded_by,
+                    });
             if let Some(uid) = user_id {
                 entry = entry.user(uid);
             }
             if let Some(ip) = ip_address.and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
                 entry = entry.ip(ip);
             }
-            audit_fire_and_forget(self.db.clone(), entry).await;
+            let _ = try_enqueue(DownloadEvent::Audit(Box::new(entry)));
         }
 
         // Trigger AfterDownload hooks (non-blocking)
@@ -1450,6 +1561,7 @@ impl ArtifactService {
         user_id: Option<Uuid>,
         ip_address: Option<String>,
         user_agent: Option<&str>,
+        count_download: bool,
     ) -> Result<(Artifact, BoxStream<'static, Result<Bytes>>)> {
         let (artifact, artifact_info) = self.prepare_download(repository_id, path).await?;
 
@@ -1458,14 +1570,20 @@ impl ArtifactService {
         // matching the buffered `get` path's NotFound contract.
         let body = self.storage.get_stream(&artifact.storage_key).await?;
 
-        self.finish_download(
-            artifact.id,
-            &artifact_info,
-            user_id,
-            ip_address.as_deref(),
-            user_agent,
-        )
-        .await;
+        // `count_download` is false for a HEAD request: it returns identical
+        // headers but serves no body, so it must not write a download-statistics
+        // row (or fire the AfterDownload epilogue) — that would over-count the
+        // metric (#2260 §5). A real GET counts exactly once here.
+        if count_download {
+            self.finish_download(
+                artifact.id,
+                &artifact_info,
+                user_id,
+                ip_address.as_deref(),
+                user_agent,
+            )
+            .await;
+        }
 
         Ok((artifact, body))
     }
@@ -1494,7 +1612,16 @@ impl ArtifactService {
         Ok(artifact)
     }
 
-    /// List artifacts in a repository with pagination and optional search
+    /// List artifacts in a repository with pagination and optional search.
+    ///
+    /// Legacy offset+exact-count entry point: still used by callers that
+    /// need `(page, total)` semantics over a bounded batch (e.g. the hosted
+    /// Maven component grouping's `MAX_FETCH` scan). The flat catalog
+    /// listing pages via [`list_page`] / [`count`] instead so it never pays
+    /// an exact COUNT per request (PF-001 / #2518).
+    ///
+    /// [`list_page`]: Self::list_page
+    /// [`count`]: Self::count
     pub async fn list(
         &self,
         repository_id: Uuid,
@@ -1503,11 +1630,48 @@ impl ArtifactService {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<Artifact>, i64)> {
+        let artifacts = self
+            .list_page(
+                repository_id,
+                path_prefix,
+                search_query,
+                None,
+                offset,
+                limit,
+            )
+            .await?;
+        let total = self.count(repository_id, path_prefix, search_query).await?;
+        Ok((artifacts, total))
+    }
+
+    /// One keyset page of a repository's artifact listing, ordered by `path`
+    /// and bounded to O(page) rows via the `(repository_id, path)` unique
+    /// index (PF-001 / #2518).
+    ///
+    /// `after_path` is the last `path` of the previous page (exclusive
+    /// keyset bound); `offset` supports legacy `page=N` addressing when no
+    /// cursor is supplied (pass 0 with a cursor). The caller passes
+    /// `limit = per_page + 1` and uses the extra row as the authoritative
+    /// `has_more` signal (#2520 pattern). No COUNT is performed; pair with
+    /// [`count`] behind an explicit `?count=exact` opt-in.
+    ///
+    /// Uses runtime query binding (`sqlx::query_as`) rather than the
+    /// compile-time macro so that no `.sqlx` offline cache entry is required.
+    ///
+    /// [`count`]: Self::count
+    pub async fn list_page(
+        &self,
+        repository_id: Uuid,
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+        after_path: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Artifact>> {
         let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
         let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
-        let artifacts = sqlx::query_as!(
-            Artifact,
+        let artifacts: Vec<Artifact> = sqlx::query_as(
             r#"
             SELECT
                 id, repository_id, path, name, version, size_bytes,
@@ -1519,20 +1683,39 @@ impl ArtifactService {
             WHERE repository_id = $1
               AND is_deleted = false
               AND ($2::text IS NULL OR path LIKE $2)
-              AND ($5::text IS NULL OR LOWER(name) LIKE $5 OR LOWER(path) LIKE $5)
+              AND ($3::text IS NULL OR LOWER(name) LIKE $3 OR LOWER(path) LIKE $3)
+              AND ($4::text IS NULL OR path > $4)
             ORDER BY path
-            OFFSET $3
-            LIMIT $4
+            LIMIT $5 OFFSET $6
             "#,
-            repository_id,
-            prefix_pattern,
-            offset,
-            limit,
-            search_pattern,
         )
+        .bind(repository_id)
+        .bind(&prefix_pattern)
+        .bind(&search_pattern)
+        .bind(after_path)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(artifacts)
+    }
+
+    /// Exact match count for [`list_page`]'s filters. Runs a full count over
+    /// every matching row, so callers keep it behind an explicit
+    /// `?count=exact` opt-in rather than paying it on every page (#2520
+    /// pattern).
+    ///
+    /// [`list_page`]: Self::list_page
+    pub async fn count(
+        &self,
+        repository_id: Uuid,
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+    ) -> Result<i64> {
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
         let total = sqlx::query_scalar!(
             r#"
@@ -1551,7 +1734,7 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok((artifacts, total))
+        Ok(total)
     }
 
     /// List artifacts across multiple repositories with pagination and optional search.
@@ -1572,6 +1755,42 @@ impl ArtifactService {
     ) -> Result<(Vec<Artifact>, i64)> {
         if repo_ids.is_empty() {
             return Ok((Vec::new(), 0));
+        }
+        let artifacts = self
+            .list_for_repos_page(repo_ids, path_prefix, search_query, None, offset, limit)
+            .await?;
+        let total = self
+            .count_for_repos(repo_ids, path_prefix, search_query)
+            .await?;
+        Ok((artifacts, total))
+    }
+
+    /// One keyset page of the virtual (multi-repository) artifact listing,
+    /// ordered by `path` (PF-001 / #2518).
+    ///
+    /// Same de-duplication contract as [`list_for_repos`]: `DISTINCT ON
+    /// (path)` with earlier `repo_ids` entries shadowing later ones. The
+    /// `after_path` keyset bound is applied INSIDE the de-duplication
+    /// subquery, so a deep page only de-duplicates/sorts member rows past
+    /// the cursor instead of re-materializing the whole union per request.
+    /// `offset` supports legacy `page=N` addressing when no cursor is
+    /// supplied (pass 0 with a cursor); the caller passes
+    /// `limit = per_page + 1` and uses the extra row as `has_more` (#2520
+    /// pattern). Pair with [`count_for_repos`] behind `?count=exact`.
+    ///
+    /// [`list_for_repos`]: Self::list_for_repos
+    /// [`count_for_repos`]: Self::count_for_repos
+    pub async fn list_for_repos_page(
+        &self,
+        repo_ids: &[Uuid],
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+        after_path: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Artifact>> {
+        if repo_ids.is_empty() {
+            return Ok(Vec::new());
         }
 
         let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
@@ -1602,6 +1821,7 @@ impl ArtifactService {
                   AND a.is_deleted = false
                   AND ($2::text IS NULL OR a.path LIKE $2)
                   AND ($5::text IS NULL OR LOWER(a.name) LIKE $5 OR LOWER(a.path) LIKE $5)
+                  AND ($6::text IS NULL OR a.path > $6)
                 ORDER BY a.path, repo_priority
             ) sub
             ORDER BY path
@@ -1614,9 +1834,32 @@ impl ArtifactService {
         .bind(offset)
         .bind(limit)
         .bind(&search_pattern)
+        .bind(after_path)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(artifacts)
+    }
+
+    /// Exact de-duplicated match count for [`list_for_repos_page`]'s
+    /// filters. Repeats the whole-union de-duplication, so callers keep it
+    /// behind an explicit `?count=exact` opt-in rather than paying it on
+    /// every page (#2520 pattern).
+    ///
+    /// [`list_for_repos_page`]: Self::list_for_repos_page
+    pub async fn count_for_repos(
+        &self,
+        repo_ids: &[Uuid],
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+    ) -> Result<i64> {
+        if repo_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
         let total: i64 = sqlx::query_scalar(
             r#"
@@ -1639,7 +1882,66 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok((artifacts, total))
+        Ok(total)
+    }
+
+    /// Fetch the artifacts whose `path` starts with any of `path_prefixes`
+    /// across one or more repositories, de-duplicated by `path` (#2723).
+    ///
+    /// Used to fill in the per-file details of ONE page of Maven grouped
+    /// components: the caller passes the `<groupId>/<artifactId>/<version>/`
+    /// directory prefix for each component on the keyset page (O(per_page)
+    /// prefixes), so the fetch stays bounded regardless of catalog size.
+    /// `DISTINCT ON (path)` collapses the same object cached in multiple
+    /// members of a virtual repository, matching the virtual listing's
+    /// de-duplication contract.
+    ///
+    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards (the same
+    /// convention as [`list_page`]'s `path_prefix`); an over-broad match is
+    /// harmless because the grouped caller re-parses each artifact's GAV from
+    /// its path and discards rows outside the requested component keys.
+    ///
+    /// Uses runtime query binding (`sqlx::query_as`) so no `.sqlx` offline
+    /// cache entry is required.
+    ///
+    /// [`list_page`]: Self::list_page
+    pub async fn list_by_path_prefixes(
+        &self,
+        repo_ids: &[Uuid],
+        path_prefixes: &[String],
+    ) -> Result<Vec<Artifact>> {
+        if repo_ids.is_empty() || path_prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let patterns: Vec<String> = path_prefixes.iter().map(|p| format!("{}%", p)).collect();
+
+        let artifacts: Vec<Artifact> = sqlx::query_as(
+            r#"
+            SELECT
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, checksum_md5, checksum_sha1,
+                content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
+                created_at, updated_at
+            FROM (
+                SELECT DISTINCT ON (a.path) a.*
+                FROM artifacts a
+                WHERE a.repository_id = ANY($1)
+                  AND a.is_deleted = false
+                  AND a.path LIKE ANY($2)
+                ORDER BY a.path, array_position($1::uuid[], a.repository_id)
+            ) sub
+            ORDER BY path
+            "#,
+        )
+        .bind(repo_ids)
+        .bind(&patterns[..])
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(artifacts)
     }
 
     /// Soft-delete an artifact
@@ -1657,6 +1959,12 @@ impl ArtifactService {
         self.trigger_hook(PluginEventType::BeforeDelete, &artifact_info)
             .await?;
 
+        // The soft-delete's usage-ledger decrement is applied by migration
+        // 182's row-level trigger in this statement's own transaction
+        // (is_deleted false -> true releases the bytes; re-flipping an
+        // already-deleted row is a zero-delta no-op), so freed space is
+        // admissible by the very next quota-checked upload with no manual
+        // ledger write here.
         let result = sqlx::query!(
             "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = $1",
             id
@@ -1710,13 +2018,16 @@ impl ArtifactService {
             // original uploader is recorded in `details` for context.
             let entry = AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact)
                 .resource(artifact.id)
-                .details(serde_json::json!({
-                    "repository_id": artifact.repository_id.to_string(),
-                    "path": artifact.path,
-                    "name": artifact.name,
-                    "version": artifact.version,
-                    "uploaded_by": artifact.uploaded_by.map(|u| u.to_string()),
-                }));
+                .resource_name(artifact.path.clone())
+                .details_typed(crate::services::audit_export::details::ArtifactDetails {
+                    repository_id: artifact.repository_id,
+                    path: artifact.path.clone(),
+                    name: artifact.name.clone(),
+                    version: artifact.version.clone(),
+                    size_bytes: u64::try_from(artifact.size_bytes).ok(),
+                    digest: Some(format!("sha256:{}", artifact.checksum_sha256)),
+                    uploaded_by: artifact.uploaded_by,
+                });
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
 
@@ -1911,6 +2222,98 @@ impl ArtifactService {
     }
 }
 
+/// Cross-repository overwrite guard for flat (coordinate-keyed) storage writes.
+///
+/// Cloud backends (S3/GCS/Azure) resolve to a single shared instance and share
+/// one flat object namespace: the storage registry honors the per-repository
+/// `storage_path` only for filesystem backends, so cloud repositories all write
+/// into the same key space. A hosted write to a bare `{format}/{coords}` key can
+/// therefore land on top of a *different* repository's object that happens to
+/// live at the identical key, clobbering its bytes while the victim's artifact
+/// row still points at that key.
+///
+/// This guard refuses such a write: if the target `storage_key` is already
+/// referenced by an artifact row belonging to a **different** repository —
+/// **whether live OR soft-deleted** — it returns [`AppError::Conflict`]
+/// (HTTP 409) and the caller must not `put`.
+///
+/// Soft-deleted foreign rows are included deliberately: a soft-delete tombstones
+/// the row but the physical object at the flat key persists, so an attacker could
+/// otherwise overwrite a soft-deleted victim object and poison the bytes that the
+/// victim serves after a restore/resurrect. A foreign row owning the physical key
+/// — even a tombstoned one — means the key is not ours to write.
+///
+/// Safe to call at every flat-key write site:
+/// - Same-repository writes are always allowed — the query excludes the writer's
+///   own `repository_id`, so re-publishing (or reclaiming your own soft-deleted)
+///   coordinate passes.
+/// - Repository-scoped keys (rpm/alpine/conda/incus embed the repo id) and
+///   content-addressed keys never collide across repositories, so the query
+///   simply never matches and the write proceeds unchanged.
+///
+/// KNOWN RESIDUAL (TOCTOU): this is a check-then-write guard, not atomic with the
+/// caller's subsequent `put` + row insert. Two repositories racing the very first
+/// publish of the same colliding key can both pass the check and create dual
+/// rows. Closing it fully requires holding a lock across guard→put→insert (or the
+/// structural repo-scoped-key scheme), which is out of scope for this surgical
+/// hotfix; a global UNIQUE index on `storage_key` is intentionally NOT used
+/// because content-addressed formats legitimately share sha-based keys across
+/// repositories. The 1.6.0 repo-scoped-key migration is the real remediation.
+pub async fn guard_foreign_storage_key(
+    db: &PgPool,
+    repository_id: Uuid,
+    storage_key: &str,
+) -> Result<()> {
+    // Runtime-checked query (no compile-time sqlx cache needed): return the
+    // owning repository id of any *other* repository holding a row at this exact
+    // key — live or soft-deleted (the physical object persists past soft-delete).
+    let foreign: Option<Uuid> = sqlx::query_scalar(
+        "SELECT repository_id FROM artifacts \
+         WHERE storage_key = $1 AND repository_id <> $2 \
+         LIMIT 1",
+    )
+    .bind(storage_key)
+    .bind(repository_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if foreign.is_some() {
+        return Err(AppError::Conflict(format!(
+            "storage key '{storage_key}' is already owned by another repository; \
+             refusing cross-repository overwrite"
+        )));
+    }
+    Ok(())
+}
+
+/// Isolation-aware cross-repository write guard (service layer, `AppError`).
+///
+/// Same guard the per-format upload handlers apply through
+/// [`crate::api::handlers::proxy_helpers::guard_cross_repo_write`], but returning
+/// the service-layer [`AppError`] so `Result<_, AppError>` callers (promotion /
+/// approval copy paths) can invoke it with `?`. This is the single source of
+/// truth for the "skip repo-isolated backends, then check for a foreign owner"
+/// sequence — `guard_cross_repo_write` delegates here.
+///
+/// The foreign-owner check applies **only to shared-namespace (cloud) backends**.
+/// On a repo-isolated backend (`filesystem`) each repository has its own physically
+/// separate directory tree, so two repositories legitimately hold the same
+/// coordinate key without colliding; running the check there would wrongly reject
+/// the second repository's write. `storage_backend` is therefore checked first and
+/// the guard is skipped for filesystem.
+pub async fn guard_foreign_storage_key_for_backend(
+    db: &PgPool,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) -> Result<()> {
+    if crate::storage::backend_is_repo_isolated(storage_backend) {
+        return Ok(());
+    }
+    guard_foreign_storage_key(db, repository_id, storage_key).await
+}
+
 /// Best-effort recorder for a completed local-artifact download (#2365).
 ///
 /// Writes real attribution (validated client IP or NULL, authenticated user
@@ -1920,20 +2323,42 @@ impl ArtifactService {
 ///
 /// Call this only after a **local** artifact row has been resolved; remote
 /// pass-through proxy fetches are not our artifacts and stay unrecorded.
-pub async fn record_download(db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
-    if let Err(e) = sqlx::query(
-        "INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent) \
-         VALUES ($1, $2, $3, $4)",
-    )
-    .bind(artifact_id)
-    .bind(ctx.user_id)
-    .bind(ctx.client_ip.map(|ip| ip.to_string()))
-    .bind(ctx.user_agent.as_deref())
-    .execute(db)
-    .await
-    {
-        warn!(%artifact_id, error = %e, "failed to record download statistics");
+///
+/// The pool parameter is retained (underscore-bound) purely for call-site
+/// stability: the ~45 format/generic/OCI call sites keep compiling unchanged
+/// while the bounded dispatcher's flush workers own the only side-effect DB
+/// connections (#2522).
+pub async fn record_download(_db: &PgPool, artifact_id: Uuid, ctx: &DownloadContext) {
+    // A HEAD request serves no body — it must never write a download row
+    // (#2260 §5). This is the single choke point every serving path funnels
+    // through (hosted stream, presigned redirect, virtual-member local resolve,
+    // per-format serve_local_artifact / direct recorders), so guarding here
+    // makes "one row == one real body served" hold for the axum `get()`-
+    // registered format routes that auto-dispatch HEAD to their GET handler,
+    // mirroring the explicit guards on the generic / OCI / incus paths.
+    if ctx.is_head {
+        return;
     }
+    // Route the statistics write through the BOUNDED download-event dispatcher
+    // (#2522). The first #2522 slice moved this INSERT off the byte plane with
+    // a per-request `tokio::spawn`, which left task + pool-connection growth
+    // unbounded under a download flood with a slow event store. `try_enqueue`
+    // never blocks, awaits, or spawns: the event is queued for a fixed pool of
+    // batch-flush workers, shed (dropped + counted) on overflow, and silently
+    // skipped when no dispatcher is installed (tests) — statistics must never
+    // block or fail the download itself. Attribution (trusted-proxy client IP,
+    // user, user-agent) is captured HERE, at request time, so it cannot drift
+    // across the async hop. The `is_head` "no body ⇒ no row" contract is
+    // preserved (checked synchronously above).
+    use crate::services::download_event_dispatch::{
+        try_enqueue, DownloadEvent, DownloadStatsEvent,
+    };
+    let _ = try_enqueue(DownloadEvent::Stats(DownloadStatsEvent {
+        artifact_id,
+        user_id: ctx.user_id,
+        ip_address: ctx.client_ip.map(|ip| ip.to_string()),
+        user_agent: ctx.user_agent.clone(),
+    }));
 }
 
 /// URL fields commonly found in package metadata across all formats.
@@ -2026,6 +2451,235 @@ mod tests {
             key,
             "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
         );
+    }
+
+    // -- #2504 cross-repository overwrite guard ----------------------------
+
+    /// Insert a minimal live artifact row at `storage_key` for `repo_id`.
+    #[cfg(test)]
+    async fn seed_artifact(pool: &PgPool, repo_id: Uuid, path: &str, storage_key: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, 1, $4, 'application/octet-stream', $5)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(path)
+        .bind("0".repeat(64))
+        .bind(storage_key)
+        .execute(pool)
+        .await
+        .expect("seed artifact");
+    }
+
+    /// #2940: `list_page` must keep selecting the quarantine columns so the
+    /// listing handler can surface per-artifact quarantine state. Guards
+    /// against a future refactor dropping them from the SELECT (which would
+    /// silently report every artifact as unquarantined again).
+    #[tokio::test]
+    async fn test_list_page_carries_quarantine_state() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let held_key = format!("generic/{}", Uuid::new_v4());
+        let clean_key = format!("generic/{}", Uuid::new_v4());
+        seed_artifact(&pool, repo_id, "held/pkg-1.0.0.bin", &held_key).await;
+        seed_artifact(&pool, repo_id, "clean/pkg-1.0.0.bin", &clean_key).await;
+
+        let until = chrono::Utc::now() + chrono::Duration::minutes(30);
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = $2 \
+             WHERE repository_id = $1 AND path = 'held/pkg-1.0.0.bin'",
+        )
+        .bind(repo_id)
+        .bind(until)
+        .execute(&pool)
+        .await
+        .expect("apply quarantine");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        let page = service
+            .list_page(repo_id, None, None, None, 0, 50)
+            .await
+            .expect("list page");
+
+        let held = page
+            .iter()
+            .find(|a| a.path == "held/pkg-1.0.0.bin")
+            .expect("held artifact listed");
+        assert_eq!(held.quarantine_status.as_deref(), Some("quarantined"));
+        assert!(held.quarantine_until.is_some());
+
+        let clean = page
+            .iter()
+            .find(|a| a.path == "clean/pkg-1.0.0.bin")
+            .expect("clean artifact listed");
+        assert!(clean.quarantine_status.is_none());
+        assert!(clean.quarantine_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_guard_rejects_foreign_repo_owning_key() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        // repo_b owns a live row at the colliding flat key.
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_b, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        // repo_a must be refused (409 Conflict) — the cross-tenant poisoning case.
+        let err = guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect_err("foreign-owned key must be rejected");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_guard_allows_same_repo_overwrite() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_a, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        // Re-publishing your own coordinate must still be allowed.
+        guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect("same-repo overwrite must be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_guard_allows_uncontended_key() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/org/fresh/{}/fresh.jar", Uuid::new_v4());
+        // No row anywhere references this key.
+        guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect("uncontended key must be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_guard_rejects_soft_deleted_foreign_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (repo_b, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/dead/1.0/dead-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_b, "com/acme/dead/1.0/dead-1.0.jar", &key).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE storage_key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("soft-delete");
+
+        // The physical object persists past soft-delete, so a tombstoned foreign
+        // row still owns the key: repo_a must NOT be able to overwrite it (guards
+        // against poison-on-resurrect).
+        let err = guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect_err("soft-deleted foreign row must still block");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_guard_allows_same_repo_soft_deleted_reclaim() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/mine/1.0/mine-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, repo_a, "com/acme/mine/1.0/mine-1.0.jar", &key).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE storage_key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .expect("soft-delete");
+
+        // Reclaiming your OWN (even soft-deleted) key is always allowed.
+        guard_foreign_storage_key(&pool, repo_a, &key)
+            .await
+            .expect("same-repo soft-deleted reclaim must be allowed");
+    }
+
+    // -- #2511 cross-repo write guard on the promotion/approval copy paths -----
+    // These exercise `guard_foreign_storage_key_for_backend` — the isolation-aware
+    // guard the promotion (`promote_artifact` / `promote_artifacts_bulk`) and
+    // approval-execute copy sites now call before writing the SOURCE artifact's
+    // flat key into the TARGET repo.
+
+    #[tokio::test]
+    async fn test_promotion_guard_blocks_cross_repo_key_on_cloud_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (foreign_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        // A third repository already owns the flat coordinate the promotion copy
+        // would re-use in `target_repo`.
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, foreign_repo, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        // On a shared-namespace cloud backend the promotion/approval copy MUST be
+        // refused (409 Conflict) — this is the cross-tenant write hole (#2511).
+        let err = guard_foreign_storage_key_for_backend(&pool, target_repo, "s3", &key)
+            .await
+            .expect_err("cross-repo-attributed key must be blocked on cloud");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_promotion_guard_allows_cross_repo_key_on_filesystem_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let (foreign_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, foreign_repo, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        // On a repo-isolated (filesystem) backend each repo has its own directory
+        // tree, so the same coordinate legitimately coexists — a legit
+        // cross-repo filesystem promotion must NOT be blocked.
+        guard_foreign_storage_key_for_backend(&pool, target_repo, "filesystem", &key)
+            .await
+            .expect("filesystem promotion must be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_promotion_guard_allows_same_repo_key_on_cloud_backend() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (target_repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        // A legitimate same-tenant re-promotion of a key this repo already owns.
+        let key = format!("maven/com/acme/lib/1.0/lib-1.0-{}.jar", Uuid::new_v4());
+        seed_artifact(&pool, target_repo, "com/acme/lib/1.0/lib-1.0.jar", &key).await;
+
+        guard_foreign_storage_key_for_backend(&pool, target_repo, "s3", &key)
+            .await
+            .expect("same-repo promotion must be allowed on cloud");
     }
 
     // -----------------------------------------------------------------------
@@ -2390,6 +3044,57 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains(declared));
         assert!(err.contains(&actual_sha256));
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_declared_digests (#2517): the streaming upload path verifies
+    // declared `x-checksum-*` headers against the digests computed in the single
+    // staging pass. It must be byte-for-byte equivalent to the old buffered
+    // `verify_checksums`.
+    // -----------------------------------------------------------------------
+
+    fn digests_of(data: &[u8]) -> ContentDigests {
+        let mut h = MultiHasher::new();
+        h.update(data);
+        h.finalize()
+    }
+
+    #[test]
+    fn test_verify_declared_digests_matches_verify_checksums() {
+        let data = vec![0x5Au8; 200_000];
+        let d = digests_of(&data);
+        // All three declared and correct (mixed case) -> Ok, same as buffered.
+        assert!(ArtifactService::verify_checksums(
+            &data,
+            Some(&d.sha256.to_uppercase()),
+            Some(&d.sha1),
+            Some(&d.md5.to_uppercase()),
+        )
+        .is_ok());
+        assert!(ArtifactService::verify_declared_digests(
+            &d,
+            Some(&d.sha256.to_uppercase()),
+            Some(&d.sha1),
+            Some(&d.md5.to_uppercase()),
+        )
+        .is_ok());
+        // None declared -> Ok (nothing to check).
+        assert!(ArtifactService::verify_declared_digests(&d, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_verify_declared_digests_rejects_each_mismatch() {
+        let d = digests_of(b"streamed artifact body");
+        // Wrong SHA-256.
+        let e = ArtifactService::verify_declared_digests(&d, Some("deadbeef"), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("SHA-256"));
+        assert!(e.contains(&d.sha256));
+        // Wrong SHA-1.
+        assert!(ArtifactService::verify_declared_digests(&d, None, Some("00"), None).is_err());
+        // Wrong MD5.
+        assert!(ArtifactService::verify_declared_digests(&d, None, None, Some("ff")).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -2824,9 +3529,32 @@ mod tests {
     /// by the shared service-layer choke points (`finalize_upload`,
     /// `finish_download`, `delete_with_sync_options`). The download event also
     /// carries the client IP and acting user. Skips without `DATABASE_URL`.
+    ///
+    /// Since #2522 the audit writes are fire-and-forget (spawned, not awaited),
+    /// so each event count is polled with a short bounded retry rather than
+    /// asserted synchronously.
     #[tokio::test]
     async fn test_artifact_lifecycle_emits_audit_events_db() {
         use crate::api::handlers::test_db_helpers as tdh;
+
+        /// Poll `audit_count` for `(artifact_id, action)` until it reaches
+        /// `expected` or the bounded budget is exhausted (#2522 async audit).
+        async fn poll_audit_count(
+            pool: &PgPool,
+            artifact_id: Uuid,
+            action: &str,
+            expected: i64,
+        ) -> i64 {
+            let mut last = -1;
+            for _ in 0..50 {
+                last = tdh::audit_count(pool, artifact_id, action).await;
+                if last >= expected {
+                    return last;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            last
+        }
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -2839,8 +3567,9 @@ mod tests {
         );
         let svc = ArtifactService::new(pool.clone(), storage);
 
-        // Upload -> ARTIFACT_UPLOADED (audit write is awaited inside
-        // finalize_upload, so it has landed by the time upload() returns).
+        // Upload -> ARTIFACT_UPLOADED. The audit write is spawned fire-and-forget
+        // inside finalize_upload (#2522), so poll for it rather than assert it
+        // has already landed by the time upload() returns.
         let artifact = svc
             .upload(
                 repo_id,
@@ -2854,7 +3583,7 @@ mod tests {
             .await
             .expect("upload succeeds");
         assert_eq!(
-            tdh::audit_count(&pool, artifact.id, "ARTIFACT_UPLOADED").await,
+            poll_audit_count(&pool, artifact.id, "ARTIFACT_UPLOADED", 1).await,
             1,
             "upload emits exactly one ARTIFACT_UPLOADED event"
         );
@@ -2871,7 +3600,7 @@ mod tests {
             .await
             .expect("download succeeds");
         assert_eq!(
-            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DOWNLOADED").await,
+            poll_audit_count(&pool, artifact.id, "ARTIFACT_DOWNLOADED", 1).await,
             1,
             "download emits exactly one ARTIFACT_DOWNLOADED event"
         );
@@ -2879,7 +3608,7 @@ mod tests {
         // Delete -> ARTIFACT_DELETED.
         svc.delete(artifact.id).await.expect("delete succeeds");
         assert_eq!(
-            tdh::audit_count(&pool, artifact.id, "ARTIFACT_DELETED").await,
+            poll_audit_count(&pool, artifact.id, "ARTIFACT_DELETED", 1).await,
             1,
             "delete emits exactly one ARTIFACT_DELETED event"
         );
@@ -3269,5 +3998,276 @@ mod tests {
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// PF-007 (#2523): two concurrent uploads that each fit but together exceed
+    /// the quota must NOT both be admitted. Before the transactional,
+    /// ledger-serialized admission, both preflight reads saw the pre-upload
+    /// usage (0) and both uploads succeeded — the over-admission race. Now the
+    /// second upload blocks on the first's `FOR UPDATE` lock, observes its
+    /// committed bytes, and is rejected. Exactly one succeeds.
+    ///
+    /// Discriminating: on the unfixed code this asserts `successes == 1` and
+    /// fails because both succeed (`successes == 2`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_uploads_cannot_over_admit_quota() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        // 100 KiB quota; two 60 KiB uploads fit individually, not together.
+        sqlx::query("UPDATE repositories SET quota_bytes = 100000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set quota");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc_a = ArtifactService::new(pool.clone(), storage.clone());
+        let svc_b = ArtifactService::new(pool.clone(), storage);
+        let body_a = Bytes::from(vec![b'a'; 60_000]);
+        let body_b = Bytes::from(vec![b'b'; 60_000]);
+
+        let (ra, rb) = tokio::join!(
+            svc_a.upload_with_sync_options(
+                repo_id,
+                "pkg/a.bin",
+                "a.bin",
+                None,
+                "application/octet-stream",
+                body_a,
+                Some(user_id),
+                false,
+            ),
+            svc_b.upload_with_sync_options(
+                repo_id,
+                "pkg/b.bin",
+                "b.bin",
+                None,
+                "application/octet-stream",
+                body_b,
+                Some(user_id),
+                false,
+            ),
+        );
+
+        let successes = [ra.is_ok(), rb.is_ok()].iter().filter(|ok| **ok).count();
+        assert_eq!(
+            successes,
+            1,
+            "exactly one of two 60 KiB uploads may enter a 100 KiB quota \
+             (ra={:?}, rb={:?})",
+            ra.as_ref().map(|a| &a.path),
+            rb.as_ref().map(|a| &a.path),
+        );
+        let rejected = [ra, rb]
+            .into_iter()
+            .find_map(|r| r.err())
+            .expect("exactly one upload must be rejected");
+        assert!(
+            matches!(rejected, AppError::QuotaExceeded(_)),
+            "the rejected upload must fail with QuotaExceeded, got {rejected:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -- #2522 download-statistics write moved OFF the synchronous hot path -----
+    // `record_download` now SPAWNS the `download_statistics` INSERT instead of
+    // awaiting it, so the byte stream returns without blocking on the catalog
+    // pool. These tests assert the eventual-write contract (poll with a bounded
+    // retry, matching the async-timing caveat) and that the HEAD "no body ⇒ no
+    // row" guard still holds synchronously.
+
+    /// Seed a live artifact row and return its id (self-contained, `RETURNING`).
+    #[cfg(test)]
+    async fn seed_dl_artifact(pool: &PgPool, repo_id: Uuid, path: &str) -> Uuid {
+        let key = format!("dl/{}", Uuid::new_v4());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $2, 1, $3, 'application/octet-stream', $4) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind("0".repeat(64))
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .expect("seed artifact returning id")
+    }
+
+    /// Poll `download_statistics` for `artifact_id` until it reaches `expected`
+    /// or the bounded retry budget is exhausted; returns the last observed count.
+    #[cfg(test)]
+    async fn poll_dl_count(pool: &PgPool, artifact_id: Uuid, expected: i64) -> i64 {
+        let mut last = -1;
+        for _ in 0..50 {
+            last = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(pool)
+            .await
+            .expect("count download_statistics");
+            if last >= expected {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        last
+    }
+
+    #[tokio::test]
+    async fn test_record_download_eventually_writes_row_off_hot_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let artifact_id = seed_dl_artifact(&pool, repo, "com/acme/dl-1.0.jar").await;
+
+        let ctx = DownloadContext {
+            client_ip: "203.0.113.7".parse().ok(),
+            user_id: None,
+            user_agent: Some("unit-test/1.0".to_string()),
+            is_head: false,
+        };
+        // Returns without awaiting the INSERT (enqueued to the bounded
+        // dispatcher `tdh::try_pool` installed); the batch flush lands the row
+        // shortly after. The count must still reach 1 — the eventual-write
+        // contract survives the spawn -> bounded-dispatch change (#2522).
+        record_download(&pool, artifact_id, &ctx).await;
+        let count = poll_dl_count(&pool, artifact_id, 1).await;
+        assert_eq!(
+            count, 1,
+            "dispatched download_statistics write must eventually land"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_download_head_writes_no_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _, _) = tdh::create_repo(&pool, "local", "maven").await;
+        let artifact_id = seed_dl_artifact(&pool, repo, "com/acme/head-1.0.jar").await;
+
+        let ctx = DownloadContext {
+            client_ip: None,
+            user_id: None,
+            user_agent: None,
+            is_head: true,
+        };
+        record_download(&pool, artifact_id, &ctx).await;
+        // Give any (erroneous) spawned write time to land, then assert none did.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count download_statistics");
+        assert_eq!(count, 0, "a HEAD serves no body and must never write a row");
+    }
+
+    /// #2516 S2: the service delete's soft-delete releases the artifact's
+    /// bytes from the usage ledger in the same transaction (migration 182's
+    /// trigger fires on the `is_deleted` flip), so freed space is admissible
+    /// by the very next upload — no reconciler pass needed. End-state
+    /// assertions only: the ledger must equal the live sum after each step.
+    #[tokio::test]
+    async fn test_delete_releases_ledger_bytes_immediately() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET quota_bytes = 1000 WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set quota");
+
+        // A 600-byte artifact; the insert trigger charges the ledger.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'rel/big.bin', 'big.bin', 600, repeat('a', 64), \
+                     'application/octet-stream', 'keys/rel/big.bin')",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed artifact");
+        let repo_service =
+            crate::services::repository_service::RepositoryService::new(pool.clone());
+
+        let artifact_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND path = 'rel/big.bin'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("artifact id");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        // Another 600 bytes cannot be admitted while the first artifact holds
+        // its quota share.
+        assert!(!repo_service
+            .check_quota(repo_id, 600)
+            .await
+            .expect("preflight"));
+
+        service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .expect("delete");
+
+        let hosted = sqlx::query_scalar::<_, i64>(
+            "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger row");
+        assert_eq!(
+            hosted, 0,
+            "delete must release the bytes in the same transaction"
+        );
+        assert!(
+            repo_service
+                .check_quota(repo_id, 600)
+                .await
+                .expect("preflight after delete"),
+            "freed space must be admissible by the very next upload"
+        );
+        // Idempotence: re-deleting maps to NotFound, and re-flipping an
+        // already-deleted row is a zero-delta no-op for the trigger — the
+        // same bytes are never released twice.
+        assert!(service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .is_err());
+        let hosted_after = sqlx::query_scalar::<_, i64>(
+            "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger row after re-delete");
+        assert_eq!(hosted_after, 0, "re-delete must not decrement again");
     }
 }

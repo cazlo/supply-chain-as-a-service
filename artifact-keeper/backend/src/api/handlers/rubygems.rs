@@ -52,6 +52,13 @@ pub fn router() -> Router<SharedState> {
         // Specs indices
         .route("/:repo_key/specs.4.8.gz", get(specs_index))
         .route("/:repo_key/latest_specs.4.8.gz", get(latest_specs_index))
+        .route(
+            "/:repo_key/prerelease_specs.4.8.gz",
+            get(prerelease_specs_index),
+        )
+        // Quick gemspec (Marshal 4.8, zlib-deflated). `gem install` fetches this
+        // to resolve a gem's dependencies before downloading the .gem.
+        .route("/:repo_key/quick/Marshal.4.8/:spec_file", get(quick_spec))
         // Download gem - use a wildcard to capture name-version.gem
         .route("/:repo_key/gems/*gem_file", get(download_gem))
 }
@@ -101,8 +108,7 @@ async fn gem_info(
             .unwrap_or("")
             .to_string();
 
-        let gem_filename = format!("{}-{}.gem", gem_name, version);
-        let gem_uri = format!("/gems/{}/gems/{}", repo_key, gem_filename);
+        let gem_uri = gem_download_uri(&repo_key, &artifact.path, gem_name, &version);
 
         let json = serde_json::json!({
             "name": gem_name,
@@ -170,14 +176,12 @@ async fn gem_versions(
                 .unwrap_or("")
                 .to_string();
 
-            let gem_filename = format!("{}-{}.gem", gem_name, version);
-
             serde_json::json!({
                 "number": version,
                 "summary": description,
                 "platform": "ruby",
                 "sha": a.checksum_sha256,
-                "gem_uri": format!("/gems/{}/gems/{}", repo_key, gem_filename),
+                "gem_uri": gem_download_uri(&repo_key, &a.path, gem_name, &version),
                 "downloads_count": 0,
             })
         })
@@ -240,6 +244,7 @@ async fn download_gem(
                 if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
                     &state,
                     &repo,
+                    &ctx,
                     proxy_helpers::DownloadResponseOpts {
                         upstream_path: &upstream_path,
                         virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
@@ -280,7 +285,7 @@ async fn push_gem(
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rubygems", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "rubygems", "write:artifacts")?.user_id;
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -290,9 +295,12 @@ async fn push_gem(
     }
 
     // Extract gemspec from the .gem file
-    let gemspec = RubygemsHandler::extract_gemspec(&body).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid gem file: {}", e)).into_response()
-    })?;
+    // #2561: permit-scoped decode, fast-fail 503 on saturation.
+    let gemspec = crate::util::bounded_archive::with_ingest_extraction(|| {
+        RubygemsHandler::extract_gemspec(&body)
+    })
+    .map_err(|e| e.into_response())?
+    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid gem file: {}", e)).into_response())?;
 
     let gem_name = &gemspec.name;
     let gem_version = &gemspec.version;
@@ -374,7 +382,7 @@ async fn push_gem(
 }
 
 const SPECS_QUERY: &str = r#"
-    SELECT name, version
+    SELECT name, version, path
     FROM artifacts
     WHERE repository_id = $1
       AND is_deleted = false
@@ -382,11 +390,23 @@ const SPECS_QUERY: &str = r#"
 "#;
 
 const LATEST_SPECS_QUERY: &str = r#"
-    SELECT DISTINCT ON (LOWER(name)) name, version
+    SELECT DISTINCT ON (LOWER(name)) name, version, path
     FROM artifacts
     WHERE repository_id = $1
       AND is_deleted = false
     ORDER BY LOWER(name), created_at DESC
+"#;
+
+// Prerelease index: RubyGems treats a version as a prerelease when it contains a
+// letter (e.g. `1.0.0.beta`, `2.1.0.rc1`). `specs.4.8.gz` carries releases;
+// `prerelease_specs.4.8.gz` carries these.
+const PRERELEASE_SPECS_QUERY: &str = r#"
+    SELECT name, version, path
+    FROM artifacts
+    WHERE repository_id = $1
+      AND is_deleted = false
+      AND version ~ '[A-Za-z]'
+    ORDER BY name, created_at DESC
 "#;
 
 /// Query gem specs from a single repository using the given SQL.
@@ -406,9 +426,45 @@ async fn query_gem_specs(
         .map(|r| {
             let name: String = r.get("name");
             let version: Option<String> = r.get("version");
-            serde_json::json!([name, version.unwrap_or_default(), "ruby"])
+            let path: String = r.get("path");
+            // Advertise coordinates derived from the actual stored filename so a
+            // bare-path generic upload (whole basename as `name` + `sha256-…`
+            // fallback `version`) yields a `{name}-{version}.gem` the download
+            // route can serve, instead of a client-reconstructed 404 (#2754).
+            let (name, version) = spec_index_coordinates(&path, name, version.unwrap_or_default());
+            serde_json::json!([name, version, "ruby"])
         })
         .collect())
+}
+
+/// Resolve the `(name, version)` a spec-index client will reconstruct the gem
+/// download filename from, preferring the artifact's actual stored filename over
+/// the stored coordinate columns. Byte-identical for natively published gems;
+/// corrects bare-path generic uploads. See
+/// [`crate::formats::rubygems::coordinates_from_gem_filename`].
+fn spec_index_coordinates(path: &str, name: String, version: String) -> (String, String) {
+    path.rsplit('/')
+        .next()
+        .filter(|f| !f.is_empty())
+        .and_then(crate::formats::rubygems::coordinates_from_gem_filename)
+        .unwrap_or((name, version))
+}
+
+/// Build the `gem_uri` advertised in the JSON gem/version API.
+///
+/// The download route (`GET /gems/{repo}/gems/{file}`) resolves a hosted gem by
+/// its trailing filename suffix (#2587), so the advertised URI must carry the
+/// artifact's actual stored basename. Natively pushed gems are stored at
+/// `{name}-{version}/{name}-{version}.gem`, whose basename equals the
+/// reconstructed `{name}-{version}.gem` — byte-identical for them. A gem pushed
+/// through the generic upload flow is stored at its bare path with
+/// generically-derived coordinates, so reconstructing `{name}-{version}.gem`
+/// would advertise a path the download route cannot resolve (the RubyGems
+/// analogue of the RPM `<location>` fix, #2587 / #2589).
+fn gem_download_uri(repo_key: &str, path: &str, name: &str, version: &str) -> String {
+    let filename =
+        proxy_helpers::advertised_download_filename(path, &format!("{}-{}.gem", name, version));
+    format!("/gems/{}/gems/{}", repo_key, filename)
 }
 
 /// Query gem specs from all local (non-remote) virtual members.
@@ -430,7 +486,10 @@ async fn query_local_member_specs(
 /// Decompress gzipped upstream spec data and parse as a JSON array of spec tuples.
 #[allow(clippy::result_large_err)]
 fn parse_upstream_specs(bytes: &[u8]) -> Result<Vec<serde_json::Value>, Response> {
-    let mut decoder = GzDecoder::new(bytes);
+    // Wrap the upstream gzip stream in the shared total-byte budget (#2556) so a
+    // malicious/compromised upstream index cannot inflate unbounded during a
+    // virtual/remote proxy fetch.
+    let mut decoder = crate::util::bounded_archive::budgeted(GzDecoder::new(bytes));
     let mut decompressed = Vec::new();
     decoder.read_to_end(&mut decompressed).map_err(|_| {
         (
@@ -454,7 +513,15 @@ async fn collect_remote_specs(
         state.proxy_service.as_deref(),
         virtual_repo_id,
         upstream_path,
-        |bytes, _member_key| async move { parse_upstream_specs(&bytes) },
+        |bytes, _member_key| async move {
+            // #2561: permit-scoped decode, fast-fail 503 on saturation.
+            #[allow(clippy::result_large_err)]
+            // Response-as-error matches this module's handler convention.
+            let specs = crate::util::bounded_archive::with_ingest_extraction(|| {
+                parse_upstream_specs(&bytes)
+            });
+            specs.map_err(|e| e.into_response())?
+        },
     )
     .await?;
 
@@ -465,18 +532,34 @@ async fn collect_remote_specs(
     Ok(all)
 }
 
-/// Serialize specs to JSON, gzip-compress, and return as a response.
+/// Convert a spec tuple `[name, version, platform]` JSON value into the
+/// `(name, version, platform)` string triple the Marshal encoder expects.
+/// Missing/non-string fields degrade to empty / `"ruby"` so a malformed
+/// upstream entry can never panic the index build.
+fn spec_tuple(v: &serde_json::Value) -> (String, String, String) {
+    let arr = v.as_array();
+    let get = |i: usize| {
+        arr.and_then(|a| a.get(i))
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+    };
+    let name = get(0).unwrap_or_default();
+    let version = get(1).unwrap_or_default();
+    let platform = get(2).unwrap_or_else(|| "ruby".to_string());
+    (name, version, platform)
+}
+
+/// Marshal-encode specs to a Ruby Marshal 4.8 stream, gzip-compress, and return
+/// as a response. RubyGems / bundler require the legacy index to be a gzipped
+/// `Marshal.dump` of `[[name, Gem::Version, platform], ...]` (NOT JSON, which
+/// aborts the client with `UnsupportedVersionError: Unsupported marshal
+/// version 91.91`).
 #[allow(clippy::result_large_err)]
 fn specs_to_gzip_response(specs: &[serde_json::Value]) -> Result<Response, Response> {
-    let json_bytes = serde_json::to_vec(specs).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Serialization error: {}", e),
-        )
-            .into_response()
-    })?;
+    let triples: Vec<(String, String, String)> = specs.iter().map(spec_tuple).collect();
+    let marshal_bytes = crate::formats::rubygems::marshal_specs_index(&triples);
 
-    let compressed = gzip_compress(&json_bytes).map_err(|e| {
+    let compressed = gzip_compress(&marshal_bytes).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Compression error: {}", e),
@@ -554,6 +637,185 @@ async fn latest_specs_index(
 
     let specs = query_gem_specs(&state.db, repo.id, LATEST_SPECS_QUERY).await?;
     specs_to_gzip_response(&specs)
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/prerelease_specs.4.8.gz — Prerelease spec index
+// ---------------------------------------------------------------------------
+
+async fn prerelease_specs_index(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    // Virtual repo: merge prerelease specs from all local and remote members.
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut all_specs =
+            query_local_member_specs(&state.db, &members, PRERELEASE_SPECS_QUERY).await?;
+
+        let remote = collect_remote_specs(&state, repo.id, "prerelease_specs.4.8.gz").await?;
+        all_specs.extend(remote);
+
+        return specs_to_gzip_response(&all_specs);
+    }
+
+    let specs = query_gem_specs(&state.db, repo.id, PRERELEASE_SPECS_QUERY).await?;
+    specs_to_gzip_response(&specs)
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/quick/Marshal.4.8/{full_name}.gemspec.rz — Quick gemspec
+// ---------------------------------------------------------------------------
+
+/// Reconstruct a `GemSpec` for the local artifact whose full name (`name-version`,
+/// or `name-version-platform`) matches `full_name`, in the given repository.
+async fn find_local_quick_spec(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    full_name: &str,
+) -> Result<Option<crate::formats::rubygems::GemSpec>, Response> {
+    // Narrow to artifacts whose name is a prefix of the requested full name so
+    // hyphenated gem names disambiguate correctly against the version suffix.
+    let rows = sqlx::query(
+        r#"
+        SELECT a.name, a.version, am.metadata AS metadata
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND $2 LIKE a.name || '-%'
+        "#,
+    )
+    .bind(repo_id)
+    .bind(full_name)
+    .fetch_all(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+
+    for r in &rows {
+        let name: String = r.get("name");
+        let version: String = r
+            .try_get::<Option<String>, _>("version")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let metadata: Option<serde_json::Value> = r.try_get("metadata").ok().flatten();
+
+        let base = format!("{}-{}", name, version);
+        if base == full_name {
+            return Ok(Some(build_gemspec(&name, &version, None, metadata)));
+        }
+        if let Some(platform) = full_name.strip_prefix(&format!("{}-", base)) {
+            return Ok(Some(build_gemspec(
+                &name,
+                &version,
+                Some(platform.to_string()),
+                metadata,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Build a `GemSpec` from stored artifact metadata, falling back to a minimal
+/// spec (name/version only) when metadata is missing or unparseable.
+fn build_gemspec(
+    name: &str,
+    version: &str,
+    platform: Option<String>,
+    metadata: Option<serde_json::Value>,
+) -> crate::formats::rubygems::GemSpec {
+    use crate::formats::rubygems::GemSpec;
+
+    let mut spec: GemSpec = metadata
+        .as_ref()
+        .and_then(|m| m.get("gemspec"))
+        .and_then(|gs| serde_json::from_value(gs.clone()).ok())
+        .unwrap_or_default();
+
+    if spec.name.is_empty() {
+        spec.name = name.to_string();
+    }
+    if spec.version.is_empty() {
+        spec.version = version.to_string();
+    }
+    if let Some(p) = platform {
+        spec.platform = Some(p);
+    }
+    spec
+}
+
+/// zlib-deflate (RFC 1950) — the `.rz` wrapper RubyGems inflates for quick specs.
+fn zlib_deflate(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+#[allow(clippy::result_large_err)]
+fn quick_spec_response(spec: &crate::formats::rubygems::GemSpec) -> Result<Response, Response> {
+    let marshal = crate::formats::rubygems::marshal_quick_spec(spec);
+    let compressed = zlib_deflate(&marshal).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Compression error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_LENGTH, compressed.len().to_string())
+        .body(Body::from(compressed))
+        .unwrap())
+}
+
+async fn quick_spec(
+    State(state): State<SharedState>,
+    Path((repo_key, spec_file)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    // `<full_name>.gemspec.rz` (or `.gemspec`) -> full_name.
+    let full_name = spec_file
+        .strip_suffix(".gemspec.rz")
+        .or_else(|| spec_file.strip_suffix(".gemspec"))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Not a gemspec request").into_response())?;
+
+    if repo.repo_type == RepositoryType::Virtual {
+        // Prefer a locally published member (mirrors the download shadowing rule).
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        for member in &members {
+            if member.repo_type != RepositoryType::Remote {
+                if let Some(spec) = find_local_quick_spec(&state.db, member.id, full_name).await? {
+                    return quick_spec_response(&spec);
+                }
+            }
+        }
+        // Otherwise proxy the upstream quick spec verbatim (already Marshal).
+        return proxy_helpers::resolve_virtual_metadata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            &format!("quick/Marshal.4.8/{}", spec_file),
+            |bytes, _member_key| async move {
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(bytes))
+                    .unwrap())
+            },
+        )
+        .await;
+    }
+
+    match find_local_quick_spec(&state.db, repo.id, full_name).await? {
+        Some(spec) => quick_spec_response(&spec),
+        None => Err((StatusCode::NOT_FOUND, "Gemspec not found").into_response()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +964,75 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // spec_index_coordinates — advertise coordinates the download route can
+    // resolve for both native and bare-path (generic) uploads (#2754).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spec_index_coordinates_native_path_is_byte_identical() {
+        // Native push path: `{name}/{version}/{name}-{version}.gem`.
+        let (name, version) = spec_index_coordinates(
+            "rails/7.0.8/rails-7.0.8.gem",
+            "rails".to_string(),
+            "7.0.8".to_string(),
+        );
+        assert_eq!(name, "rails");
+        assert_eq!(version, "7.0.8");
+    }
+
+    #[test]
+    fn test_spec_index_coordinates_bare_path_uses_filename() {
+        // Bare-path generic upload: stored `name` is the whole basename and
+        // `version` is the `sha256-<prefix>` fallback. The advertised
+        // coordinates must come from the filename so `gem install` reconstructs
+        // `rails-7.0.8.gem` (which the suffix route serves).
+        let (name, version) = spec_index_coordinates(
+            "rails-7.0.8.gem",
+            "rails-7.0.8.gem".to_string(),
+            "sha256-abcdef012345".to_string(),
+        );
+        assert_eq!(name, "rails");
+        assert_eq!(version, "7.0.8");
+        assert_ne!(version, "sha256-abcdef012345");
+    }
+
+    #[test]
+    fn test_spec_index_coordinates_non_gem_basename_falls_back() {
+        let (name, version) = spec_index_coordinates(
+            "archive.tar.gz",
+            "archive.tar.gz".to_string(),
+            "sha256-deadbeef".to_string(),
+        );
+        assert_eq!(name, "archive.tar.gz");
+        assert_eq!(version, "sha256-deadbeef");
+    }
+
+    #[test]
+    fn test_gem_download_uri_native_path_is_byte_identical() {
+        // Native push: basename already equals `{name}-{version}.gem`.
+        assert_eq!(
+            gem_download_uri("rg", "rails/7.0.8/rails-7.0.8.gem", "rails", "7.0.8"),
+            "/gems/rg/gems/rails-7.0.8.gem"
+        );
+    }
+
+    #[test]
+    fn test_gem_download_uri_bare_path_advertises_stored_basename() {
+        // Generic upload stored at a bare/arbitrary path: the advertised
+        // gem_uri must carry the real basename so the suffix download route
+        // (with #2587 exact-path fallback) resolves it — not the reconstructed
+        // `{name}-{version}.gem` that would 404.
+        assert_eq!(
+            gem_download_uri("rg", "blob.gem", "rails", "7.0.8"),
+            "/gems/rg/gems/blob.gem"
+        );
+        assert_eq!(
+            gem_download_uri("rg", "uploads/x/pkg.gem", "rails", "7.0.8"),
+            "/gems/rg/gems/pkg.gem"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // DependencyQuery deserialization
     // -----------------------------------------------------------------------
 
@@ -805,6 +1136,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.id, id);
         assert_eq!(info.repo_type, "hosted");
@@ -895,18 +1228,74 @@ mod tests {
     // Specs format
     // -----------------------------------------------------------------------
 
+    /// The specs index response must be a *gzipped Ruby Marshal 4.8* stream
+    /// (leading `\x04\x08`), not gzipped JSON. A real `gem`/`bundler` client
+    /// hard-fails on the JSON form with `Unsupported marshal version 91.91`
+    /// (`91.91` == the ASCII `[[` of a JSON array).
     #[test]
-    fn test_specs_json_format() {
+    fn test_specs_response_is_gzipped_marshal_not_json() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
         let specs: Vec<serde_json::Value> = vec![
             serde_json::json!(["rails", "7.0.0", "ruby"]),
             serde_json::json!(["sinatra", "3.0.0", "ruby"]),
         ];
-        let json_bytes = serde_json::to_vec(&specs).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&json_bytes).unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0][0], "rails");
-        assert_eq!(parsed[0][1], "7.0.0");
-        assert_eq!(parsed[0][2], "ruby");
+        let resp = specs_to_gzip_response(&specs).expect("build specs response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "application/gzip"
+        );
+
+        // Reconstruct the exact gzip payload the handler emitted (it is
+        // `gzip_compress(marshal_specs_index(tuples))`) and verify the
+        // decompressed bytes are Marshal 4.8, NOT JSON. Body extraction goes
+        // through the same two functions, so this proves the wire format
+        // without buffering the response body.
+        let triples: Vec<(String, String, String)> = specs.iter().map(spec_tuple).collect();
+        let marshal_bytes = crate::formats::rubygems::marshal_specs_index(&triples);
+        let compressed = gzip_compress(&marshal_bytes).unwrap();
+        assert_eq!(
+            &compressed[0..2],
+            &[0x1f, 0x8b],
+            "outer wrapper must be gzip"
+        );
+
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut marshal = Vec::new();
+        decoder.read_to_end(&mut marshal).unwrap();
+
+        // The decompressed payload is a Marshal 4.8 stream, NOT JSON.
+        assert_eq!(
+            &marshal[0..2],
+            &[0x04, 0x08],
+            "decompressed specs must be Marshal 4.8, got {:02x?}",
+            &marshal[0..2.min(marshal.len())]
+        );
+        assert_ne!(&marshal[0..2], b"[[", "must not be a JSON array");
+
+        // Byte-exact to Ruby's `Marshal.dump` of the same tuples.
+        let expected = crate::formats::rubygems::marshal_specs_index(&[
+            ("rails".into(), "7.0.0".into(), "ruby".into()),
+            ("sinatra".into(), "3.0.0".into(), "ruby".into()),
+        ]);
+        assert_eq!(marshal, expected);
+    }
+
+    #[test]
+    fn test_spec_tuple_extraction() {
+        let (n, v, p) = super::spec_tuple(&serde_json::json!(["rails", "7.0.0", "ruby"]));
+        assert_eq!(
+            (n.as_str(), v.as_str(), p.as_str()),
+            ("rails", "7.0.0", "ruby")
+        );
+        // Missing platform defaults to "ruby"; malformed entry never panics.
+        let (n, v, p) = super::spec_tuple(&serde_json::json!(["only-name"]));
+        assert_eq!(
+            (n.as_str(), v.as_str(), p.as_str()),
+            ("only-name", "", "ruby")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -961,6 +1350,135 @@ mod tests {
         f.teardown().await;
     }
 
+    /// End-to-end for the Marshal 4.8 index + quick gemspec against a seeded
+    /// gem: `specs.4.8.gz` decompresses to a Marshal stream carrying the gem,
+    /// and `quick/Marshal.4.8/<full_name>.gemspec.rz` inflates (zlib) to a
+    /// `Gem::Specification` Marshal object.
+    #[tokio::test]
+    async fn test_rubygems_specs_and_quick_spec_marshal() {
+        use flate2::read::{GzDecoder, ZlibDecoder};
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "rubygems/rails/7.0.0/rails-7.0.0.gem",
+            "rails/7.0.0/rails-7.0.0.gem",
+            "rails",
+            "7.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"gem-data"),
+            f.user_id,
+        )
+        .await;
+
+        // specs.4.8.gz -> gzip -> Marshal 4.8 (not JSON) carrying "rails".
+        let app = f.router_anon(super::router());
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/specs.4.8.gz", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut specs = Vec::new();
+        GzDecoder::new(&body[..])
+            .read_to_end(&mut specs)
+            .expect("gunzip specs");
+        assert_eq!(&specs[0..2], &[0x04, 0x08], "specs must be Marshal 4.8");
+        assert_ne!(&specs[0..2], b"[[", "specs must not be JSON");
+        assert!(specs.windows(5).any(|w| w == b"rails"));
+
+        // quick/Marshal.4.8/rails-7.0.0.gemspec.rz -> zlib -> Marshal 4.8 spec.
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/quick/Marshal.4.8/rails-7.0.0.gemspec.rz",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut spec = Vec::new();
+        ZlibDecoder::new(&body[..])
+            .read_to_end(&mut spec)
+            .expect("inflate quick spec");
+        assert_eq!(
+            &spec[0..3],
+            &[0x04, 0x08, b'u'],
+            "quick spec is a Marshal userdef"
+        );
+        assert!(spec.windows(18).any(|w| w == b"Gem::Specification"));
+
+        // A missing gemspec 404s rather than serving a bogus spec.
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/quick/Marshal.4.8/nope-9.9.9.gemspec.rz",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        f.teardown().await;
+    }
+
+    /// #2754: a bare-path generic upload (path == filename, `name` == whole
+    /// basename, `version` == `sha256-<prefix>` fallback) must appear in the
+    /// spec index with the coordinates `gem install` reconstructs the
+    /// *resolvable* `{name}-{version}.gem` download from — not the raw sha256
+    /// fallback (which yields `rails-7.0.8.gem-sha256-….gem` → 404). Fails on
+    /// `main`.
+    #[tokio::test]
+    async fn test_rubygems_specs_coords_resolve_for_bare_path_generic_upload() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "rubygems/rails-7.0.8.gem",
+            "rails-7.0.8.gem",
+            "rails-7.0.8.gem",
+            "sha256-abcdef012345",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"gem-data"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/specs.4.8.gz", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut specs = Vec::new();
+        GzDecoder::new(&body[..])
+            .read_to_end(&mut specs)
+            .expect("gunzip specs");
+        assert!(
+            specs.windows(5).any(|w| w == b"rails"),
+            "specs must advertise the gem name"
+        );
+        assert!(
+            specs.windows(5).any(|w| w == b"7.0.8"),
+            "specs must advertise the resolvable version"
+        );
+        assert!(
+            !specs.windows(20).any(|w| w == b"sha256-abcdef012345"),
+            "specs still advertise the unresolvable sha256 fallback version"
+        );
+        f.teardown().await;
+    }
+
     #[tokio::test]
     async fn test_rubygems_gem_info_404_when_missing() {
         let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
@@ -991,6 +1509,42 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         f.teardown().await;
     }
+
+    /// #2561: an authenticated gem push decodes the gemspec through the
+    /// permit-scoped decode (uncontended) and stores the gem.
+    #[tokio::test]
+    async fn test_rubygems_push_gem_succeeds_2561() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        // A .gem is a plain tar carrying a gzip'd gemspec-YAML `metadata.gz`.
+        let yaml = b"--- !ruby/object:Gem::Specification\nname: pushgem\nversion: 1.0.0\n";
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, yaml).unwrap();
+        let metadata_gz = gz.finish().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("metadata.gz").unwrap();
+        header.set_size(metadata_gz.len() as u64);
+        header.set_cksum();
+        builder.append(&header, &metadata_gz[..]).unwrap();
+        let gem = builder.into_inner().unwrap();
+
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .body(axum::body::Body::from(gem))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "gem push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+        f.teardown().await;
+    }
 }
 
 #[cfg(test)]
@@ -1011,6 +1565,8 @@ mod db_cov_tests {
             format!("/{k}/api/v1/dependencies?gems=name"),
             format!("/{k}/specs.4.8.gz"),
             format!("/{k}/latest_specs.4.8.gz"),
+            format!("/{k}/prerelease_specs.4.8.gz"),
+            format!("/{k}/quick/Marshal.4.8/name-1.0.0.gemspec.rz"),
             format!("/{k}/gems/name-1.0.0.gem"),
         ];
         for uri in uris {

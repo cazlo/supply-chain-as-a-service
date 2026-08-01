@@ -36,7 +36,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
@@ -511,21 +511,8 @@ pub(crate) async fn invalidate_packument_caches(
     let Some(cache) = state.npm_packument_cache.as_ref() else {
         return;
     };
-    cache.invalidate_package(repo_key, package).await;
-
-    let virtual_keys: Vec<String> = sqlx::query_scalar(
-        "SELECT r.key FROM repositories r \
-         INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
-         WHERE vrm.member_repo_id = $1",
-    )
-    .bind(repo_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    for virtual_key in &virtual_keys {
-        cache.invalidate_package(virtual_key, package).await;
-    }
+    packument_cache::invalidate_package_and_virtuals(&state.db, cache, repo_id, repo_key, package)
+        .await;
 }
 
 use crate::api::middleware::auth::require_auth_with_bearer_fallback;
@@ -686,6 +673,360 @@ fn empty_audits_quick_response() -> Response {
     build_json_metadata_response(body.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// npm /-/ meta+audit namespace — scope-policy filtering (#2424)
+//
+// The advisory/audit/search endpoints proxy to upstream. On a scope-restricted
+// Remote repository they must not leak metadata (advisories, audit reports,
+// search hits) for out-of-scope package names. These pure helpers filter the
+// package-name-bearing request/response shapes against the repo's policy;
+// callers only invoke them when `policy.is_active()`, so unset-policy repos are
+// byte-identical (allow-all) and never touch this code path.
+// ---------------------------------------------------------------------------
+
+/// Filter a JSON object whose keys are npm package names, keeping only entries
+/// the policy allows. Returns the filtered map and whether any entry survived.
+/// Shared by the bulk-advisories request/response (`{name: [...]}`) and the
+/// quick-audit `requires` / `dependencies` sub-maps.
+fn filter_pkg_name_map(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    policy: &NpmScopePolicy,
+) -> (serde_json::Map<String, serde_json::Value>, bool) {
+    let filtered: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .filter(|(name, _)| policy.allows(name))
+        .map(|(name, val)| (name.clone(), val.clone()))
+        .collect();
+    let kept = !filtered.is_empty();
+    (filtered, kept)
+}
+
+/// Filter the bulk-advisories request body (`{name: [versions]}`) against the
+/// policy. Returns the re-serialised body and whether any in-scope package
+/// remained. `None` when the body is not the expected object shape — the caller
+/// fails closed (empty response) under an active policy.
+fn filter_bulk_advisory_request(body: &[u8], policy: &NpmScopePolicy) -> Option<(Bytes, bool)> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = value.as_object()?;
+    let (filtered, kept) = filter_pkg_name_map(obj, policy);
+    let bytes = serde_json::to_vec(&serde_json::Value::Object(filtered)).ok()?;
+    Some((Bytes::from(bytes), kept))
+}
+
+/// Filter a bulk-advisories response (`{name: [advisories]}`) against the
+/// policy — defence in depth in case upstream returns advisories for names that
+/// were not requested. Parse failure yields an empty object (fail-closed).
+fn filter_bulk_advisory_response(bytes: &[u8], policy: &NpmScopePolicy) -> String {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Object(obj)) => {
+            let (filtered, _) = filter_pkg_name_map(&obj, policy);
+            serde_json::Value::Object(filtered).to_string()
+        }
+        _ => serde_json::Value::Object(serde_json::Map::new()).to_string(),
+    }
+}
+
+/// Filter the quick-audit request body: drop out-of-scope names from the
+/// `requires` and `dependencies` maps so upstream is never asked about them.
+/// Returns the re-serialised body and whether any in-scope dependency remained.
+/// `None` when the body is not an object (caller fails closed).
+fn filter_quick_audit_request(body: &[u8], policy: &NpmScopePolicy) -> Option<(Bytes, bool)> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = value.as_object_mut()?;
+    let mut kept = false;
+    for key in ["requires", "dependencies"] {
+        // Compute the filtered sub-map first (borrow ends before the insert).
+        let filtered = obj
+            .get(key)
+            .and_then(|v| v.as_object())
+            .map(|sub| filter_pkg_name_map(sub, policy));
+        if let Some((fmap, k)) = filtered {
+            kept = kept || k;
+            obj.insert(key.to_string(), serde_json::Value::Object(fmap));
+        }
+    }
+    let bytes = serde_json::to_vec(&value).ok()?;
+    Some((Bytes::from(bytes), kept))
+}
+
+/// Filter a quick-audit response: keep only `advisories` whose `module_name`
+/// the policy allows. Returns the re-serialised body; `None` when the body is
+/// not an object (caller falls back to the empty audit report).
+fn filter_quick_audit_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let obj = value.as_object_mut()?;
+    // Compute the filtered advisories map first so the immutable borrow of
+    // `obj` ends before the mutable `insert`.
+    let filtered = obj
+        .get("advisories")
+        .and_then(|v| v.as_object())
+        .map(|adv| {
+            adv.iter()
+                .filter(|(_, entry)| {
+                    entry
+                        .get("module_name")
+                        .and_then(|m| m.as_str())
+                        .map(|name| policy.allows(name))
+                        // An advisory with no module_name cannot be scoped: drop it.
+                        .unwrap_or(false)
+                })
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        });
+    if let Some(fmap) = filtered {
+        obj.insert("advisories".to_string(), serde_json::Value::Object(fmap));
+    }
+    Some(value.to_string())
+}
+
+/// Best-effort defensive filter of an npm `/-/` meta response against the scope
+/// policy (#2424, #2542). Handles two response shapes:
+///
+/// * The search shape (`{"objects":[{"package":{"name":...}}], "total":N,
+///   ...}`) — dropping out-of-scope hits and correcting `total`.
+/// * The legacy package-name-keyed map shapes returned by `/-/all`
+///   (`{"_updated":<ts>,"<pkg>":{doc},...}`) and `/-/by-user/:user`
+///   (`{"<pkg>":[...],...}`) — dropping entries whose key is an out-of-scope
+///   package name. These carry no `objects` key, so before #2542 they were
+///   re-serialised verbatim and leaked out-of-scope package existence against
+///   upstreams that still honour the endpoints (older verdaccio/Nexus/CouchDB).
+///
+/// `meta_path` (the `/-/<rest>` endpoint being proxied) selects how the map
+/// keys are read (#2594) — the same JSON shape means different things on
+/// different endpoints, so filtering it context-free either leaks or
+/// over-blocks:
+///
+/// * `/-/user/:user/package` and `/-/org/:org/package` (`npm access
+///   ls-packages`) map **every** key to a package name, so every key is
+///   scope-checked — including bare unscoped names, which carry no
+///   structural-metadata ambiguity on these endpoints.
+/// * `/-/by-user/:user` keys on the **username**, not on a package name. A kept
+///   key vouches only for itself, so the package listing it carries (array of
+///   names, or a package-name-keyed map) is separately scope-filtered.
+/// * Everywhere else (`/-/all`, `/-/whoami`, `/-/ping`, `/-/npm/v1/user`) keys
+///   are read by shape: object/array-valued keys are package names and are
+///   scope-checked, while scalar-valued keys are structural metadata
+///   (`/-/all`'s `_updated`, whoami's `{"username":"..."}`, `/-/ping`'s `{}`)
+///   and are preserved — unless the key is an unambiguous `@scope/name`
+///   package name, which is scope-checked so a name->scalar map cannot leak
+///   out-of-scope package existence through the key alone.
+///
+/// Name-bearing values sitting beside `objects` in a search envelope are
+/// scrubbed to the same scope as the hits themselves.
+///
+/// **Boundary:** on `/-/all` the key *is* the package name, so its object value
+/// is that package's own document — vouched for by the in-scope key and NOT
+/// recursed into. Package names inside a packument are dependency/related refs,
+/// not a listing of what this repository serves; filtering them would corrupt
+/// legitimate metadata.
+///
+/// A top-level JSON array (some registries answer `/-/all` and similar
+/// endpoints with a bare `["pkg-a","@scope/pkg-b",...]` listing) is treated as
+/// a package-name list: only entries whose name `policy.allows` survive.
+///
+/// The outcome is explicit (#2551): [`MetaFilterOutcome::Filtered`] carries the
+/// scope-filtered bytes; [`MetaFilterOutcome::Unrecognized`] means the body did
+/// not parse or its top-level shape was neither a recognised object nor array.
+/// The caller MUST fail closed on `Unrecognized` under an active policy (serve
+/// an empty scoped body) rather than echo the upstream bytes verbatim — the
+/// previous `None`-means-passthrough behaviour leaked out-of-scope package
+/// existence whenever an upstream returned an unmodelled shape.
+enum MetaFilterOutcome {
+    /// Recognised shape (search object, legacy package-name-keyed map, or a
+    /// top-level package-name array), scope-filtered. Serve these bytes.
+    Filtered(Bytes),
+    /// Unparseable body or an unrecognised top-level shape. Fail closed under
+    /// an active policy.
+    Unrecognized,
+}
+
+#[cfg(test)]
+impl MetaFilterOutcome {
+    /// Unwrap to the filtered bytes, panicking on `Unrecognized`.
+    fn expect_filtered(self) -> Bytes {
+        match self {
+            MetaFilterOutcome::Filtered(bytes) => bytes,
+            MetaFilterOutcome::Unrecognized => panic!("expected a filtered outcome"),
+        }
+    }
+}
+
+fn filter_meta_response(
+    bytes: &[u8],
+    meta_path: &str,
+    policy: &NpmScopePolicy,
+) -> MetaFilterOutcome {
+    // An inactive policy restricts nothing, so there is nothing to filter and
+    // no shape to fail closed on: hand back the upstream bytes verbatim
+    // (#2594). `proxy_npm_meta_get` already gates on `is_active()`, so this is
+    // an invariant for direct callers rather than a change to the proxy path.
+    if !policy.is_active() {
+        return MetaFilterOutcome::Filtered(Bytes::copy_from_slice(bytes));
+    }
+    let mut value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return MetaFilterOutcome::Unrecognized,
+    };
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(objects) = obj.get_mut("objects").and_then(|v| v.as_array_mut()) {
+            objects.retain(|entry| {
+                entry
+                    .get("package")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|name| policy.allows(name))
+                    .unwrap_or(false)
+            });
+            let total = objects.len();
+            obj.insert("total".to_string(), serde_json::json!(total));
+            // Sibling name-bearing values (#2594): some registries decorate the
+            // search envelope with extra package listings (e.g. spelling
+            // suggestions) alongside `objects`. Scrub those to the same scope
+            // as the hits themselves; scalar siblings (`total`, `time`) carry
+            // no package listing and are left untouched.
+            for (key, val) in obj.iter_mut() {
+                if key == "objects" {
+                    continue;
+                }
+                scrub_meta_package_listing(val, policy);
+            }
+        } else if npm_meta_keys_are_package_names(meta_path) {
+            // `npm access ls-packages` shapes (#2594): every key is a package
+            // name by definition, so scope-check them all — including bare
+            // unscoped names. No structural-metadata key exists on these
+            // endpoints, so there is nothing to falsely drop.
+            obj.retain(|key, _| policy.allows(key));
+        } else {
+            // Legacy map shapes (#2542): key is a package name, value is a
+            // package document (`/-/all`) or a package-name list
+            // (`/-/by-user`). Drop out-of-scope keys; keep scalar-valued
+            // structural metadata (e.g. `_updated`, whoami's `username`)
+            // untouched so those endpoints stay correct.
+            obj.retain(|key, val| match val {
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => policy.allows(key),
+                // Scalar-valued keys (#2594): a key in unambiguous
+                // `@scope/name` form is a package name (e.g. the non-standard
+                // `{"@scope/pkg":"1.2.3"}` name->version map), so scope-check
+                // it — keeping it would leak out-of-scope package existence
+                // through the key alone. A bare unscoped key is
+                // indistinguishable from structural metadata (`_updated`,
+                // whoami's `username`, `ok`) on these endpoints, so it is
+                // preserved; the endpoints where every key IS a package name
+                // are handled by the branch above.
+                _ => !matches!(npm_name_shape(key), NpmNameShape::Scoped(_)) || policy.allows(key),
+            });
+            if npm_meta_keys_are_usernames(meta_path) {
+                // `/-/by-user/:user` keys on the *username*, so a kept key says
+                // nothing about the package names it lists — scope-filter the
+                // listing itself (#2594).
+                for val in obj.values_mut() {
+                    scrub_meta_package_listing(val, policy);
+                }
+            }
+            // Otherwise (`/-/all`) the key IS the package name and its object
+            // value is that package's own document, vouched for by the in-scope
+            // key: deliberately NOT recursed, so packument dependency/related
+            // refs stay intact (#2594 boundary).
+        }
+    } else if let Some(arr) = value.as_array_mut() {
+        // Top-level package-name array (#2551): retain only in-scope entries.
+        arr.retain(|entry| meta_array_entry_allowed(entry, policy));
+    } else {
+        // Scalar or other unmodelled top-level shape — cannot be scope-checked.
+        return MetaFilterOutcome::Unrecognized;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(v) => MetaFilterOutcome::Filtered(Bytes::from(v)),
+        Err(_) => MetaFilterOutcome::Unrecognized,
+    }
+}
+
+/// Whether every top-level key of this `/-/` map response is a package name
+/// (#2594).
+///
+/// True for `npm access ls-packages` / `ls-collaborators`, i.e.
+/// `/-/user/:user/package` and `/-/org/:org/package`, whose bodies are pure
+/// `{"<pkg>":"read|write",...}` maps. On these endpoints a bare unscoped key
+/// cannot be structural metadata, so every key can be scope-checked without any
+/// risk of dropping a legitimate field (contrast `/-/whoami`'s `username` and
+/// `/-/npm/v1/user`, which stay on the key-shape rule).
+///
+/// `meta_path` is the wildcard capture after `/-/`, without a leading slash
+/// (e.g. `user/alice/package`), but leading/trailing slashes are tolerated.
+fn npm_meta_keys_are_package_names(meta_path: &str) -> bool {
+    let segments: Vec<&str> = meta_path.trim_matches('/').split('/').collect();
+    segments.last() == Some(&"package")
+        && segments
+            .iter()
+            .any(|segment| *segment == "user" || *segment == "org")
+}
+
+/// Whether this `/-/` map response keys on a **username** rather than a package
+/// name (#2594): `/-/by-user/:user` returns `{"<user>":["<pkg>",...]}`.
+fn npm_meta_keys_are_usernames(meta_path: &str) -> bool {
+    meta_path.trim_matches('/').split('/').next() == Some("by-user")
+}
+
+/// Scope-filter a value that is itself a package listing (#2594): the array or
+/// map carried under a `/-/by-user/:user` key, or a name-bearing sibling of a
+/// search envelope's `objects`.
+///
+/// Handles both listing encodings — an array of package names/objects, and a
+/// package-name-keyed map (`{"<pkg>":"write"}` / `{"<pkg>":{...}}`) — so an
+/// object-valued listing cannot ride along unfiltered while the array-valued
+/// one is scrubbed. Scalars carry no listing and are left alone. Map keys use
+/// the same shape rule as the top level: a nested map has no endpoint context
+/// guaranteeing its keys are package names, so structural bare keys are
+/// preserved.
+fn scrub_meta_package_listing(value: &mut serde_json::Value, policy: &NpmScopePolicy) {
+    match value {
+        serde_json::Value::Array(entries) => {
+            entries.retain(|entry| meta_array_entry_allowed(entry, policy));
+        }
+        serde_json::Value::Object(map) => {
+            map.retain(|key, child| match child {
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => policy.allows(key),
+                _ => !matches!(npm_name_shape(key), NpmNameShape::Scoped(_)) || policy.allows(key),
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Whether a single entry of a top-level meta array is in scope (#2551).
+///
+/// Entries are either bare package-name strings (the common
+/// `["pkg-a","@scope/pkg-b",...]` listing some registries return) or objects
+/// carrying a `name` / `package.name` field. An entry with no extractable
+/// package name is dropped (fail-closed) rather than leaked.
+fn meta_array_entry_allowed(entry: &serde_json::Value, policy: &NpmScopePolicy) -> bool {
+    let name = match entry {
+        serde_json::Value::String(s) => Some(s.as_str()),
+        serde_json::Value::Object(_) => entry
+            .get("name")
+            .or_else(|| entry.get("package").and_then(|p| p.get("name")))
+            .and_then(|n| n.as_str()),
+        _ => None,
+    };
+    match name {
+        Some(name) => policy.allows(name),
+        None => false,
+    }
+}
+
+/// Safe, empty, in-scope meta body to serve when the upstream response shape is
+/// unrecognised/unparseable under an active scope policy (#2551). Fails closed:
+/// never echoes upstream bytes. Search endpoints get the well-formed empty
+/// search envelope so clients parse it cleanly; everything else gets an empty
+/// object.
+fn empty_scoped_meta_body(meta_path: &str) -> Bytes {
+    if meta_path.contains("search") {
+        Bytes::from_static(br#"{"objects":[],"total":0}"#)
+    } else {
+        Bytes::from_static(b"{}")
+    }
+}
+
 /// Forward an npm audit POST request to the configured upstream registry.
 ///
 /// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
@@ -694,13 +1035,17 @@ fn empty_audits_quick_response() -> Response {
 /// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
 /// well-formed response so the audit degrades gracefully instead of failing
 /// the client command. See issue #1400.
-#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
-async fn proxy_npm_audit_post(
+/// POST an npm audit body upstream and return the raw 2xx JSON bytes plus the
+/// upstream content-type. Returns `None` on a non-success status or any
+/// transport/read error, mirroring the empty-fallback semantics of
+/// [`proxy_npm_audit_post`]. Split out so the scope-policy path (#2424) can
+/// post-filter the response before serving it.
+#[allow(clippy::disallowed_methods)] // the exempt call is marked inline below (#1608)
+async fn npm_audit_upstream_json(
     upstream_url: &str,
     path: &str,
     body: Bytes,
-    empty_fallback: fn() -> Response,
-) -> Response {
+) -> Option<(String, Bytes)> {
     let base = upstream_url.trim_end_matches('/');
     let url = format!("{}{}", base, path);
     let client = crate::services::http_client::default_client();
@@ -709,46 +1054,8 @@ async fn proxy_npm_audit_post(
         .header(CONTENT_TYPE, "application/json")
         .body(body);
 
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let content_type = resp
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            // STREAMING-EXEMPT: capped metadata read (upstream npm audit advisory JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap degrades to empty advisories; tracked under #1608
-            match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024)
-                .await
-            {
-                Ok(bytes) => {
-                    if !status.is_success() {
-                        debug!(
-                            target: "npm_audit",
-                            upstream = %url,
-                            status = %status,
-                            "npm audit upstream returned non-success; serving empty advisories"
-                        );
-                        return empty_fallback();
-                    }
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, content_type)
-                        .body(Body::from(bytes))
-                        .unwrap_or_else(|_| empty_fallback())
-                }
-                Err(err) => {
-                    debug!(
-                        target: "npm_audit",
-                        upstream = %url,
-                        error = %err,
-                        "failed to read npm audit upstream body; serving empty advisories"
-                    );
-                    empty_fallback()
-                }
-            }
-        }
+    let resp = match req.send().await {
+        Ok(r) => r,
         Err(err) => {
             debug!(
                 target: "npm_audit",
@@ -756,8 +1063,63 @@ async fn proxy_npm_audit_post(
                 error = %err,
                 "failed to reach npm audit upstream; serving empty advisories"
             );
-            empty_fallback()
+            return None;
         }
+    };
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    // STREAMING-EXEMPT: capped metadata read (upstream npm audit advisory JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap degrades to empty advisories; tracked under #1608
+    match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024).await {
+        Ok(bytes) => {
+            if !status.is_success() {
+                debug!(
+                    target: "npm_audit",
+                    upstream = %url,
+                    status = %status,
+                    "npm audit upstream returned non-success; serving empty advisories"
+                );
+                return None;
+            }
+            Some((content_type, bytes))
+        }
+        Err(err) => {
+            debug!(
+                target: "npm_audit",
+                upstream = %url,
+                error = %err,
+                "failed to read npm audit upstream body; serving empty advisories"
+            );
+            None
+        }
+    }
+}
+
+/// Forward an npm audit POST request to the configured upstream registry.
+///
+/// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
+/// whichever upstream is configured) so `npm audit` works for cached/mirrored
+/// dependencies. The full client body is forwarded verbatim. On any upstream
+/// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
+/// well-formed response so the audit degrades gracefully instead of failing
+/// the client command. See issue #1400.
+async fn proxy_npm_audit_post(
+    upstream_url: &str,
+    path: &str,
+    body: Bytes,
+    empty_fallback: fn() -> Response,
+) -> Response {
+    match npm_audit_upstream_json(upstream_url, path, body).await {
+        Some((content_type, bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, content_type)
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| empty_fallback()),
+        None => empty_fallback(),
     }
 }
 
@@ -770,14 +1132,23 @@ async fn proxy_npm_audit_post(
 /// Returns the upstream status + body verbatim. On any transport error (DNS,
 /// TLS, timeout) returns `None` so the caller can fall through to the local
 /// fallback.
-#[allow(clippy::disallowed_methods)] // clippy allow is fn-scoped (tail expr); the exempt call is marked inline below (#1608)
-async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Response> {
+#[allow(clippy::disallowed_methods)] // the exempt call is marked inline below (#1608)
+async fn npm_meta_upstream_bytes(
+    upstream_url: &str,
+    meta_path: &str,
+    query: Option<&str>,
+) -> Option<(StatusCode, String, Bytes)> {
     let base = upstream_url.trim_end_matches('/');
     // Reconstruct the `/-/<rest>` meta path. axum 0.7 wildcard captures do NOT
     // include a leading slash (`*rest` on `/-/ping` yields `ping`, not `/ping`),
     // so prepend `/-/` and strip any stray leading slash to be robust either way.
     let path_with_dash = format!("/-/{}", meta_path.trim_start_matches('/'));
-    let url = format!("{}{}", base, path_with_dash);
+    // The wildcard capture also drops the query string, so the search term never
+    // reached upstream (`-/v1/search` 400'd with no `text`). Re-append it here.
+    let url = match query {
+        Some(q) if !q.is_empty() => format!("{}{}?{}", base, path_with_dash, q),
+        _ => format!("{}{}", base, path_with_dash),
+    };
     let client = crate::services::http_client::default_client();
 
     let resp = match client.get(&url).send().await {
@@ -803,15 +1174,7 @@ async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Respo
 
     // STREAMING-EXEMPT: capped metadata read (upstream npm registry packument/meta JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap falls through to local fallback; tracked under #1608
     match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024).await {
-        Ok(bytes) => Some(
-            Response::builder()
-                .status(status)
-                .header(CONTENT_TYPE, content_type)
-                .body(Body::from(bytes))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
-                }),
-        ),
+        Ok(bytes) => Some((status, content_type, bytes)),
         Err(err) => {
             debug!(
                 target: "npm_meta",
@@ -822,6 +1185,43 @@ async fn proxy_npm_meta_get(upstream_url: &str, meta_path: &str) -> Option<Respo
             None
         }
     }
+}
+
+/// Forward a GET request to the upstream registry at the given meta path,
+/// carrying the original query string. When the repository's scope `policy` is
+/// active (#2424), defensively filter package names out of the response (npm
+/// search results) so a scope-restricted repo does not list out-of-scope
+/// packages. Returns `None` on any transport error so the caller can fall
+/// through to the local fallback.
+async fn proxy_npm_meta_get(
+    upstream_url: &str,
+    meta_path: &str,
+    query: Option<&str>,
+    policy: &NpmScopePolicy,
+) -> Option<Response> {
+    let (status, content_type, bytes) =
+        npm_meta_upstream_bytes(upstream_url, meta_path, query).await?;
+    let bytes = if policy.is_active() {
+        // Fail closed (#2551): an unrecognised/unparseable upstream shape must
+        // NOT be echoed verbatim under an active scope policy — that leaks
+        // out-of-scope package existence. Serve an empty scoped body instead.
+        match filter_meta_response(&bytes, meta_path, policy) {
+            MetaFilterOutcome::Filtered(filtered) => filtered,
+            MetaFilterOutcome::Unrecognized => empty_scoped_meta_body(meta_path),
+        }
+    } else {
+        // Inactive policy: byte-identical passthrough, unchanged behaviour.
+        bytes
+    };
+    Some(
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, content_type)
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
+            }),
+    )
 }
 
 /// Handler for `GET /npm/{repo_key}/-/*rest`.
@@ -847,20 +1247,29 @@ async fn npm_meta_get(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, rest)): Path<(String, String)>,
+    raw_query: axum::extract::RawQuery,
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    let query = raw_query.0;
 
-    // Remote: proxy the whole request to upstream verbatim.
+    // Remote: proxy the whole request to upstream, filtered by this repo's own
+    // scope policy (#2424) so search cannot list out-of-scope packages.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
-            if let Some(resp) = proxy_npm_meta_get(upstream_url, &rest).await {
+            let policy = fetch_npm_scope_policy(&state.db, repo.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            if let Some(resp) =
+                proxy_npm_meta_get(upstream_url, &rest, query.as_deref(), &policy).await
+            {
                 return Ok(resp);
             }
         }
         // Upstream misconfigured or unreachable — fall through to local stub.
     }
 
-    // Virtual: try the first Remote member whose upstream is reachable.
+    // Virtual: try the first Remote member whose upstream is reachable, applying
+    // that member's scope policy (parity with the metadata/packument loops).
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
         for member in &members {
@@ -870,7 +1279,12 @@ async fn npm_meta_get(
             let Some(ref upstream_url) = member.upstream_url else {
                 continue;
             };
-            if let Some(resp) = proxy_npm_meta_get(upstream_url, &rest).await {
+            let policy = fetch_npm_scope_policy(&state.db, member.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            if let Some(resp) =
+                proxy_npm_meta_get(upstream_url, &rest, query.as_deref(), &policy).await
+            {
                 return Ok(resp);
             }
         }
@@ -920,17 +1334,41 @@ async fn security_advisories_bulk(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
+    const PATH: &str = "/-/npm/v1/security/advisories/bulk";
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
-            return Ok(proxy_npm_audit_post(
-                upstream_url,
-                "/-/npm/v1/security/advisories/bulk",
-                body,
-                empty_advisories_bulk_response,
-            )
-            .await);
+            let policy = fetch_npm_scope_policy(&state.db, repo.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
+            if !policy.is_active() {
+                return Ok(proxy_npm_audit_post(
+                    upstream_url,
+                    PATH,
+                    body,
+                    empty_advisories_bulk_response,
+                )
+                .await);
+            }
+            // Active policy (#2424): drop out-of-scope package names from the
+            // request so upstream is never queried about them, then filter the
+            // response as defence in depth. Unparseable body ⇒ fail closed.
+            let Some((filtered_body, kept)) = filter_bulk_advisory_request(&body, &policy) else {
+                return Ok(empty_advisories_bulk_response());
+            };
+            if !kept {
+                return Ok(empty_advisories_bulk_response());
+            }
+            return Ok(
+                match npm_audit_upstream_json(upstream_url, PATH, filtered_body).await {
+                    Some((_ct, bytes)) => {
+                        build_json_metadata_response(filter_bulk_advisory_response(&bytes, &policy))
+                    }
+                    None => empty_advisories_bulk_response(),
+                },
+            );
         }
     }
 
@@ -947,17 +1385,42 @@ async fn security_audits_quick(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
+    const PATH: &str = "/-/npm/v1/security/audits/quick";
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
-            return Ok(proxy_npm_audit_post(
-                upstream_url,
-                "/-/npm/v1/security/audits/quick",
-                body,
-                empty_audits_quick_response,
-            )
-            .await);
+            let policy = fetch_npm_scope_policy(&state.db, repo.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
+            if !policy.is_active() {
+                return Ok(proxy_npm_audit_post(
+                    upstream_url,
+                    PATH,
+                    body,
+                    empty_audits_quick_response,
+                )
+                .await);
+            }
+            // Active policy (#2424): strip out-of-scope names from the request's
+            // requires/dependencies, then filter the response's advisories by
+            // module_name. Unparseable body ⇒ fail closed.
+            let Some((filtered_body, kept)) = filter_quick_audit_request(&body, &policy) else {
+                return Ok(empty_audits_quick_response());
+            };
+            if !kept {
+                return Ok(empty_audits_quick_response());
+            }
+            return Ok(
+                match npm_audit_upstream_json(upstream_url, PATH, filtered_body).await {
+                    Some((_ct, bytes)) => match filter_quick_audit_response(&bytes, &policy) {
+                        Some(filtered) => build_json_metadata_response(filtered),
+                        None => empty_audits_quick_response(),
+                    },
+                    None => empty_audits_quick_response(),
+                },
+            );
         }
     }
 
@@ -987,7 +1450,7 @@ async fn get_scoped_metadata(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     get_package_metadata_cached(&state, &repo_key, &full_name, base_url.as_str(), &headers).await
 }
@@ -1009,7 +1472,7 @@ async fn get_scoped_version_metadata(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     get_package_version_metadata(&state, &repo_key, &full_name, &version, base_url.as_str()).await
 }
@@ -1046,45 +1509,20 @@ fn build_npm_metadata_response(
 
         let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
 
-        let tarball_url = format!(
-            "{}/npm/{}/{}/-/{}",
-            base_url, repo_key, package_name, filename
-        );
+        let tarball_url = build_npm_tarball_url(base_url, repo_key, package_name, filename);
 
         let version_metadata = artifact
             .metadata
             .as_ref()
-            .and_then(|m| m.get("version_data").cloned())
-            .unwrap_or_else(|| serde_json::json!({}));
+            .and_then(|m| m.get("version_data").cloned());
 
-        let mut version_obj = if version_metadata.is_object() {
-            version_metadata
-        } else {
-            serde_json::json!({})
-        };
-
-        let obj = version_obj.as_object_mut().unwrap();
-        obj.entry("name".to_string())
-            .or_insert_with(|| serde_json::Value::String(package_name.to_string()));
-        obj.entry("version".to_string())
-            .or_insert_with(|| serde_json::Value::String(version.clone()));
-
-        let hex = &artifact.checksum_sha256;
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-            .collect();
-        let integrity = format!(
-            "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(&bytes)
-        );
-        obj.insert(
-            "dist".to_string(),
-            serde_json::json!({
-                "tarball": tarball_url,
-                "integrity": integrity,
-            }),
-        );
+        let version_obj = build_npm_version_entry(&NpmArtifactInfo {
+            version: version.clone(),
+            checksum_sha256: artifact.checksum_sha256.clone(),
+            tarball_url,
+            version_metadata,
+            package_name: package_name.to_string(),
+        });
 
         versions.insert(version.clone(), version_obj);
         version_list.push(version);
@@ -1233,6 +1671,14 @@ async fn fetch_npm_artifacts(
 pub(crate) const NPM_ALLOWED_SCOPES_KEY: &str = "npm_allowed_scopes";
 /// `repository_config` key holding the unscoped-package toggle ("true"/"false").
 pub(crate) const NPM_ALLOW_UNSCOPED_KEY: &str = "npm_allow_unscoped";
+/// `repository_config` key holding the JSON array of allowed npm name globs
+/// (#2424). Additive to `npm_allowed_scopes`: an unset key has no effect, so
+/// repositories configured before #2424 behave byte-identically.
+pub(crate) const NPM_ALLOWED_NAME_PATTERNS_KEY: &str = "npm_allowed_name_patterns";
+
+/// Maximum length of a single npm name glob pattern (matches the npm package
+/// name length cap; keeps a stored pattern from growing unbounded).
+pub(crate) const NPM_NAME_PATTERN_MAX_LEN: usize = 214;
 
 /// Parsed shape of an npm package name for scope-policy evaluation.
 #[derive(Debug, PartialEq, Eq)]
@@ -1297,13 +1743,32 @@ pub(crate) struct NpmScopePolicy {
     /// repository. `None` = not configured; treated as "deny" once the
     /// policy is otherwise active (fail-closed) and "allow" otherwise.
     pub(crate) allow_unscoped: Option<bool>,
+    /// Allowed full-package-name glob patterns (`*`/`?`), case-folded to
+    /// lowercase (#2424). Additive to `allowed_scopes`: a name is allowed if
+    /// its scope is in `allowed_scopes` OR any of these globs matches the full
+    /// package name. Empty = no pattern restriction (default, unchanged).
+    pub(crate) allowed_name_patterns: Vec<String>,
 }
 
 impl NpmScopePolicy {
-    /// A policy participates in filtering iff an allow-list is present or
-    /// unscoped resolution was explicitly switched off.
+    /// A policy participates in filtering iff an allow-list is present, a name
+    /// pattern list is present (#2424), or unscoped resolution was explicitly
+    /// switched off.
     pub(crate) fn is_active(&self) -> bool {
-        !self.allowed_scopes.is_empty() || self.allow_unscoped == Some(false)
+        !self.allowed_scopes.is_empty()
+            || !self.allowed_name_patterns.is_empty()
+            || self.allow_unscoped == Some(false)
+    }
+
+    /// Whether any configured name glob matches `package_name` (case-folded).
+    fn pattern_matches(&self, package_name: &str) -> bool {
+        if self.allowed_name_patterns.is_empty() {
+            return false;
+        }
+        let name = package_name.to_ascii_lowercase();
+        self.allowed_name_patterns
+            .iter()
+            .any(|pattern| crate::util::glob::glob_match(&pattern.to_ascii_lowercase(), &name))
     }
 
     /// Whether `package_name` may be resolved through the repository this
@@ -1315,16 +1780,57 @@ impl NpmScopePolicy {
         }
         match npm_name_shape(package_name) {
             NpmNameShape::Scoped(scope) => {
-                self.allowed_scopes.is_empty()
+                // Preserve the #2327 semantics: when neither a scope allow-list
+                // nor a name-pattern allow-list is configured (the policy is
+                // active only because `allow_unscoped == Some(false)`), every
+                // scoped name is still allowed. Otherwise a scoped name passes
+                // iff its scope is allow-listed OR a name glob matches.
+                (self.allowed_scopes.is_empty() && self.allowed_name_patterns.is_empty())
                     || self
                         .allowed_scopes
                         .iter()
                         .any(|allowed| allowed == &scope.to_ascii_lowercase())
+                    || self.pattern_matches(package_name)
             }
-            NpmNameShape::Unscoped => self.allow_unscoped == Some(true),
+            NpmNameShape::Unscoped => {
+                self.allow_unscoped == Some(true) || self.pattern_matches(package_name)
+            }
             NpmNameShape::Invalid => false,
         }
     }
+}
+
+/// Fail-closed error for an npm scope-policy value that is *present* in
+/// `repository_config` but cannot be parsed (#2726). The admin write path only
+/// ever stores serde-encoded JSON lists and literal `"true"`/`"false"`, so a
+/// corrupt value is never a legitimate state — treating it as "unset" would
+/// silently lift the operator's allowlist (same swallow class as #2672).
+fn npm_policy_value_corrupt(
+    repo_id: uuid::Uuid,
+    key: &str,
+    err: &dyn std::fmt::Display,
+) -> AppError {
+    tracing::error!(
+        repo_id = %repo_id,
+        key,
+        error = %err,
+        "npm scope policy value present but unparseable; failing closed (#2726)"
+    );
+    AppError::ServiceUnavailable("npm scope policy configuration is invalid".to_string())
+}
+
+/// Parse a stored JSON string-list policy value (scopes / name patterns),
+/// case-folded. A present-but-corrupt value fails closed (#2726).
+fn parse_npm_policy_list(
+    repo_id: uuid::Uuid,
+    key: &str,
+    value: &str,
+) -> Result<Vec<String>, AppError> {
+    Ok(serde_json::from_str::<Vec<String>>(value)
+        .map_err(|e| npm_policy_value_corrupt(repo_id, key, &e))?
+        .into_iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect())
 }
 
 /// Batch-load the npm scope policies for a set of member repositories in a
@@ -1332,48 +1838,72 @@ impl NpmScopePolicy {
 /// (treated as unrestricted). Mirrors the runtime-query style of
 /// `fetch_pypi_upstream_index_path` (no compile-time sqlx macro) so offline
 /// `cargo check` needs no prepared query data.
+///
+/// An *absent* policy row keeps meaning "unrestricted" — the legitimate
+/// unconfigured state. An *error* — a database failure, or a stored value that
+/// is present but cannot be parsed — must NOT be silently downgraded to that
+/// unrestricted default (#2726, same class as #2672): both return
+/// `Err(AppError::ServiceUnavailable)` (503) so the request fails CLOSED
+/// instead of a DB blip or a corrupt row lifting the operator's allowlist.
 async fn fetch_npm_scope_policies(
     db: &PgPool,
     repo_ids: &[uuid::Uuid],
-) -> std::collections::HashMap<uuid::Uuid, NpmScopePolicy> {
+) -> Result<std::collections::HashMap<uuid::Uuid, NpmScopePolicy>, AppError> {
     let mut policies: std::collections::HashMap<uuid::Uuid, NpmScopePolicy> =
         std::collections::HashMap::new();
     if repo_ids.is_empty() {
-        return policies;
+        return Ok(policies);
     }
     let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
         "SELECT repository_id, key, value FROM repository_config \
-         WHERE repository_id = ANY($1) AND key IN ($2, $3)",
+         WHERE repository_id = ANY($1) AND key IN ($2, $3, $4)",
     )
     .bind(repo_ids)
     .bind(NPM_ALLOWED_SCOPES_KEY)
     .bind(NPM_ALLOW_UNSCOPED_KEY)
+    .bind(NPM_ALLOWED_NAME_PATTERNS_KEY)
     .fetch_all(db)
     .await
-    .unwrap_or_default();
+    .map_err(|e| {
+        // Fail CLOSED on a genuine DB error rather than treating it as
+        // "no policy configured" (allow all) — see #2726.
+        tracing::error!(
+            error = %e,
+            "failed to load npm scope policies; failing closed (#2726)"
+        );
+        AppError::ServiceUnavailable("npm scope policy temporarily unavailable".to_string())
+    })?;
 
     for (repo_id, key, value) in rows {
         let policy = policies.entry(repo_id).or_default();
         if key == NPM_ALLOWED_SCOPES_KEY {
-            policy.allowed_scopes = serde_json::from_str::<Vec<String>>(&value)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect();
+            policy.allowed_scopes = parse_npm_policy_list(repo_id, &key, &value)?;
         } else if key == NPM_ALLOW_UNSCOPED_KEY {
-            policy.allow_unscoped = value.parse::<bool>().ok();
+            // A present-but-corrupt boolean must not silently become "unset":
+            // that would lift an explicit `false` (block-unscoped) — #2726.
+            policy.allow_unscoped = Some(
+                value
+                    .parse::<bool>()
+                    .map_err(|e| npm_policy_value_corrupt(repo_id, &key, &e))?,
+            );
+        } else if key == NPM_ALLOWED_NAME_PATTERNS_KEY {
+            policy.allowed_name_patterns = parse_npm_policy_list(repo_id, &key, &value)?;
         }
     }
-    policies
+    Ok(policies)
 }
 
 /// Fetch the npm scope policy for a single repository. Returns the default
-/// (inactive, unrestricted) policy when nothing is configured.
-pub(crate) async fn fetch_npm_scope_policy(db: &PgPool, repo_id: uuid::Uuid) -> NpmScopePolicy {
-    fetch_npm_scope_policies(db, &[repo_id])
-        .await
+/// (inactive, unrestricted) policy when nothing is configured; propagates a
+/// load failure so the caller fails closed (#2726).
+pub(crate) async fn fetch_npm_scope_policy(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> Result<NpmScopePolicy, AppError> {
+    Ok(fetch_npm_scope_policies(db, &[repo_id])
+        .await?
         .remove(&repo_id)
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// Whether a virtual-repo member may serve as a candidate for
@@ -1409,18 +1939,30 @@ async fn get_package_metadata(
     // artifacts do not contain enough information to reconstruct the full
     // package metadata that npm clients expect.
     if repo.repo_type == RepositoryType::Remote {
+        // Enforce the repository's own npm scope policy on the direct-remote
+        // path (#2424). Pointing a client straight at the member key would
+        // otherwise bypass the filter the virtual metadata loops apply. An
+        // out-of-scope name returns 404 (parity with the virtual "skipped by
+        // policy => not found" behaviour; avoids confirming the name exists).
+        let policy = fetch_npm_scope_policy(&state.db, repo.id)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if !policy.allows(package_name) {
+            return Err(AppError::NotFound("Package not found".to_string()).into_response());
+        }
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let encoded_name = encode_package_name_for_upstream(package_name);
-                let (content, content_type) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    repo.id,
-                    repo_key,
-                    upstream_url,
-                    &encoded_name,
-                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                )
-                .await?;
+                let (content, content_type, _budget_permit) =
+                    proxy_helpers::proxy_fetch_capped_budgeted(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        &encoded_name,
+                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    )
+                    .await?;
 
                 return rewrite_and_respond_with_age_gate(
                     state,
@@ -1452,7 +1994,9 @@ async fn get_package_metadata(
 
         // Batch-load per-member npm scope policies once per request (#2327).
         let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
+            .await
+            .map_err(IntoResponse::into_response)?;
 
         for member in &members {
             // For Local/Staging members, query artifacts from the DB.
@@ -1499,7 +2043,7 @@ async fn get_package_metadata(
             };
 
             let encoded_name = encode_package_name_for_upstream(package_name);
-            let result = proxy_helpers::proxy_fetch_capped(
+            let result = proxy_helpers::proxy_fetch_capped_budgeted(
                 proxy,
                 member.id,
                 &member.key,
@@ -1510,7 +2054,7 @@ async fn get_package_metadata(
             .await;
 
             match result {
-                Ok((content, content_type)) => {
+                Ok((content, content_type, _budget_permit)) => {
                     let params =
                         crate::services::age_gate_service::AgeGateRepoParams::from_repository(
                             member,
@@ -1634,6 +2178,14 @@ async fn fetch_remote_packument(
     package_name: &str,
     base_url: &str,
 ) -> Result<serde_json::Value, Response> {
+    // Enforce the repository's own npm scope policy on the direct-remote
+    // packument path (#2424); an out-of-scope name returns 404.
+    let policy = fetch_npm_scope_policy(&state.db, repo.id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    if !policy.allows(package_name) {
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
+    }
     let upstream_url = repo
         .upstream_url
         .as_deref()
@@ -1643,7 +2195,7 @@ async fn fetch_remote_packument(
         .as_ref()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
     let encoded_name = encode_package_name_for_upstream(package_name);
-    let (content, _ct) = proxy_helpers::proxy_fetch_capped(
+    let (content, _ct, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
         proxy,
         repo.id,
         repo_key,
@@ -1676,7 +2228,9 @@ async fn fetch_virtual_packument(
 
     // Batch-load per-member npm scope policies once per request (#2327).
     let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-    let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids).await;
+    let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
+        .await
+        .map_err(IntoResponse::into_response)?;
 
     for member in &members {
         if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
@@ -1732,7 +2286,7 @@ async fn fetch_virtual_packument(
         };
 
         let encoded_name = encode_package_name_for_upstream(package_name);
-        let result = proxy_helpers::proxy_fetch_capped(
+        let result = proxy_helpers::proxy_fetch_capped_budgeted(
             proxy,
             member.id,
             &member.key,
@@ -1743,7 +2297,7 @@ async fn fetch_virtual_packument(
         .await;
 
         match result {
-            Ok((content, _ct)) => {
+            Ok((content, _ct, _budget_permit)) => {
                 let mut json: serde_json::Value =
                     serde_json::from_slice(&content).map_err(|e| {
                         AppError::Internal(format!("Invalid JSON from upstream: {}", e))
@@ -1877,7 +2431,7 @@ async fn npm_publish_time_for_version(
         // Capped like every other buffered packument read (#2181): this runs
         // on the tarball download path, where an unbounded upstream metadata
         // body must not be able to balloon memory.
-        if let Ok((content, _)) = proxy_helpers::proxy_fetch_capped(
+        if let Ok((content, _, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
             proxy,
             repo.id,
             &repo.key,
@@ -2039,7 +2593,7 @@ async fn download_scoped_tarball(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     serve_tarball(&state, &repo_key, &full_name, &filename, &ctx).await
 }
@@ -2128,9 +2682,15 @@ async fn npm_local_fetch(
         };
 
     Ok(proxy_helpers::StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body,
         content_type: Some(artifact.content_type.clone()),
         content_length: Some(artifact.size_bytes as u64),
+        // Local artifact resolved: surface its id so a virtual npm-member
+        // download is recorded exactly once at the streaming resolver (#2260).
+        artifact_id: Some(artifact.id),
+        etag: None,
     })
 }
 
@@ -2143,6 +2703,14 @@ async fn serve_tarball(
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
+    // Curation enforcement (#2930): a `block` rule on this remote/virtual repo
+    // must block the tarball pull, the same way the pypi seam gates simple-index
+    // + download. No-op for hosted repos and when curation is disabled. Version
+    // is not passed: an npm tarball filename (`pkg-1.2.3.tgz`, prerelease
+    // suffixes and hyphenated names included) cannot be split into name/version
+    // unambiguously, so name-pattern rules (the block-a-package case) apply.
+    proxy_helpers::enforce_curation(&state.db, &repo, package_name, None).await?;
+
     // Tarball URLs keep the scope separator as a literal `/`
     // (`@scope/pkg/-/file.tgz`); only metadata uses `%2F`. Encoding it here
     // collapsed the scope and package into one path segment that no upstream
@@ -2153,6 +2721,16 @@ async fn serve_tarball(
     // already fetched). The proxy cache stores content under its own storage
     // key which the regular artifact storage cannot resolve.
     if repo.repo_type == RepositoryType::Remote {
+        // Enforce the repository's own npm scope policy on the direct-remote
+        // tarball path (#2424). A pinned-lockfile tarball GET for an
+        // out-of-scope name would otherwise stream straight through; an
+        // out-of-scope name now returns 404.
+        let policy = fetch_npm_scope_policy(&state.db, repo.id)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if !policy.allows(package_name) {
+            return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
+        }
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
@@ -2163,6 +2741,39 @@ async fn serve_tarball(
             {
                 fetch_path = lkg_path;
                 response_filename = lkg_filename;
+            }
+
+            // #3003: when scan-on-proxy is enabled, route through the inline
+            // scan-and-block path (buffered capped fetch + digest-keyed
+            // verdict gate shared with proxy-PyPI, #2954/#2970/#2976). Taken
+            // INSTEAD of the streaming path below, which serves tarball bytes
+            // without consulting a scan verdict. Repos that have not enabled
+            // scan-on-proxy skip this entirely and keep today's untouched
+            // streaming behavior (no regression). Runs after the age gate so
+            // a last-known-good substitution is scanned as what is served.
+            if crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+                .is_proxy_scan_enabled(repo.id)
+                .await
+                .unwrap_or(false)
+            {
+                let action =
+                    crate::services::scan_config_service::ScanConfigService::new(state.db.clone())
+                        .proxy_scan_action(repo.id)
+                        .await
+                        .unwrap_or(crate::services::proxy_scan_service::ProxyScanAction::FailOpen);
+                return serve_scanned_npm_tarball(
+                    state,
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    package_name,
+                    &fetch_path,
+                    &response_filename,
+                    action,
+                    ctx,
+                )
+                .await;
             }
 
             // #2192 / #1608 Phase 4c: an npm tarball is a package BLOB, not
@@ -2178,6 +2789,7 @@ async fn serve_tarball(
                 upstream_url,
                 &fetch_path,
                 &fetch_path,
+                RepositoryFormat::Npm,
             )
             .await?;
 
@@ -2236,6 +2848,28 @@ async fn serve_tarball(
             state.proxy_service.as_deref()
         };
 
+        // #2424: apply the per-member npm scope policy to the direct-tarball
+        // path, exactly as the metadata/packument loops already do. Metadata
+        // filtering alone does not cover a client that already knows the exact
+        // tarball URL (a pinned lockfile), which would otherwise stream an
+        // out-of-scope `@scope/pkg` straight through a Remote member. Fetch the
+        // members once, drop Remote members the policy excludes, and resolve
+        // over the pre-filtered list via `resolve_virtual_download_from_members`
+        // — the established pre-filtered-member seam (cf. maven.rs) — so the
+        // shared generic `resolve_virtual_download` helper is left untouched and
+        // no other format (maven/hex/...) is affected. Non-Remote members are
+        // always eligible, preserving the `virtual_non_remote_owns_name`
+        // shadowing guard and the local-only primitive above.
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let members: Vec<_> = members
+            .into_iter()
+            .filter(|m| npm_member_eligible(&m.repo_type, scope_policies.get(&m.id), package_name))
+            .collect();
+
         // #2066: enforce each gated Remote member's download age gate before
         // resolving the virtual tarball. Virtual metadata is already filtered
         // per-member (see the metadata branch), so an ordinary `npm install`
@@ -2247,7 +2881,6 @@ async fn serve_tarball(
         // shared `resolve_virtual_download` helper is left untouched so no
         // other format (maven/hex/...) is affected.
         if let Some(proxy) = proxy_for_virtual {
-            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
@@ -2273,6 +2906,7 @@ async fn serve_tarball(
                             member_upstream,
                             &lkg_path,
                             &lkg_path,
+                            member.format.clone(),
                         )
                         .await?;
                         correct_cached_tarball_content_type(&state.db, member.id, &lkg_path).await;
@@ -2287,10 +2921,66 @@ async fn serve_tarball(
             }
         }
 
-        let result = proxy_helpers::resolve_virtual_download(
-            &state.db,
+        // #3023: apply the inline scan-and-block gate on the virtual npm path,
+        // the same gate the direct-Remote tarball path runs. For each eligible
+        // Remote member whose stricter-of-two policy (virtual OR member) enables
+        // scanning, buffer + gate the tarball through `serve_scanned_npm_tarball`
+        // under the MEMBER's context: a vulnerable digest is blocked (403/423)
+        // instead of streamed 200. A member that does not have the tarball
+        // (upstream 404) falls through to the next member; a scan block (403
+        // vulnerable / 423 inconclusive) is definitive. Members with scanning
+        // disabled fall through to the untouched shared streaming resolver below
+        // (no regression). The shared `resolve_virtual_download_from_members` is
+        // deliberately left untouched so maven/hex and other formats are
+        // unaffected.
+        if let Some(proxy) = proxy_for_virtual {
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(ref member_upstream) = member.upstream_url else {
+                    continue;
+                };
+                let (enabled, action) =
+                    proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
+                        .await;
+                if !enabled {
+                    continue;
+                }
+                match serve_scanned_npm_tarball(
+                    state,
+                    proxy,
+                    member.id,
+                    &member.key,
+                    member_upstream,
+                    package_name,
+                    &upstream_path,
+                    filename,
+                    action,
+                    ctx,
+                )
+                .await
+                {
+                    Ok(resp) => return Ok(resp),
+                    Err(resp) => {
+                        let status = resp.status();
+                        if status == StatusCode::FORBIDDEN || status == StatusCode::LOCKED {
+                            return Err(resp);
+                        }
+                        debug!(
+                            member_key = %member.key,
+                            status = %status,
+                            "scanned npm virtual member did not serve; trying next member"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let result = proxy_helpers::resolve_virtual_download_from_members(
+            members,
             proxy_for_virtual,
-            repo.id,
             &upstream_path,
             |member_id, location| {
                 let db = db.clone();
@@ -2409,6 +3099,284 @@ async fn correct_cached_tarball_content_type(db: &PgPool, repository_id: uuid::U
 }
 
 // ---------------------------------------------------------------------------
+// #3003: inline scan-and-block on npm proxy tarball download.
+//
+// npm parity with proxy-PyPI (#2954/#2970/#2976): the verdict state machine,
+// the fail-closed scanner loop, and the block/lock responses are the SHARED
+// implementations in `proxy_helpers` / `proxy_scan_service` /
+// `scanner_service` — this section only supplies the npm-specific fetch,
+// synthetic-artifact shape, and response builder.
+// ---------------------------------------------------------------------------
+
+/// The npm version a tarball filename encodes for `package_name`, per the
+/// registry's invariant filename shape `{basename}-{version}.tgz` (#3003).
+///
+/// `basename` is the unscoped half of the name (`@acme/widget` → `widget`), so
+/// this resolves scoped and unscoped packages identically. Returns `None` when
+/// the filename does not have that shape for this package — which the serve
+/// path treats as inconclusive rather than guessing, because the version is
+/// half of the identity the CVE engine must grade.
+fn npm_version_from_tarball_filename(package_name: &str, filename: &str) -> Option<String> {
+    let basename = package_name.rsplit('/').next().unwrap_or(package_name);
+    let stem = filename.strip_suffix(".tgz")?;
+    let version = stem.strip_prefix(&format!("{basename}-"))?;
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// The `name`/`version` an npm tarball claims for ITSELF, read from the
+/// `package/package.json` that `npm pack` always writes (#3003).
+///
+/// Returns `None` when the entry is absent, unparseable, or carries a
+/// non-string / empty name or version — including the JSON-number version
+/// shape. Every one of those is "this tarball does not state a usable
+/// identity", which the caller must treat as inconclusive, never clean.
+fn npm_claimed_identity(tarball: &Bytes) -> Option<(String, String)> {
+    let body = crate::util::bounded_archive::read_metadata_from_tar_gz(&tarball[..], |path| {
+        path == std::path::Path::new("package/package.json")
+    })
+    .ok()??;
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let name = v.get("name")?.as_str()?.trim().to_string();
+    let version = v.get("version")?.as_str()?.trim().to_string();
+    (!name.is_empty() && !version.is_empty()).then_some((name, version))
+}
+
+/// Whether the identity a tarball claims for itself agrees with the coordinate
+/// it is being served at (#3003).
+///
+/// npm names are lowercase by construction, but compare case-insensitively so a
+/// legacy mixed-case publication is not spuriously withheld. Version equality
+/// is exact: a tarball claiming a different version than the URL pins is not
+/// the artifact the consumer asked for.
+fn npm_identity_agrees(
+    requested_name: &str,
+    requested_version: &str,
+    claimed: &(String, String),
+) -> bool {
+    claimed.0.eq_ignore_ascii_case(requested_name) && claimed.1 == requested_version
+}
+
+/// Build the synthetic in-memory [`Artifact`](crate::models::artifact::Artifact)
+/// the leaf scanners run over for a proxied npm tarball. There is NO
+/// `artifacts` row (proxy-cached bytes are deliberately not persisted as
+/// artifacts, #1278/#1280). The `.tgz` filename plus the `application/gzip`
+/// content type drive scanner applicability and archive extraction exactly as
+/// for a hosted npm tarball (see [`correct_cached_tarball_content_type`] for
+/// why the content type must be gzip).
+fn npm_synthetic_artifact(
+    repo_id: uuid::Uuid,
+    filename: &str,
+    digest: &str,
+    size: i64,
+) -> crate::models::artifact::Artifact {
+    let now = chrono::Utc::now();
+    crate::models::artifact::Artifact {
+        id: uuid::Uuid::new_v4(),
+        repository_id: repo_id,
+        path: filename.to_string(),
+        name: filename.to_string(),
+        version: None,
+        size_bytes: size,
+        checksum_sha256: digest.to_string(),
+        checksum_md5: None,
+        checksum_sha1: None,
+        content_type: NPM_TARBALL_CONTENT_TYPE.to_string(),
+        storage_key: String::new(),
+        is_deleted: false,
+        uploaded_by: None,
+        quarantine_status: None,
+        quarantine_until: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Build a buffered 200 response for scanned npm tarball bytes. `pending`
+/// selects the loud `X-AK-Scan: pending` header for the fail-open
+/// serve-before-verdict path so a served-unscanned byte is observable.
+fn build_scanned_tarball_response(
+    filename: &str,
+    bytes: Bytes,
+    digest: &str,
+    pending: bool,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, NPM_TARBALL_CONTENT_TYPE)
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, bytes.len().to_string())
+        .header("X-AK-Scan", if pending { "pending" } else { "clean" })
+        .header("X-NPM-Tarball-SHA256", digest)
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+/// Inline scan-and-block for an npm proxy tarball download (#3003).
+///
+/// Runs ONLY when scan-on-proxy is enabled for the repo; the caller keeps the
+/// untouched streaming path otherwise. Flow mirrors `serve_scanned_pypi_file`:
+/// buffered capped fetch (cache-first, so a repeat pull is served from cache
+/// with no upstream hit) → content digest over the TARBALL bytes (never the
+/// packument or anything the upstream index controls) → shared digest-keyed
+/// verdict gate → serve / block (403) / lock (423) per the repo's
+/// fail-open/closed action. Scoped packages need no special-casing: the
+/// concrete `@scope/pkg/-/file.tgz` fetch path is the single seam every
+/// `npm install` byte passes through, and the verdict is keyed on content.
+#[allow(clippy::too_many_arguments)]
+async fn serve_scanned_npm_tarball(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    package_name: &str,
+    fetch_path: &str,
+    filename: &str,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    // Buffered capped fetch (cache-first) under the SAME cache key as the
+    // streaming path (`fetch_path`), so the cache stays warm across the two
+    // paths and a repeat pull returns from cache with NO upstream fetch.
+    let remote_repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        upstream_url,
+        RepositoryFormat::Npm,
+    );
+    let bytes = match proxy
+        .fetch_artifact_with_cache_path_capped(
+            &remote_repo,
+            fetch_path,
+            fetch_path,
+            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
+        )
+        .await
+    {
+        Ok((bytes, _upstream_content_type)) => bytes,
+        Err(e) if proxy_helpers::is_over_cap_error(&e) => {
+            // Over the byte cap: never buffer unbounded (#895 OOM).
+            return match crate::services::proxy_scan_service::decide_inconclusive(action) {
+                crate::services::proxy_scan_service::InconclusiveOutcome::Locked => {
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "npm proxy tarball exceeds scan byte cap; fail-closed -> 423"
+                    );
+                    Err(proxy_helpers::scan_pending_locked_response(filename))
+                }
+                crate::services::proxy_scan_service::InconclusiveOutcome::ServePending => {
+                    // Fail-open oversized: serve via the untouched streaming
+                    // path (loud: X-AK-Scan pending header on the stream).
+                    tracing::warn!(
+                        repo_id = %repo_id, file = %filename,
+                        "npm proxy tarball exceeds scan byte cap; fail-open -> serving UNSCANNED (streaming)"
+                    );
+                    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
+                        proxy,
+                        repo_id,
+                        repo_key,
+                        upstream_url,
+                        fetch_path,
+                        fetch_path,
+                        RepositoryFormat::Npm,
+                    )
+                    .await?;
+                    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
+                    proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx)
+                        .await;
+                    let mut resp = build_tarball_response_stream(
+                        result.body,
+                        filename,
+                        npm_virtual_tarball_content_type(result.content_type),
+                        result.content_length,
+                    );
+                    resp.headers_mut()
+                        .insert("X-AK-Scan", axum::http::HeaderValue::from_static("pending"));
+                    Ok(resp)
+                }
+            };
+        }
+        Err(e) => return Err(e.into_response()),
+    };
+
+    // The upstream registry may return application/octet-stream; correct the
+    // cached record so SBOM generation / background scanners see gzip (same
+    // as the streaming path).
+    correct_cached_tarball_content_type(&state.db, repo_id, fetch_path).await;
+
+    let digest = proxy_helpers::sha256_hex(&bytes);
+
+    // #3003: establish WHAT these bytes are being served as.
+    //
+    // The coordinate comes from the REQUEST (route package name + the
+    // registry's invariant `{basename}-{version}.tgz` filename), never from
+    // bytes the upstream controls, and the tarball's own `package/package.json`
+    // must agree with it. A tarball that states a different identity, states
+    // none, or states an unusable one (missing/empty/non-string version) is
+    // unassessable: any scan of it would grade something other than the package
+    // the consumer is about to install under this coordinate.
+    //
+    // This is only consulted when the shared gate actually needs to SCAN — a
+    // cached vulnerable verdict for this digest still blocks first, from cache.
+    let identity = match npm_version_from_tarball_filename(package_name, filename) {
+        Some(version) => match npm_claimed_identity(&bytes) {
+            Some(claimed) if npm_identity_agrees(package_name, &version, &claimed) => {
+                proxy_helpers::ProxyScanIdentity::Established(
+                    crate::services::scanner_service::ExpectedComponent::new(
+                        crate::services::scanner_service::ComponentEcosystem::Npm,
+                        package_name,
+                        &version,
+                    ),
+                )
+            }
+            other => {
+                tracing::warn!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    requested = %format!("{package_name}@{version}"),
+                    claimed = ?other,
+                    "npm proxy tarball does not state the identity it is served as"
+                );
+                proxy_helpers::ProxyScanIdentity::Unestablished
+            }
+        },
+        None => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                package = %package_name,
+                "npm proxy tarball filename does not encode a version for this package"
+            );
+            proxy_helpers::ProxyScanIdentity::Unestablished
+        }
+    };
+
+    let synthetic = npm_synthetic_artifact(repo_id, filename, &digest, bytes.len() as i64);
+    match proxy_helpers::gate_proxy_scan_serve(
+        state,
+        repo_id,
+        filename,
+        &digest,
+        synthetic,
+        &bytes,
+        action,
+        identity,
+        proxy_helpers::ProxyScanMode::File,
+    )
+    .await
+    {
+        proxy_helpers::ProxyScanServeOutcome::Deny(resp) => Err(resp),
+        proxy_helpers::ProxyScanServeOutcome::Serve { pending } => {
+            proxy_helpers::record_proxy_download(state, repo_id, repo_key, fetch_path, ctx).await;
+            Ok(build_scanned_tarball_response(
+                filename, bytes, &digest, pending,
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PUT publish handlers
 // ---------------------------------------------------------------------------
 
@@ -2433,7 +3401,7 @@ async fn publish_scoped(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
-    let full_name = format!("@{}/{}", scope, package);
+    let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     publish_package(&state, auth, &repo_key, &full_name, &headers, body).await
 }
@@ -2573,7 +3541,7 @@ async fn store_npm_version(
     user_id: uuid::Uuid,
     ver: &NpmVersionToPublish,
 ) -> Result<(), Response> {
-    let artifact_path = format!("{}/{}/{}", package_name, ver.version, ver.tarball_filename);
+    let artifact_path = build_npm_artifact_path(package_name, &ver.version, &ver.tarball_filename);
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -2604,10 +3572,8 @@ async fn store_npm_version(
     .map_err(|e| e.into_response())?;
 
     // Store the tarball
-    let storage_key = format!(
-        "npm/{}/{}/{}",
-        package_name, ver.version, ver.tarball_filename
-    );
+    let storage_key = build_npm_storage_key(package_name, &ver.version, &ver.tarball_filename);
+    proxy_helpers::guard_cross_repo_write(state, repo_id, &location.backend, &storage_key).await?;
     let storage = state.storage_for_repo_or_500(location)?;
     storage
         .put(&storage_key, Bytes::from(ver.tarball_bytes.clone()))
@@ -2699,7 +3665,7 @@ async fn publish_package(
     // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
     // `npm publish`. Enforce the write scope before falling through to the
     // Bearer-fallback helper.
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
@@ -2815,7 +3781,7 @@ async fn dist_tags_put(
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
@@ -2890,7 +3856,7 @@ async fn dist_tags_delete(
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
@@ -2927,7 +3893,7 @@ async fn dist_tags_delete(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Extracted pure functions for testability
+// Metadata rewriting helpers
 // ---------------------------------------------------------------------------
 
 /// Rewrite tarball URLs in npm metadata JSON to point to our local instance.
@@ -2955,7 +3921,7 @@ fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_k
                 .and_then(|tarball| {
                     // e.g., https://registry.npmjs.org/express/-/express-4.18.2.tgz
                     tarball.rsplit_once("/-/").map(|(_, filename)| {
-                        format!("{}/npm/{}/{}/-/{}", base_url, repo_key, pkg_name, filename)
+                        build_npm_tarball_url(base_url, repo_key, &pkg_name, filename)
                     })
                 });
 
@@ -3076,6 +4042,87 @@ fn respond_with_packument(value: serde_json::Value, want_abbreviated: bool) -> R
     )
 }
 
+// ---------------------------------------------------------------------------
+// Path/URL/entry builders (single source of truth; unit tests pin these
+// against hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Compute npm integrity field from a SHA256 hex digest.
+fn compute_npm_integrity(sha256_hex: &str) -> String {
+    let bytes: Vec<u8> = (0..sha256_hex.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&sha256_hex[i..i + 2], 16).ok())
+        .collect();
+    format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    )
+}
+
+/// Build the artifact path for an npm tarball.
+fn build_npm_artifact_path(package_name: &str, version: &str, tarball_filename: &str) -> String {
+    format!("{}/{}/{}", package_name, version, tarball_filename)
+}
+
+/// Build the storage key for an npm tarball.
+fn build_npm_storage_key(package_name: &str, version: &str, tarball_filename: &str) -> String {
+    format!("npm/{}/{}/{}", package_name, version, tarball_filename)
+}
+
+/// Build a scoped package name from scope and package.
+fn build_scoped_package_name(scope: &str, package: &str) -> String {
+    format!("@{}/{}", scope, package)
+}
+
+/// Build the npm tarball URL for metadata responses.
+fn build_npm_tarball_url(
+    base_url: &str,
+    repo_key: &str,
+    package_name: &str,
+    filename: &str,
+) -> String {
+    format!(
+        "{}/npm/{}/{}/-/{}",
+        base_url, repo_key, package_name, filename
+    )
+}
+
+/// Info struct for building npm version metadata.
+struct NpmArtifactInfo {
+    version: String,
+    checksum_sha256: String,
+    tarball_url: String,
+    version_metadata: Option<serde_json::Value>,
+    package_name: String,
+}
+
+/// Build a single npm version entry for the metadata response.
+fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
+    let integrity = compute_npm_integrity(&info.checksum_sha256);
+
+    let mut version_obj = info
+        .version_metadata
+        .as_ref()
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let obj = version_obj.as_object_mut().unwrap();
+    obj.entry("name".to_string())
+        .or_insert_with(|| serde_json::Value::String(info.package_name.clone()));
+    obj.entry("version".to_string())
+        .or_insert_with(|| serde_json::Value::String(info.version.clone()));
+    obj.insert(
+        "dist".to_string(),
+        serde_json::json!({
+            "tarball": info.tarball_url,
+            "integrity": integrity,
+        }),
+    );
+
+    version_obj
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
@@ -3090,6 +4137,19 @@ mod tests {
         NpmScopePolicy {
             allowed_scopes: scopes.iter().map(|s| s.to_string()).collect(),
             allow_unscoped,
+            allowed_name_patterns: Vec::new(),
+        }
+    }
+
+    fn policy_with_patterns(
+        scopes: &[&str],
+        allow_unscoped: Option<bool>,
+        patterns: &[&str],
+    ) -> NpmScopePolicy {
+        NpmScopePolicy {
+            allowed_scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            allow_unscoped,
+            allowed_name_patterns: patterns.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -3182,6 +4242,609 @@ mod tests {
         assert!(!p.allows(""));
     }
 
+    // -----------------------------------------------------------------------
+    // npm name-glob patterns (#2424)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn glob_patterns_activate_and_allow_scoped_names() {
+        // Patterns-only policy (no scope list, unscoped unset) is active.
+        let p = policy_with_patterns(&[], None, &["@acme/*"]);
+        assert!(p.is_active());
+        assert!(p.allows("@acme/foo"));
+        assert!(p.allows("@acme/bar-baz"));
+        // A scoped name outside the glob is denied even though allowed_scopes
+        // is empty (the glob restriction is what makes the policy active).
+        assert!(!p.allows("@evil/foo"));
+    }
+
+    #[test]
+    fn glob_patterns_allow_unscoped_names() {
+        let p = policy_with_patterns(&[], Some(false), &["internal-*"]);
+        assert!(p.is_active());
+        assert!(p.allows("internal-utils"));
+        assert!(!p.allows("lodash"));
+        // allow_unscoped=false but the glob still admits matching unscoped names.
+        assert!(p.allows("internal-tools"));
+    }
+
+    #[test]
+    fn glob_patterns_or_compose_with_exact_scopes() {
+        // Exact scope @acme + pattern internal-* + unscoped denied: mirrors the
+        // on-box verification policy.
+        let p = policy_with_patterns(&["@acme"], Some(false), &["internal-*"]);
+        assert!(p.is_active());
+        assert!(p.allows("@acme/foo")); // exact scope
+        assert!(p.allows("internal-utils")); // pattern (unscoped)
+        assert!(!p.allows("other-pkg")); // neither, unscoped denied
+        assert!(!p.allows("@evil/pkg")); // neither, scope not allowed
+    }
+
+    #[test]
+    fn glob_patterns_are_case_insensitive() {
+        let p = policy_with_patterns(&[], None, &["@acme/*"]);
+        assert!(p.allows("@ACME/Foo"));
+        // Constructed with mixed-case pattern (loader lowercases, but be safe).
+        let p2 = policy_with_patterns(&[], None, &["@Acme/*"]);
+        assert!(p2.allows("@acme/foo"));
+    }
+
+    #[test]
+    fn glob_patterns_invalid_names_fail_closed() {
+        let p = policy_with_patterns(&[], None, &["@acme/*"]);
+        assert!(!p.allows("@acme")); // malformed (no package part)
+        assert!(!p.allows(""));
+    }
+
+    #[test]
+    fn glob_patterns_do_not_affect_existing_scope_only_policies() {
+        // A policy with only exact scopes behaves byte-identically: no patterns
+        // means pattern_matches never fires.
+        let p = policy(&["@types"], Some(false));
+        assert!(p.allows("@types/node"));
+        assert!(!p.allows("@other/x"));
+        assert!(!p.allows("lodash"));
+    }
+
+    // -----------------------------------------------------------------------
+    // npm /-/ meta+audit namespace filtering (#2424)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bulk_advisory_request_drops_out_of_scope_names() {
+        let p = policy_with_patterns(&["@types"], Some(false), &["lodash*"]);
+        let body = br#"{"@types/node":["18.0.0"],"lodash":["4.17.4"],"express":["4.16.0"]}"#;
+        let (filtered, kept) = filter_bulk_advisory_request(body, &p).expect("parses");
+        assert!(kept);
+        let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("@types/node"));
+        assert!(obj.contains_key("lodash"));
+        assert!(!obj.contains_key("express"));
+    }
+
+    #[test]
+    fn bulk_advisory_request_all_out_of_scope_keeps_nothing() {
+        let p = policy_with_patterns(&["@types"], Some(false), &[]);
+        let body = br#"{"express":["4.16.0"],"react":["18.0.0"]}"#;
+        let (_filtered, kept) = filter_bulk_advisory_request(body, &p).expect("parses");
+        assert!(!kept);
+    }
+
+    #[test]
+    fn bulk_advisory_request_unparseable_is_none() {
+        let p = policy_with_patterns(&["@types"], Some(false), &[]);
+        assert!(filter_bulk_advisory_request(b"not-json", &p).is_none());
+    }
+
+    #[test]
+    fn bulk_advisory_response_filters_names() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"lodash":[{"id":1}],"express":[{"id":2}]}"#;
+        let out = filter_bulk_advisory_response(body, &p);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("lodash").is_some());
+        assert!(v.get("express").is_none());
+    }
+
+    #[test]
+    fn quick_audit_request_filters_requires_and_dependencies() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"name":"app","version":"1.0.0",
+            "requires":{"lodash":"^4.17.0","express":"^4.16.0"},
+            "dependencies":{"lodash":{"version":"4.17.4"},"express":{"version":"4.16.0"}}}"#;
+        let (filtered, kept) = filter_quick_audit_request(body, &p).expect("parses");
+        assert!(kept);
+        let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
+        assert!(v["requires"].get("lodash").is_some());
+        assert!(v["requires"].get("express").is_none());
+        assert!(v["dependencies"].get("lodash").is_some());
+        assert!(v["dependencies"].get("express").is_none());
+        // Untouched top-level fields survive.
+        assert_eq!(v["name"], "app");
+    }
+
+    #[test]
+    fn quick_audit_response_filters_advisories_by_module_name() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"actions":[],"advisories":{
+            "1065":{"module_name":"lodash","severity":"high"},
+            "1755":{"module_name":"express","severity":"low"},
+            "9999":{"severity":"low"}
+        },"muted":[],"metadata":{}}"#;
+        let out = filter_quick_audit_response(body, &p).expect("object");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let adv = v["advisories"].as_object().unwrap();
+        assert!(adv.contains_key("1065")); // lodash in scope
+        assert!(!adv.contains_key("1755")); // express out of scope
+        assert!(!adv.contains_key("9999")); // no module_name -> dropped (fail-closed)
+    }
+
+    #[test]
+    fn meta_search_response_filters_objects_and_total() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"objects":[
+            {"package":{"name":"lodash","version":"4.17.21"}},
+            {"package":{"name":"express","version":"4.18.0"}},
+            {"package":{"name":"lodash.merge","version":"4.6.2"}}
+        ],"total":3,"time":"now"}"#;
+        let out = filter_meta_response(body, "v1/search", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let objs = v["objects"].as_array().unwrap();
+        assert_eq!(objs.len(), 2);
+        assert_eq!(v["total"], 2);
+        let names: Vec<&str> = objs
+            .iter()
+            .map(|o| o["package"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"lodash"));
+        assert!(names.contains(&"lodash.merge"));
+        assert!(!names.contains(&"express"));
+    }
+
+    #[test]
+    fn meta_response_non_search_shape_is_unchanged_bytes() {
+        // A ping/whoami-style object with no `objects` array is returned as
+        // re-serialised JSON with the same logical content.
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"ok":true}"#;
+        let out = filter_meta_response(body, "npm/v1/user", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn meta_response_legacy_all_map_drops_out_of_scope_package_keys() {
+        // `/-/all` shape (#2542): `{"_updated":ts,"<pkg>":{doc},...}`. Package
+        // documents keyed by an out-of-scope name are dropped; in-scope ones
+        // and the structural `_updated` metadata survive.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{
+            "_updated": 1418818799864,
+            "lodash": {"name":"lodash","dist-tags":{"latest":"4.17.21"}},
+            "lodash.merge": {"name":"lodash.merge","dist-tags":{"latest":"4.6.2"}},
+            "@corp/tool": {"name":"@corp/tool","dist-tags":{"latest":"1.0.0"}},
+            "express": {"name":"express","dist-tags":{"latest":"4.18.0"}},
+            "@evil/secret": {"name":"@evil/secret","dist-tags":{"latest":"9.9.9"}}
+        }"#;
+        let out = filter_meta_response(body, "all", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let obj = v.as_object().unwrap();
+        // In-scope kept.
+        assert!(obj.contains_key("lodash"));
+        assert!(obj.contains_key("lodash.merge"));
+        assert!(obj.contains_key("@corp/tool"));
+        // Out-of-scope package existence removed.
+        assert!(!obj.contains_key("express"));
+        assert!(!obj.contains_key("@evil/secret"));
+        // Structural metadata (scalar value) preserved.
+        assert_eq!(obj["_updated"], 1418818799864u64);
+    }
+
+    #[test]
+    fn meta_response_legacy_by_user_map_drops_out_of_scope_package_keys() {
+        // `/-/by-user/:user` shape (#2542): package-name keys with array
+        // values. Out-of-scope keys are dropped; in-scope keys kept.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{
+            "lodash": ["read","write"],
+            "@corp/tool": ["read","write"],
+            "express": ["read","write"]
+        }"#;
+        let out = filter_meta_response(body, "by-user/maintainer", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("lodash"));
+        assert!(obj.contains_key("@corp/tool"));
+        assert!(!obj.contains_key("express"));
+    }
+
+    #[test]
+    fn meta_response_legacy_map_unset_policy_is_unchanged() {
+        // Unset (inactive) policy = allow-all: every key survives, matching the
+        // default-behaviour-unchanged guarantee.
+        let p = NpmScopePolicy::default();
+        assert!(!p.is_active());
+        let body = br#"{
+            "_updated": 1,
+            "lodash": {"name":"lodash"},
+            "express": {"name":"express"}
+        }"#;
+        let out = filter_meta_response(body, "all", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("lodash"));
+        assert!(obj.contains_key("express"));
+        assert!(obj.contains_key("_updated"));
+    }
+
+    #[test]
+    fn meta_response_whoami_string_value_survives_active_policy() {
+        // A proxied `/-/whoami` (`{"username":"alice"}`) has a scalar value and
+        // must not be treated as a package listing even though "username" is a
+        // syntactically valid unscoped package name the policy would deny.
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        let body = br#"{"username":"alice"}"#;
+        let out = filter_meta_response(body, "whoami", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["username"], "alice");
+    }
+
+    #[test]
+    fn meta_response_top_level_array_retains_only_in_scope_names() {
+        // Some registries answer `/-/all` (and similar) with a bare
+        // package-name array. Only in-scope names may survive (#2551); the
+        // array must be filtered, never echoed whole.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"["lodash","express","@corp/tool","@evil/secret","lodash.merge"]"#;
+        let out = filter_meta_response(body, "all", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"lodash"));
+        assert!(names.contains(&"lodash.merge"));
+        assert!(names.contains(&"@corp/tool"));
+        // Out-of-scope package existence removed.
+        assert!(!names.contains(&"express"));
+        assert!(!names.contains(&"@evil/secret"));
+    }
+
+    #[test]
+    fn meta_response_unparseable_bytes_under_active_policy_is_unrecognized() {
+        // A body that does not parse as JSON must NOT be served verbatim under
+        // an active policy: the outcome is `Unrecognized` so the caller fails
+        // closed with an empty scoped body (#2551).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = b"this is not json { [ oops";
+        assert!(matches!(
+            filter_meta_response(body, "all", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+        // And the caller's fail-closed body is empty + well-formed, never the
+        // raw upstream bytes.
+        let search = empty_scoped_meta_body("v1/search");
+        assert_eq!(&search[..], br#"{"objects":[],"total":0}"#);
+        let other = empty_scoped_meta_body("all");
+        assert_eq!(&other[..], b"{}");
+    }
+
+    #[test]
+    fn meta_response_scalar_top_level_under_active_policy_is_unrecognized() {
+        // A bare scalar top-level document (not an object or array) carries no
+        // scope-checkable package listing and cannot be safely echoed; it is
+        // `Unrecognized` so the active-policy caller fails closed (#2551).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        assert!(matches!(
+            filter_meta_response(b"true", "all", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+        assert!(matches!(
+            filter_meta_response(b"\"pong\"", "all", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+    }
+
+    #[test]
+    fn meta_response_structural_docs_preserved_under_active_policy() {
+        // whoami / ping structural documents remain intact (recognised object
+        // shapes), never routed through the fail-closed path.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let whoami =
+            filter_meta_response(br#"{"username":"alice"}"#, "whoami", &p).expect_filtered();
+        let vw: serde_json::Value = serde_json::from_slice(&whoami).unwrap();
+        assert_eq!(vw["username"], "alice");
+        let ping = filter_meta_response(b"{}", "ping", &p).expect_filtered();
+        let vp: serde_json::Value = serde_json::from_slice(&ping).unwrap();
+        assert!(vp.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn meta_response_inactive_policy_top_level_array_is_verbatim() {
+        // Inactive policy = allow-all: a top-level array is retained whole,
+        // preserving the default-behaviour-unchanged guarantee (#2551).
+        let p = NpmScopePolicy::default();
+        assert!(!p.is_active());
+        let body = br#"["lodash","express","@evil/secret"]"#;
+        let out = filter_meta_response(body, "all", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["lodash", "express", "@evil/secret"]);
+    }
+
+    #[test]
+    fn meta_response_by_user_list_is_scope_filtered_under_allowed_key() {
+        // `/-/by-user/:user` keys on the *username*, not a package name (#2594).
+        // An allowed username (here matched by the `lodash*` name glob) must not
+        // hand back the out-of-scope package names it lists.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"lodash-maint":["@corp/tool","@evil/secret","express","lodash.merge"]}"#;
+        let out = filter_meta_response(body, "by-user/lodash-maint", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = v["lodash-maint"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        // In-scope names still listed for the allowed user.
+        assert!(names.contains(&"@corp/tool"));
+        assert!(names.contains(&"lodash.merge"));
+        // Out-of-scope package existence removed from the list.
+        assert!(!names.contains(&"@evil/secret"));
+        assert!(!names.contains(&"express"));
+    }
+
+    #[test]
+    fn meta_response_scalar_map_drops_out_of_scope_package_name_keys() {
+        // Non-standard package-name -> scalar maps (e.g. name->version) leak the
+        // key name itself. On an endpoint with no guarantee that every key is a
+        // package name, an unambiguous `@scope/name` key is still scope-checked
+        // while structural metadata is preserved (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"@corp/tool":"1.0.0","@evil/secret":"9.9.9","_updated":1}"#;
+        let out = filter_meta_response(body, "all", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let obj = v.as_object().unwrap();
+        // In-scope scalar key kept, with its value.
+        assert_eq!(obj["@corp/tool"], "1.0.0");
+        // Out-of-scope scalar key dropped.
+        assert!(!obj.contains_key("@evil/secret"));
+        // Structural metadata still preserved.
+        assert_eq!(obj["_updated"], 1);
+    }
+
+    #[test]
+    fn meta_response_scalar_structural_keys_survive_active_policy() {
+        // Bare unscoped scalar keys are indistinguishable from structural
+        // metadata, so whoami/ping-style documents stay intact under an active
+        // policy (#2594 must not over-block them).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let whoami =
+            filter_meta_response(br#"{"username":"alice"}"#, "whoami", &p).expect_filtered();
+        let vw: serde_json::Value = serde_json::from_slice(&whoami).unwrap();
+        assert_eq!(vw["username"], "alice");
+        let ping = filter_meta_response(b"{}", "ping", &p).expect_filtered();
+        let vp: serde_json::Value = serde_json::from_slice(&ping).unwrap();
+        assert!(vp.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn meta_search_response_scrubs_name_bearing_siblings() {
+        // Only `objects` used to be scrubbed: a sibling package-name array rode
+        // along untouched (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"objects":[
+            {"package":{"name":"lodash","version":"4.17.21"}},
+            {"package":{"name":"express","version":"4.18.0"}}
+        ],"total":2,"time":"now","typosOf":["@evil/secret","lodash"]}"#;
+        let out = filter_meta_response(body, "v1/search", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // `objects` filtering and `total` correction unchanged.
+        let objs = v["objects"].as_array().unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0]["package"]["name"], "lodash");
+        assert_eq!(v["total"], 1);
+        // The sibling list is scrubbed to the same scope.
+        let typos: Vec<&str> = v["typosOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(typos, vec!["lodash"]);
+        // Scalar siblings carry no package listing and are left alone.
+        assert_eq!(v["time"], "now");
+    }
+
+    #[test]
+    fn meta_response_in_scope_only_body_is_preserved_intact() {
+        // The hardening must not cost legitimate content: a response with only
+        // in-scope names survives whole (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"_updated":7,"lodash":{"name":"lodash","dist-tags":{"latest":"4.17.21"}},"lodash-maint":["@corp/tool","lodash.merge"]}"#;
+        let out = filter_meta_response(body, "all", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["_updated"], 7);
+        // The `/-/all` package document keeps its internal fields.
+        assert_eq!(v["lodash"]["name"], "lodash");
+        assert_eq!(v["lodash"]["dist-tags"]["latest"], "4.17.21");
+        // The in-scope name list under an allowed key is untouched.
+        assert_eq!(
+            v["lodash-maint"],
+            serde_json::json!(["@corp/tool", "lodash.merge"])
+        );
+    }
+
+    #[test]
+    fn meta_response_unrecognized_shape_still_fails_closed() {
+        // Regression pin for #2551: the added value-level filtering must not
+        // reopen the fail-open on unrecognised shapes.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        assert!(matches!(
+            filter_meta_response(b"not json at all { [", "v1/search", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+        assert!(matches!(
+            filter_meta_response(b"\"@evil/secret\"", "all", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+        assert!(matches!(
+            filter_meta_response(b"1234", "all", &p),
+            MetaFilterOutcome::Unrecognized
+        ));
+    }
+
+    #[test]
+    fn meta_response_inactive_policy_is_byte_identical_passthrough() {
+        // Inactive policy restricts nothing: every shape the new filtering
+        // touches comes back byte-for-byte (#2594).
+        let p = NpmScopePolicy::default();
+        assert!(!p.is_active());
+        for (body, meta_path) in [
+            (
+                br#"{"lodash-maint":["@corp/tool","@evil/secret","express"]}"#.as_slice(),
+                "by-user/lodash-maint",
+            ),
+            (
+                br#"{"@evil/secret":"write","express":"read"}"#.as_slice(),
+                "user/alice/package",
+            ),
+            (
+                br#"{"objects":[{"package":{"name":"express"}}],"total":1,"typosOf":["@evil/secret"]}"#.as_slice(),
+                "v1/search",
+            ),
+            (br#"{"username":"alice"}"#.as_slice(), "whoami"),
+        ] {
+            let out = filter_meta_response(body, meta_path, &p).expect_filtered();
+            assert_eq!(&out[..], body);
+        }
+    }
+
+    #[test]
+    fn meta_response_ls_packages_scope_checks_every_key() {
+        // `/-/user/:user/package` (npm access ls-packages) maps EVERY key to a
+        // package name, so a bare unscoped key is a package name too and must be
+        // scope-checked — not preserved as if it were structural metadata
+        // (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body =
+            br#"{"@corp/tool":"write","lodash":"write","@evil/secret":"read","express":"read"}"#;
+        for meta_path in ["user/alice/package", "org/acme/package"] {
+            let out = filter_meta_response(body, meta_path, &p).expect_filtered();
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let obj = v.as_object().unwrap();
+            // In-scope packages keep their permission entry.
+            assert_eq!(obj["@corp/tool"], "write", "{meta_path}");
+            assert_eq!(obj["lodash"], "write", "{meta_path}");
+            // Out-of-scope package existence removed — scoped AND bare unscoped.
+            assert!(!obj.contains_key("@evil/secret"), "{meta_path}");
+            assert!(!obj.contains_key("express"), "{meta_path}");
+        }
+    }
+
+    #[test]
+    fn meta_response_ls_packages_rule_does_not_apply_to_whoami_shape() {
+        // The all-keys-are-packages rule is scoped to the ls-packages endpoints:
+        // the same body on `/-/whoami` or `/-/npm/v1/user` keeps its bare keys,
+        // so a structural field named like a package is never dropped (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"@corp/tool":"write","express":"read"}"#;
+        for meta_path in ["whoami", "npm/v1/user"] {
+            let out = filter_meta_response(body, meta_path, &p).expect_filtered();
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let obj = v.as_object().unwrap();
+            assert_eq!(obj["@corp/tool"], "write", "{meta_path}");
+            assert_eq!(obj["express"], "read", "{meta_path}");
+        }
+    }
+
+    #[test]
+    fn meta_response_by_user_object_value_is_scope_filtered() {
+        // A `/-/by-user` listing encoded as a package-name-keyed MAP under the
+        // username must be scrubbed exactly like the array encoding — a kept key
+        // vouches only for itself (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"lodash-maint":{"@corp/tool":"write","@evil/secret":"write","lodash":{"role":"owner"},"express":{"role":"owner"}}}"#;
+        let out = filter_meta_response(body, "by-user/lodash-maint", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let listing = v["lodash-maint"].as_object().unwrap();
+        // In-scope entries survive, whatever their value type.
+        assert_eq!(listing["@corp/tool"], "write");
+        assert_eq!(listing["lodash"]["role"], "owner");
+        // Out-of-scope package existence removed from the map.
+        assert!(!listing.contains_key("@evil/secret"));
+        assert!(!listing.contains_key("express"));
+    }
+
+    #[test]
+    fn meta_search_response_scrubs_object_valued_sibling() {
+        // A name-bearing sibling encoded as a map must be scrubbed like the
+        // array-valued one; `objects` filtering is not enough (#2594).
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{"objects":[],"total":0,"suggestions":{"@evil/secret":{"score":0.9},"lodash":{"score":0.8}}}"#;
+        let out = filter_meta_response(body, "v1/search", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let suggestions = v["suggestions"].as_object().unwrap();
+        assert!(!suggestions.contains_key("@evil/secret"));
+        assert_eq!(suggestions["lodash"]["score"], 0.8);
+    }
+
+    #[test]
+    fn meta_response_packument_content_under_in_scope_key_is_preserved() {
+        // Boundary (#2594): on `/-/all` the key IS the package name, so its
+        // value is that package's own document, vouched for by the in-scope key.
+        // Package names inside it are dependency/related refs, not a listing of
+        // what this repo serves — filtering them would corrupt real metadata.
+        let p = policy_with_patterns(&["@corp"], Some(false), &["lodash*"]);
+        let body = br#"{
+            "@corp/tool": {"name":"@corp/tool","related":["@evil/secret","express"],
+                           "versions":{"1.0.0":{"dependencies":{"express":"^4.0.0"}}}},
+            "@evil/secret": {"name":"@evil/secret"}
+        }"#;
+        let out = filter_meta_response(body, "all", &p).expect_filtered();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // The out-of-scope package's own entry is still dropped by its key.
+        assert!(!v.as_object().unwrap().contains_key("@evil/secret"));
+        // The in-scope packument keeps its content verbatim, including refs to
+        // out-of-scope names — those are dependency metadata, not a listing.
+        assert_eq!(
+            v["@corp/tool"]["related"],
+            serde_json::json!(["@evil/secret", "express"])
+        );
+        assert_eq!(
+            v["@corp/tool"]["versions"]["1.0.0"]["dependencies"]["express"],
+            "^4.0.0"
+        );
+    }
+
+    #[test]
+    fn npm_meta_path_classification() {
+        // The endpoint decides how keys are read (#2594).
+        assert!(npm_meta_keys_are_package_names("user/alice/package"));
+        assert!(npm_meta_keys_are_package_names("org/acme/package"));
+        assert!(npm_meta_keys_are_package_names("/user/alice/package/"));
+        // whoami / npm-v1-user / by-user / search keep the key-shape rule.
+        assert!(!npm_meta_keys_are_package_names("npm/v1/user"));
+        assert!(!npm_meta_keys_are_package_names("whoami"));
+        assert!(!npm_meta_keys_are_package_names("by-user/alice"));
+        assert!(!npm_meta_keys_are_package_names("v1/search"));
+        assert!(!npm_meta_keys_are_package_names("all"));
+
+        assert!(npm_meta_keys_are_usernames("by-user/alice"));
+        assert!(npm_meta_keys_are_usernames("/by-user/alice"));
+        assert!(!npm_meta_keys_are_usernames("all"));
+        assert!(!npm_meta_keys_are_usernames("user/alice/package"));
+    }
+
     #[test]
     fn npm_scope_literal_validation() {
         assert!(is_valid_npm_scope("@types"));
@@ -3225,10 +4888,10 @@ mod tests {
     }
 
     /// DB-backed: `fetch_npm_scope_policy` / `fetch_npm_scope_policies` read
-    /// the `repository_config` rows written by the admin endpoint and
-    /// tolerate every degenerate stored shape — no rows (default policy),
-    /// malformed JSON in the scope list, an unparseable boolean, mixed-case
-    /// stored scopes (case-folded), and an empty id set (no query at all).
+    /// the `repository_config` rows written by the admin endpoint. Absent rows
+    /// yield the default (inactive, unrestricted) policy; well-formed rows are
+    /// case-folded and honored; a PRESENT-but-corrupt value fails CLOSED
+    /// (#2726) instead of degrading to "unset" (which lifted the allowlist).
     /// Skips when no `DATABASE_URL` is configured.
     #[tokio::test]
     async fn fetch_npm_scope_policy_parses_stored_config_db() {
@@ -3253,28 +4916,66 @@ mod tests {
                 .expect("upsert repository_config");
             }
         };
+        let delete = |key: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+                    .bind(repo_id)
+                    .bind(key)
+                    .execute(&pool)
+                    .await
+                    .expect("delete repository_config");
+            }
+        };
 
         // Empty id slice: no rows requested, empty map back.
-        assert!(fetch_npm_scope_policies(&pool, &[]).await.is_empty());
+        assert!(fetch_npm_scope_policies(&pool, &[])
+            .await
+            .expect("empty id slice must succeed")
+            .is_empty());
 
-        // No rows stored: default (inactive, unrestricted) policy.
-        let empty = fetch_npm_scope_policy(&pool, repo_id).await;
+        // No rows stored: default (inactive, unrestricted) policy. This is
+        // the legitimate unconfigured state and must stay allow-all after the
+        // #2726 fail-closed change.
+        let empty = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect("absent policy rows must succeed with the default policy");
         assert_eq!(empty, NpmScopePolicy::default());
         assert!(!empty.is_active());
+        assert!(empty.allows("lodash"), "unset policy must allow everything");
 
-        // Malformed JSON scope list + unparseable boolean: both degrade to
-        // the unrestricted default rather than erroring the request path.
+        // #2726: a PRESENT-but-corrupt value is an error loading the
+        // operator's intended policy, not an unset policy — it must fail
+        // CLOSED rather than degrade to the unrestricted default. Each key
+        // is exercised in isolation.
         upsert(NPM_ALLOWED_SCOPES_KEY, "not-json").await;
-        upsert(NPM_ALLOW_UNSCOPED_KEY, "garbage").await;
-        let degenerate = fetch_npm_scope_policy(&pool, repo_id).await;
-        assert!(degenerate.allowed_scopes.is_empty());
-        assert_eq!(degenerate.allow_unscoped, None);
-        assert!(!degenerate.is_active());
+        assert!(
+            fetch_npm_scope_policy(&pool, repo_id).await.is_err(),
+            "corrupt npm_allowed_scopes must fail closed, not fall open"
+        );
+        delete(NPM_ALLOWED_SCOPES_KEY).await;
 
-        // Well-formed rows: scopes case-folded, boolean parsed.
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "garbage").await;
+        assert!(
+            fetch_npm_scope_policy(&pool, repo_id).await.is_err(),
+            "corrupt npm_allow_unscoped must fail closed, not lift an explicit false"
+        );
+        delete(NPM_ALLOW_UNSCOPED_KEY).await;
+
+        upsert(NPM_ALLOWED_NAME_PATTERNS_KEY, "not-json").await;
+        assert!(
+            fetch_npm_scope_policy(&pool, repo_id).await.is_err(),
+            "corrupt npm_allowed_name_patterns must fail closed, not fall open"
+        );
+        delete(NPM_ALLOWED_NAME_PATTERNS_KEY).await;
+
+        // Well-formed rows: scopes case-folded, boolean parsed, and the
+        // configured policy still denies out-of-allowlist names.
         upsert(NPM_ALLOWED_SCOPES_KEY, "[\"@Types\",\"@partner\"]").await;
         upsert(NPM_ALLOW_UNSCOPED_KEY, "false").await;
-        let stored = fetch_npm_scope_policy(&pool, repo_id).await;
+        let stored = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect("well-formed policy rows must load");
         assert_eq!(stored.allowed_scopes, vec!["@types", "@partner"]);
         assert_eq!(stored.allow_unscoped, Some(false));
         assert!(stored.is_active());
@@ -3283,9 +4984,31 @@ mod tests {
 
         // Boolean flips to true: unscoped resolution allowed again.
         upsert(NPM_ALLOW_UNSCOPED_KEY, "true").await;
-        let flipped = fetch_npm_scope_policy(&pool, repo_id).await;
+        let flipped = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect("well-formed policy rows must load");
         assert_eq!(flipped.allow_unscoped, Some(true));
         assert!(flipped.allows("lodash"));
+
+        // #2424: the name-pattern key parses into a lowercased Vec and
+        // composes with the scope list.
+        upsert(
+            NPM_ALLOWED_NAME_PATTERNS_KEY,
+            "[\"@Acme/*\",\"internal-*\"]",
+        )
+        .await;
+        upsert(NPM_ALLOW_UNSCOPED_KEY, "false").await;
+        let with_patterns = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect("well-formed policy rows must load");
+        assert_eq!(
+            with_patterns.allowed_name_patterns,
+            vec!["@acme/*", "internal-*"]
+        );
+        assert!(with_patterns.is_active());
+        assert!(with_patterns.allows("@acme/thing"));
+        assert!(with_patterns.allows("internal-utils"));
+        assert!(!with_patterns.allows("random-pkg"));
 
         // Cleanup.
         let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
@@ -3296,6 +5019,50 @@ mod tests {
             .bind(repo_id)
             .execute(&pool)
             .await;
+    }
+
+    /// #2726 core regression: a genuine DB error while loading the npm scope
+    /// policies must fail CLOSED (503 ServiceUnavailable), NOT be swallowed
+    /// into an empty allow-all map. Needs no live database: a lazily-connected
+    /// pool pointed at an unreachable server errors on first query. Before the
+    /// fix, `unwrap_or_default()` turned this exact failure into "every repo
+    /// unrestricted", silently lifting the operator's allowlist at all proxy
+    /// gates (tarball, metadata, packument, meta/audit).
+    #[tokio::test]
+    async fn test_fetch_npm_scope_policies_db_error_fails_closed() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+            .expect("connect_lazy");
+        let repo_id = uuid::Uuid::new_v4();
+
+        let err = fetch_npm_scope_policies(&pool, &[repo_id])
+            .await
+            .expect_err("a DB error must fail closed (Err), not fall open to allow-all");
+        assert!(
+            matches!(err, AppError::ServiceUnavailable(_)),
+            "a policy-load DB error must map to 503, got: {err:?}"
+        );
+
+        // The single-repo wrapper propagates the same failure (this feeds the
+        // live gates at get_package_metadata / fetch_remote_packument /
+        // serve_tarball).
+        let err = fetch_npm_scope_policy(&pool, repo_id)
+            .await
+            .expect_err("single-repo policy fetch must also fail closed on a DB error");
+        assert!(matches!(err, AppError::ServiceUnavailable(_)));
+    }
+
+    /// #2726: the pure parse helpers fail closed on corrupt values and accept
+    /// well-formed ones (no DB needed).
+    #[test]
+    fn test_parse_npm_policy_list_corrupt_fails_closed() {
+        let repo_id = uuid::Uuid::new_v4();
+        let err = parse_npm_policy_list(repo_id, NPM_ALLOWED_SCOPES_KEY, "not-json")
+            .expect_err("corrupt JSON must be an error, not an empty (unrestricted) list");
+        assert!(matches!(err, AppError::ServiceUnavailable(_)));
+
+        let ok = parse_npm_policy_list(repo_id, NPM_ALLOWED_SCOPES_KEY, "[\"@Types\"]")
+            .expect("well-formed JSON must parse");
+        assert_eq!(ok, vec!["@types"]);
     }
 
     /// DB-backed (#2327 secondary): a virtual repo with two Remote members —
@@ -3438,117 +5205,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (test-only)
-    // -----------------------------------------------------------------------
-
-    /// Compute npm integrity field from a SHA256 hex digest.
-    fn compute_npm_integrity(sha256_hex: &str) -> String {
-        let bytes: Vec<u8> = (0..sha256_hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&sha256_hex[i..i + 2], 16).ok())
-            .collect();
-        format!(
-            "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(&bytes)
-        )
-    }
-
-    /// Build the tarball filename for an npm package.
-    fn build_npm_tarball_filename(package_name: &str, version: &str) -> String {
-        if package_name.starts_with('@') {
-            let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
-            format!("{}-{}.tgz", short_name, version)
-        } else {
-            format!("{}-{}.tgz", package_name, version)
-        }
-    }
-
-    /// Build the artifact path for an npm tarball.
-    fn build_npm_artifact_path(
-        package_name: &str,
-        version: &str,
-        tarball_filename: &str,
-    ) -> String {
-        format!("{}/{}/{}", package_name, version, tarball_filename)
-    }
-
-    /// Build the storage key for an npm tarball.
-    fn build_npm_storage_key(package_name: &str, version: &str, tarball_filename: &str) -> String {
-        format!("npm/{}/{}/{}", package_name, version, tarball_filename)
-    }
-
-    /// Build a scoped package name from scope and package.
-    fn build_scoped_package_name(scope: &str, package: &str) -> String {
-        format!("@{}/{}", scope, package)
-    }
-
-    /// Validate an npm package name (basic checks).
-    fn validate_npm_package_name(name: &str) -> std::result::Result<(), String> {
-        if name.is_empty() {
-            return Err("Package name cannot be empty".to_string());
-        }
-        if name.len() > 214 {
-            return Err("Package name cannot exceed 214 characters".to_string());
-        }
-        if name.starts_with('.') || name.starts_with('_') {
-            return Err("Package name cannot start with '.' or '_'".to_string());
-        }
-        if name != name.to_lowercase() && !name.starts_with('@') {
-            return Err("Package name must be lowercase (unless scoped)".to_string());
-        }
-        Ok(())
-    }
-
-    /// Build the npm tarball URL for metadata responses.
-    fn build_npm_tarball_url(
-        base_url: &str,
-        repo_key: &str,
-        package_name: &str,
-        filename: &str,
-    ) -> String {
-        format!(
-            "{}/npm/{}/{}/-/{}",
-            base_url, repo_key, package_name, filename
-        )
-    }
-
-    /// Info struct for building npm version metadata.
-    #[allow(dead_code)]
-    struct NpmArtifactInfo {
-        version: String,
-        filename: String,
-        checksum_sha256: String,
-        tarball_url: String,
-        version_metadata: Option<serde_json::Value>,
-        package_name: String,
-    }
-
-    /// Build a single npm version entry for the metadata response.
-    fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
-        let integrity = compute_npm_integrity(&info.checksum_sha256);
-
-        let mut version_obj = info
-            .version_metadata
-            .as_ref()
-            .filter(|v| v.is_object())
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-
-        let obj = version_obj.as_object_mut().unwrap();
-        obj.entry("name".to_string())
-            .or_insert_with(|| serde_json::Value::String(info.package_name.clone()));
-        obj.entry("version".to_string())
-            .or_insert_with(|| serde_json::Value::String(info.version.clone()));
-        obj.insert(
-            "dist".to_string(),
-            serde_json::json!({
-                "tarball": info.tarball_url,
-                "integrity": integrity,
-            }),
-        );
-
-        version_obj
-    }
 
     // -----------------------------------------------------------------------
     // rewrite_npm_tarball_urls
@@ -3990,6 +5646,101 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Advertised-location conformance (#2657 class)
+    //
+    // The rewrite/build tests prove `dist.tarball` is emitted as a string;
+    // only routing that URL against the REAL router (mounted where `api::routes`
+    // nests it) proves an npm client can fetch the published tarball. A tarball
+    // URL whose path the download route 404s passes every rewrite test yet
+    // breaks `npm install` (the #2587 class).
+    // -----------------------------------------------------------------------
+
+    /// The npm routes mounted exactly where `api::routes` nests them. The
+    /// advertised `dist.tarball` is absolute and carries the `/npm` prefix.
+    fn npm_mounted_router() -> Router<crate::api::SharedState> {
+        Router::new().nest("/npm", super::router())
+    }
+
+    /// Resolve an advertised URL against the document that carried it and return
+    /// the path+query to request.
+    fn resolve_advertised(document_url: &str, advertised: &str) -> String {
+        let base = reqwest::Url::parse(document_url).expect("document url");
+        let joined = base.join(advertised).expect("advertised url must resolve");
+        joined[url::Position::BeforePath..url::Position::AfterQuery].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_advertised_dist_tarball_resolves_against_real_router() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let package = "widget";
+        let version = "1.0.0";
+        let tgz: &[u8] = b"npm-tgz-bytes-for-advertised-url";
+        let repo = fx.repo_info("local", None);
+        let path = format!("{package}/{version}/{package}-{version}.tgz");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            &path,
+            package,
+            version,
+            "application/gzip",
+            Bytes::from_static(tgz),
+            fx.user_id,
+        )
+        .await;
+
+        // Read the `dist.tarball` the packument advertises.
+        let meta_path = format!("/npm/{}/{package}", fx.repo_key);
+        let meta_doc_url = format!("http://ak.test{meta_path}");
+        let (meta_status, meta_body) = tdh::send(
+            tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+            tdh::get(meta_path),
+        )
+        .await;
+        let meta: serde_json::Value = serde_json::from_slice(&meta_body).unwrap_or_default();
+        let tarball = meta["versions"][version]["dist"]["tarball"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let (dl_status, dl_body) = if tarball.is_empty() {
+            (StatusCode::NOT_FOUND, Bytes::new())
+        } else {
+            let dl_path = resolve_advertised(&meta_doc_url, &tarball);
+            tdh::send(
+                tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+                tdh::get(dl_path),
+            )
+            .await
+        };
+
+        fx.teardown().await;
+
+        assert_eq!(meta_status, StatusCode::OK, "packument");
+        assert!(
+            !tarball.is_empty(),
+            "packument must advertise a dist.tarball"
+        );
+        assert_eq!(
+            dl_status,
+            StatusCode::OK,
+            "the advertised dist.tarball ({tarball}) must resolve, not 404"
+        );
+        assert_eq!(
+            &dl_body[..],
+            tgz,
+            "the advertised dist.tarball must serve the published tarball bytes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // RepoInfo struct
     // -----------------------------------------------------------------------
 
@@ -4006,6 +5757,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
@@ -4135,44 +5888,46 @@ mod tests {
 
     #[test]
     fn test_validate_npm_package_name_valid() {
-        assert!(validate_npm_package_name("express").is_ok());
+        assert!(validate_package_name("express").is_ok());
     }
 
     #[test]
     fn test_validate_npm_package_name_empty() {
-        assert!(validate_npm_package_name("").is_err());
+        assert!(validate_package_name("").is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_too_long() {
         let long_name = "a".repeat(215);
-        assert!(validate_npm_package_name(&long_name).is_err());
+        assert!(validate_package_name(&long_name).is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_starts_with_dot() {
-        assert!(validate_npm_package_name(".hidden").is_err());
+        assert!(validate_package_name(".hidden").is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_starts_with_underscore() {
-        assert!(validate_npm_package_name("_private").is_err());
+        assert!(validate_package_name("_private").is_err());
     }
 
     #[test]
     fn test_validate_npm_package_name_uppercase_rejected() {
-        assert!(validate_npm_package_name("MyPackage").is_err());
+        // The handler-level validator does not enforce lowercase; callers
+        // normalise case before storage (see NPM_NAME_PATTERN docs).
+        assert!(validate_package_name("MyPackage").is_ok());
     }
 
     #[test]
     fn test_validate_npm_package_name_scoped_uppercase_ok() {
-        assert!(validate_npm_package_name("@Scope/Package").is_ok());
+        assert!(validate_package_name("@Scope/Package").is_ok());
     }
 
     #[test]
     fn test_validate_npm_package_name_max_length() {
         let name = "a".repeat(214);
-        assert!(validate_npm_package_name(&name).is_ok());
+        assert!(validate_package_name(&name).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -4219,7 +5974,6 @@ mod tests {
         let tarball_url = build_npm_tarball_url("http://localhost:8080", "repo", pkg, &filename);
         NpmArtifactInfo {
             version: version.to_string(),
-            filename,
             checksum_sha256: sha256.to_string(),
             tarball_url,
             version_metadata: metadata,
@@ -5926,6 +7680,187 @@ mod tests {
         );
     }
 
+    /// #2490: a hosted publish must invalidate the computed-packument cache
+    /// on EVERY replica, not only the one that handled the publish.
+    ///
+    /// Simulates two replicas as two process-local `SharedState`s sharing one
+    /// database: replica B warms its virtual-repo packument cache (both the
+    /// full and the abbreviated/corgi Accept variants — the two documents one
+    /// `npm pack`/`npm install` resolves), replica A publishes a new version
+    /// with a `canary` dist-tag, and replica B — whose cached entries would
+    /// otherwise serve the pre-publish packument as *fresh* for the whole
+    /// fresh TTL (300 s here) — must converge through the Postgres NOTIFY
+    /// fanout within seconds, coherently across both variants. Also asserts
+    /// read-your-writes on the publishing replica itself, immediately and
+    /// without polling. Skips when no test database is configured.
+    #[tokio::test]
+    async fn test_publish_invalidates_virtual_packument_across_replicas() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::cache_invalidation;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+
+        // A virtual repo with the hosted repo as its only member: reads go
+        // through the virtual (cached), publishes to the hosted member.
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&fx.pool, "virtual", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual member");
+
+        // "Replica B": its own in-process packument cache over the same
+        // database, with its cross-replica invalidation listener running.
+        let state_b = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let _listener_b = cache_invalidation::start_cache_invalidation_listener(
+            fx.pool.clone(),
+            cache_invalidation::CacheInvalidationHandles {
+                repo_cache: state_b.repo_cache.clone(),
+                permission_service: state_b.permission_service.clone(),
+                npm_packument_cache: state_b.npm_packument_cache.clone(),
+            },
+            shutdown.clone(),
+        )
+        .await;
+
+        // v1.0.0 exists before the caches are warmed.
+        let path = "widget/1.0.0/widget-1.0.0.tgz";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            path,
+            "widget",
+            "1.0.0",
+            "application/gzip",
+            Bytes::from_static(b"tgz"),
+            fx.user_id,
+        )
+        .await;
+
+        let base_url = "http://localhost";
+        let full_headers = HeaderMap::new();
+        let mut corgi_headers = HeaderMap::new();
+        corgi_headers.insert(
+            axum::http::header::ACCEPT,
+            "application/vnd.npm.install-v1+json".parse().unwrap(),
+        );
+
+        async fn packument_json(
+            state: &SharedState,
+            repo_key: &str,
+            base_url: &str,
+            headers: &HeaderMap,
+        ) -> serde_json::Value {
+            let resp =
+                super::get_package_metadata_cached(state, repo_key, "widget", base_url, headers)
+                    .await
+                    .unwrap_or_else(|r| panic!("packument read failed: HTTP {}", r.status()));
+            let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+                .await
+                .expect("read packument body");
+            serde_json::from_slice(&bytes).expect("parse packument json")
+        }
+
+        // Warm replica B's cache in BOTH Accept variants and prove the warm
+        // state: without an invalidation these entries serve as fresh for the
+        // whole 300 s fresh TTL.
+        for headers in [&full_headers, &corgi_headers] {
+            let json = packument_json(&state_b, &virtual_key, base_url, headers).await;
+            assert!(
+                json["versions"]["1.0.0"].is_object(),
+                "warmed packument must contain the seeded version"
+            );
+        }
+        let warm_key = packument_cache::cache_key(&virtual_key, "widget", false, false, base_url);
+        assert!(
+            state_b
+                .npm_packument_cache
+                .as_ref()
+                .expect("test state has the packument cache enabled")
+                .lookup(&warm_key)
+                .await
+                .is_some(),
+            "replica B's virtual packument must be cached before the publish"
+        );
+
+        // Replica A publishes 2.0.0 with a `canary` dist-tag.
+        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz2");
+        let publish_body = serde_json::json!({
+            "name": "widget",
+            "versions": { "2.0.0": { "name": "widget", "version": "2.0.0" } },
+            "_attachments": { "widget-2.0.0.tgz": { "data": tarball_b64 } },
+            "dist-tags": { "canary": "2.0.0" }
+        });
+        let published = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "widget",
+            &HeaderMap::new(),
+            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body")),
+        )
+        .await;
+        assert!(
+            published.is_ok(),
+            "publish should succeed: {:?}",
+            published.err().map(|r| r.status())
+        );
+
+        // Read-your-writes on the publishing replica: immediate, no polling.
+        let json_a = packument_json(&fx.state, &virtual_key, base_url, &full_headers).await;
+
+        // Replica B must converge via the NOTIFY fanout well before the
+        // 300 s fresh TTL; poll briefly for the asynchronous delivery. Both
+        // Accept variants must agree (the incoherence that split `npm pack`'s
+        // printed filename from its written bytes in #2490).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut converged = false;
+        while std::time::Instant::now() < deadline {
+            let full = packument_json(&state_b, &virtual_key, base_url, &full_headers).await;
+            let corgi = packument_json(&state_b, &virtual_key, base_url, &corgi_headers).await;
+            if [&full, &corgi].iter().all(|json| {
+                json["versions"]["2.0.0"].is_object() && json["dist-tags"]["canary"] == "2.0.0"
+            }) {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Tear down before asserting so a failure never leaks DB state.
+        shutdown.cancel();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await
+            .expect("delete virtual repo");
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+        fx.teardown().await;
+
+        assert!(
+            json_a["versions"]["2.0.0"].is_object() && json_a["dist-tags"]["canary"] == "2.0.0",
+            "publishing replica must read its own write immediately, got {:?}",
+            json_a["dist-tags"]
+        );
+        assert!(
+            converged,
+            "replica B must see 2.0.0 and dist-tags.canary coherently in both \
+             Accept variants within seconds of the publish (would take up to \
+             the fresh TTL + per-variant SWR reads without the fanout, #2490)"
+        );
+    }
+
     /// #2022: a direct `npm publish` to a `promotion_only` repository must be
     /// rejected with 409 CONFLICT; the same publish to a normal repository must
     /// still succeed. Skips when no test database is configured.
@@ -7372,5 +9307,1090 @@ mod db_cov_tests {
         }
 
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3003: inline scan-and-block on the npm remote tarball serve path.
+//
+// These drive `serve_tarball` end-to-end into `serve_scanned_npm_tarball`
+// with a wiremock upstream, a real proxy service, and a scan_configs row
+// with scan_on_proxy enabled — mirroring the PyPI #2954/#2976 suite so
+// npm demonstrably inherits the same shared gate. Skip cleanly when
+// DATABASE_URL is unset.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod proxy_scan_block_tests {
+    use super::*;
+
+    use crate::api::handlers::proxy_helpers::sha256_hex;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::handlers::test_db_helpers::enable_proxy_scan;
+    use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+
+    /// Mount the concrete tarball route (`/{package}/-/{filename}`) — the
+    /// single seam every `npm install` byte passes through.
+    async fn mount_tarball_upstream(
+        upstream: &wiremock::MockServer,
+        package: &str,
+        filename: &str,
+        tarball: &[u8],
+        expected_fetches: Option<u64>,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let mut mock = Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{filename}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball.to_vec())
+                    .insert_header("Content-Type", "application/octet-stream"),
+            );
+        if let Some(n) = expected_fetches {
+            mock = mock.expect(n);
+        }
+        mock.mount(upstream).await;
+    }
+
+    /// Point the fixture repo's upstream_url at the wiremock server (the
+    /// serve path re-reads the repository row from the DB).
+    async fn point_upstream(fx: &tdh::Fixture, upstream: &wiremock::MockServer) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+    }
+
+    async fn cleanup_proxy_scan_row(pool: &sqlx::PgPool, digest: &str) {
+        // proxy_scan_results outlives repo cleanup (repository_id is SET NULL
+        // on delete): remove the digest row explicitly.
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(digest)
+            .execute(pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+    }
+
+    /// Create a public Remote npm member pointing at `upstream`, attach it to
+    /// the `virtual_id` fixture repo, and return the member id.
+    async fn attach_remote_npm_member(
+        pool: &sqlx::PgPool,
+        virtual_id: uuid::Uuid,
+        upstream: &wiremock::MockServer,
+    ) -> (uuid::Uuid, std::path::PathBuf) {
+        let (member_id, _key, member_dir) = tdh::create_repo(pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(member_id)
+            .execute(pool)
+            .await
+            .expect("configure npm member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("attach npm member");
+        (member_id, member_dir)
+    }
+
+    async fn cleanup_npm_member(pool: &sqlx::PgPool, member_id: uuid::Uuid, dir: &std::path::Path) {
+        for sql in [
+            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+            "DELETE FROM scan_configs WHERE repository_id = $1",
+            "DELETE FROM role_assignments WHERE repository_id = $1",
+            "DELETE FROM artifacts WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── #3023: the inline scan gate on the VIRTUAL npm tarball path ────────
+    #[tokio::test]
+    async fn test_virtual_serve_tarball_blocks_vulnerable_member() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "vulnwidget";
+        let filename = "vulnwidget-0.1.0.tgz";
+        let tarball: &[u8] = b"\x1f\x8b vulnwidget-tarball-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"\x1f\x8b vulnwidget-tarball-3023"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&upstream, package, filename, tarball, Some(1)).await;
+        let (member_id, member_dir) =
+            attach_remote_npm_member(&fx.pool, fx.repo_id, &upstream).await;
+        enable_proxy_scan(&fx.pool, member_id, "fail_closed").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                1,
+                1,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result =
+            super::serve_tarball(&state, &fx.repo_key, package, filename, &Default::default())
+                .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        cleanup_npm_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "a vulnerable tarball through a virtual repo must be blocked (#3023), got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "vulnerable-via-virtual npm serve must be 403"
+            ),
+        }
+    }
+
+    /// Clean via virtual -> 200 (no over-block).
+    #[tokio::test]
+    async fn test_virtual_serve_tarball_serves_clean_member() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "cleanwidget";
+        let filename = "cleanwidget-0.1.0.tgz";
+        let tarball: &[u8] = b"\x1f\x8b cleanwidget-tarball-3023";
+        let digest = sha256_hex(&Bytes::from_static(b"\x1f\x8b cleanwidget-tarball-3023"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&upstream, package, filename, tarball, None).await;
+        let (member_id, member_dir) =
+            attach_remote_npm_member(&fx.pool, fx.repo_id, &upstream).await;
+        // fail_open: a fresh cached CLEAN verdict serves without a live scanner
+        // (the #2976 unknown-live-version re-scan tightening is fail_closed-only).
+        enable_proxy_scan(&fx.pool, member_id, "fail_open").await;
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.99.0-test"),
+                Some(member_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result =
+            super::serve_tarball(&state, &fx.repo_key, package, filename, &Default::default())
+                .await;
+        let status = result
+            .as_ref()
+            .map(|r| r.status())
+            .unwrap_or_else(|r| r.status());
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        cleanup_npm_member(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a clean tarball through a virtual repo must still serve 200 (no over-block)"
+        );
+    }
+
+    /// The synthetic scan identity for a proxied npm tarball: `.tgz` name +
+    /// `application/gzip` content type (drives Grype applicability + archive
+    /// extraction), digest-keyed, with NO artifacts-row storage key.
+    #[test]
+    fn test_npm_synthetic_artifact_shape() {
+        let repo_id = uuid::Uuid::new_v4();
+        let a = npm_synthetic_artifact(repo_id, "widget-1.0.0.tgz", "ab12", 42);
+        assert_eq!(a.repository_id, repo_id);
+        assert_eq!(a.name, "widget-1.0.0.tgz");
+        assert_eq!(a.path, "widget-1.0.0.tgz");
+        assert_eq!(a.content_type, NPM_TARBALL_CONTENT_TYPE);
+        assert_eq!(a.checksum_sha256, "ab12");
+        assert_eq!(a.size_bytes, 42);
+        assert!(a.storage_key.is_empty());
+    }
+
+    /// Build an npm-shaped `.tgz` whose `package/package.json` is exactly
+    /// `body` (or omit the file entirely when `body` is `None`), so the
+    /// crafted-identity shapes are exercised over real tarball bytes.
+    fn crafted_tgz(package_json: Option<&[u8]>) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut gz);
+            if let Some(body) = package_json {
+                let mut header = tar::Header::new_gnu();
+                header.set_path("package/package.json").unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, body).unwrap();
+            }
+            let index = b"module.exports = 1;\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("package/index.js").unwrap();
+            header.set_size(index.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, index.as_ref()).unwrap();
+            builder.finish().unwrap();
+        }
+        gz.flush().unwrap();
+        Bytes::from(gz.finish().unwrap())
+    }
+
+    /// A real npm-shaped `.tgz` that honestly states `name@version` — what the
+    /// registry serves, and what the identity gate requires before a scan of
+    /// it can be vouched for.
+    fn honest_tgz(name: &str, version: &str) -> Bytes {
+        crafted_tgz(Some(
+            serde_json::json!({ "name": name, "version": version })
+                .to_string()
+                .as_bytes(),
+        ))
+    }
+
+    /// #3003: the served version comes from the registry's invariant filename
+    /// shape, for scoped and unscoped packages alike — never from the bytes.
+    #[test]
+    fn test_npm_version_from_tarball_filename() {
+        assert_eq!(
+            npm_version_from_tarball_filename("lodash", "lodash-4.17.11.tgz").as_deref(),
+            Some("4.17.11")
+        );
+        // Scoped: the filename uses the UNSCOPED basename.
+        assert_eq!(
+            npm_version_from_tarball_filename("@acme/widget", "widget-1.0.0.tgz").as_deref(),
+            Some("1.0.0")
+        );
+        // Prerelease/build metadata is part of the version, not a delimiter.
+        assert_eq!(
+            npm_version_from_tarball_filename("pkg", "pkg-1.0.0-beta.1.tgz").as_deref(),
+            Some("1.0.0-beta.1")
+        );
+        // Shapes we must NOT guess at.
+        assert!(npm_version_from_tarball_filename("lodash", "other-1.0.0.tgz").is_none());
+        assert!(npm_version_from_tarball_filename("lodash", "lodash-.tgz").is_none());
+        assert!(npm_version_from_tarball_filename("lodash", "lodash-1.0.0.tar.gz").is_none());
+    }
+
+    /// #3003: what the tarball claims about itself — and the shapes that mean
+    /// "this tarball states no usable identity" (red-team shapes c and d).
+    #[test]
+    fn test_npm_claimed_identity_shapes() {
+        let honest = crafted_tgz(Some(br#"{"name":"lodash","version":"4.17.11"}"#));
+        assert_eq!(
+            npm_claimed_identity(&honest),
+            Some(("lodash".to_string(), "4.17.11".to_string()))
+        );
+
+        // (c) no package.json at all.
+        assert!(npm_claimed_identity(&crafted_tgz(None)).is_none());
+        // (d) version as a JSON NUMBER, not a string.
+        assert!(
+            npm_claimed_identity(&crafted_tgz(Some(br#"{"name":"lodash","version":4.17}"#)))
+                .is_none()
+        );
+        // Missing / empty halves.
+        assert!(npm_claimed_identity(&crafted_tgz(Some(br#"{"name":"lodash"}"#))).is_none());
+        assert!(
+            npm_claimed_identity(&crafted_tgz(Some(br#"{"name":"","version":"1.0.0"}"#))).is_none()
+        );
+        // Not even valid JSON.
+        assert!(npm_claimed_identity(&crafted_tgz(Some(b"nope"))).is_none());
+    }
+
+    /// #3003 (red-team shape a): a tarball whose package.json was rewritten to
+    /// a benign identity does NOT agree with the coordinate it is served at.
+    #[test]
+    fn test_npm_identity_agreement() {
+        assert!(npm_identity_agrees(
+            "lodash",
+            "4.17.11",
+            &("lodash".into(), "4.17.11".into())
+        ));
+        // Legacy mixed-case publication still agrees.
+        assert!(npm_identity_agrees(
+            "@acme/Widget",
+            "1.0.0",
+            &("@acme/widget".into(), "1.0.0".into())
+        ));
+        // (a) rewritten to a benign name.
+        assert!(!npm_identity_agrees(
+            "lodash",
+            "4.17.11",
+            &("totally-benign".into(), "1.0.0".into())
+        ));
+        // Rewritten to a benign VERSION of the right name (e.g. a patched one).
+        assert!(!npm_identity_agrees(
+            "lodash",
+            "4.17.11",
+            &("lodash".into(), "4.17.21".into())
+        ));
+    }
+
+    /// #3003 END-TO-END, red-team Finding 1: each crafted shape that defeats
+    /// content-derived identity must be WITHHELD under fail_closed (423),
+    /// never served 200-clean. The state has no scanner service, so a 200 here
+    /// could only mean the gate let unassessed bytes through.
+    #[tokio::test]
+    async fn test_serve_tarball_crafted_identity_shapes_are_withheld() {
+        let shapes: Vec<(&str, Option<&[u8]>)> = vec![
+            // (a) identity rewritten to something benign.
+            (
+                "rewritten-identity",
+                Some(br#"{"name":"totally-benign","version":"1.0.0"}"#),
+            ),
+            // (c) package.json removed entirely.
+            ("no-package-json", None),
+            // (d) version as a JSON number.
+            (
+                "numeric-version",
+                Some(br#"{"name":"lodash","version":4.17}"#),
+            ),
+            // Right name, wrong version.
+            (
+                "version-mismatch",
+                Some(br#"{"name":"lodash","version":"4.17.21"}"#),
+            ),
+        ];
+
+        for (label, package_json) in shapes {
+            let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+                return;
+            };
+            let tarball = crafted_tgz(package_json);
+            let upstream = wiremock::MockServer::start().await;
+            {
+                use wiremock::matchers::{method, path};
+                use wiremock::{Mock, ResponseTemplate};
+                Mock::given(method("GET"))
+                    .and(path("/lodash/-/lodash-4.17.11.tgz"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(tarball.to_vec())
+                            .insert_header("Content-Type", "application/octet-stream"),
+                    )
+                    .mount(&upstream)
+                    .await;
+            }
+            point_upstream(&fx, &upstream).await;
+            enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+            let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+            let result = super::serve_tarball(
+                &state,
+                &fx.repo_key,
+                "lodash",
+                "lodash-4.17.11.tgz",
+                &Default::default(),
+            )
+            .await;
+
+            let digest = sha256_hex(&tarball);
+            cleanup_proxy_scan_row(&fx.pool, &digest).await;
+            fx.teardown().await;
+
+            match result {
+                Ok(r) => panic!(
+                    "{label}: a tarball that does not state the identity it is served \
+                     as must be withheld under fail_closed, got {}",
+                    r.status()
+                ),
+                Err(resp) => assert_eq!(
+                    resp.status(),
+                    StatusCode::LOCKED,
+                    "{label}: expected 423 (inconclusive), not a clean serve"
+                ),
+            }
+        }
+    }
+
+    /// Availability control for the shapes above: under fail_OPEN the same
+    /// unassessable tarball still serves, loudly marked pending — the
+    /// hardening tightens fail_closed without changing the latency-first
+    /// posture operators opted into.
+    #[tokio::test]
+    async fn test_serve_tarball_crafted_identity_serves_pending_under_fail_open() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = crafted_tgz(Some(br#"{"name":"totally-benign","version":"1.0.0"}"#));
+        let upstream = wiremock::MockServer::start().await;
+        {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+            Mock::given(method("GET"))
+                .and(path("/lodash/-/lodash-4.17.11.tgz"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(tarball.to_vec())
+                        .insert_header("Content-Type", "application/octet-stream"),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "lodash",
+            "lodash-4.17.11.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fail_open must still serve, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        cleanup_proxy_scan_row(&fx.pool, &sha256_hex(&tarball)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan.as_deref(),
+            Some("pending"),
+            "an unassessable serve under fail_open must be loudly marked pending"
+        );
+    }
+
+    /// Fail-closed + inconclusive scan (no scanner service on the state) must
+    /// 423, never serve unscanned tarball bytes — npm inherits the #2954
+    /// fail-closed contract through the shared gate.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_fail_closed_inconclusive_is_423() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("sealed-widget", "1.0.0");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "sealed-widget",
+            "sealed-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        // No scanner service on the state: the inline scan is inconclusive.
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "sealed-widget",
+            "sealed-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "fail-closed + inconclusive scan must never serve tarball bytes, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::LOCKED,
+                "fail-closed inconclusive must be 423 Locked"
+            ),
+        }
+    }
+
+    /// Fail-open first pull serves LOUDLY: 200 with `X-AK-Scan: pending`, the
+    /// digest header, and byte-identical content.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_fail_open_serves_pending() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("open-widget", "2.0.0");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "open-widget",
+            "open-widget-2.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "open-widget",
+            "open-widget-2.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fail-open first pull must serve, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let digest_header = resp
+            .headers()
+            .get("X-NPM-Tarball-SHA256")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        let digest = sha256_hex(&tarball);
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("pending"),
+            "a served-before-verdict byte must be observable (X-AK-Scan: pending)"
+        );
+        assert_eq!(ct.as_deref(), Some(NPM_TARBALL_CONTENT_TYPE));
+        assert_eq!(digest_header.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            &body[..],
+            &tarball[..],
+            "served bytes must equal upstream bytes"
+        );
+    }
+
+    /// A fresh cached VULNERABLE verdict for the tarball digest blocks with
+    /// 403 — and a SECOND pull is blocked from the proxy cache with no
+    /// upstream re-fetch (wiremock `expect(1)` verifies on drop), proving the
+    /// verdict is keyed per sha256 and reused.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_blocks_cached_vulnerable_digest() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b poisoned-npm-tarball-3003-vulnerable";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b poisoned-npm-tarball-3003-vulnerable",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "poisoned-widget",
+            "poisoned-widget-0.1.0.tgz",
+            tarball,
+            Some(1),
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Seed a fresh vulnerable verdict for this digest through the real
+        // service so record_verdict + lookup_verdict are covered end-to-end.
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                1,
+                1,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        for pull in ["first", "second (cache-served)"] {
+            let result = super::serve_tarball(
+                &state,
+                &fx.repo_key,
+                "poisoned-widget",
+                "poisoned-widget-0.1.0.tgz",
+                &Default::default(),
+            )
+            .await;
+            match result {
+                Ok(r) => {
+                    let status = r.status();
+                    cleanup_proxy_scan_row(&fx.pool, &digest).await;
+                    fx.teardown().await;
+                    panic!("{pull} pull of a vulnerable digest must be blocked, got {status}");
+                }
+                Err(resp) => assert_eq!(
+                    resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "{pull} pull: cached vulnerable digest must be a 403 scan_blocked"
+                ),
+            }
+        }
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+        // Dropping the mock server verifies expect(1): the second blocked
+        // pull came from the proxy cache, not upstream.
+    }
+
+    /// A SCOPED package (`@scope/pkg`) flows through the same seam and the
+    /// same digest key: a cached vulnerable verdict blocks its tarball too.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_blocks_scoped_package() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b scoped-npm-tarball-3003-vulnerable";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b scoped-npm-tarball-3003-vulnerable",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        // Tarball URLs keep the scope separator as a literal `/`.
+        mount_tarball_upstream(
+            &upstream,
+            "@acme/secret-widget",
+            "secret-widget-1.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "@acme/secret-widget",
+            "secret-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "scoped vulnerable tarball must be blocked, got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+        }
+    }
+
+    /// The cached-`clean` fast path serves 200 `X-AK-Scan: clean` — on a
+    /// FAIL-OPEN repo with no scanner service the header is the
+    /// discriminator (without the verdict this pull would be `pending`).
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_serves_cached_clean_digest() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b verified-npm-tarball-3003-clean";
+        let digest = sha256_hex(&Bytes::from_static(
+            b"\x1f\x8b verified-npm-tarball-3003-clean",
+        ));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "verified-widget",
+            "verified-widget-3.2.1.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "verified-widget",
+            "verified-widget-3.2.1.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("fresh clean verdict must serve from the cache, got {status}");
+            }
+        };
+        let status = resp.status();
+        let scan_header = resp
+            .headers()
+            .get("X-AK-Scan")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            scan_header.as_deref(),
+            Some("clean"),
+            "a verdict-backed serve must be marked clean, not pending"
+        );
+        assert_eq!(&body[..], tarball);
+    }
+
+    /// #2976 inherited: a cached `clean` verdict recorded by an OLDER
+    /// scanner/CVE-DB version must NOT be reused once the live CVE engine
+    /// reports a newer version — the pull re-scans and (mock now knows the
+    /// CVE) blocks 403.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_rescans_when_scanner_version_advances() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("staleclean-widget", "1.0.0");
+        let digest = sha256_hex(&tarball);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "staleclean-widget",
+            "staleclean-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        // Cached CLEAN verdict recorded at stored version V...
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed stale clean verdict");
+
+        // ...while the LIVE engine is at V+1 and now flags the bytes.
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-0.84.0-test"),
+                rescan: MockCveRescan::Vulnerable,
+            })],
+        );
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "staleclean-widget",
+            "staleclean-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "clean verdict from an older scanner version must be re-scanned \
+                 (and blocked), not served from cache; got {}",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "re-scan against the bumped CVE-DB found the CVE -> 403"
+            ),
+        }
+    }
+
+    /// #2976 probe-None case inherited: an UNKNOWN live scanner version must
+    /// not let a cached clean verdict short-circuit a fail-closed repo — the
+    /// pull re-scans (mock flags it) and blocks 403.
+    #[tokio::test]
+    async fn test_serve_tarball_proxy_scan_unknown_live_version_rescans_under_fail_closed() {
+        use crate::services::proxy_scan_service::ProxyScanService;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("probenone-widget", "1.0.0");
+        let digest = sha256_hex(&tarball);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "probenone-widget",
+            "probenone-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-0.83.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        // Live engine present but its version probe FAILS (None).
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: None,
+                rescan: MockCveRescan::Vulnerable,
+            })],
+        );
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "probenone-widget",
+            "probenone-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "an UNKNOWN live scanner version must not let a cached clean \
+                 verdict short-circuit the fail-closed gate; got {} (expected \
+                 a re-scan -> 403)",
+                r.status()
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+        }
+    }
+
+    /// Regression guard: a remote repo WITHOUT scan-on-proxy keeps today's
+    /// untouched streaming behavior — 200, no `X-AK-Scan` header.
+    #[tokio::test]
+    async fn test_serve_tarball_without_proxy_scan_streams_untouched() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: &[u8] = b"\x1f\x8b unscanned-npm-tarball-3003-passthrough";
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "plain-widget",
+            "plain-widget-1.0.0.tgz",
+            tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        // NO scan_configs row: scan-on-proxy disabled.
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball(
+            &state,
+            &fx.repo_key,
+            "plain-widget",
+            "plain-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                fx.teardown().await;
+                panic!("non-opted-in repo must keep streaming, got {status}");
+            }
+        };
+        let status = resp.status();
+        let has_scan_header = resp.headers().contains_key("X-AK-Scan");
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !has_scan_header,
+            "repos without scan-on-proxy must be untouched (no X-AK-Scan header)"
+        );
+        assert_eq!(&body[..], tarball);
     }
 }

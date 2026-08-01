@@ -129,6 +129,11 @@ services:
       - shared_config:/shared
     environment:
       DTRACK_INIT_FORCE_ROTATE: ${DTRACK_INIT_FORCE_ROTATE:-false}
+      # Owner (uid:gid) for /shared/dtrack-api-key (#2865). Must match the UID
+      # the backend runs as so it can read the key; the hardened backend image
+      # runs as artifact = 1001:0 (docker/Dockerfile.backend). Override only if
+      # you run a custom backend image with a different UID.
+      DTRACK_INIT_KEY_OWNER: ${DTRACK_INIT_KEY_OWNER:-1001:0}
       # Opt-in OSV mirror (#1972). NVD-only matches by CPE and misses purl-based
       # language dependencies; set to true to also mirror OSV (purl matching).
       DTRACK_INIT_OSV_ENABLED: ${DTRACK_INIT_OSV_ENABLED:-false}
@@ -220,6 +225,8 @@ services:
       # Read it with: docker exec artifact-keeper-backend cat /data/storage/admin.password
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
+      LOG_FORMAT: ${LOG_FORMAT:-pretty}
+      AUDIT_STREAM: ${AUDIT_STREAM:-off}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,https://localhost}
       # Trusted reverse-proxy CIDRs (#2298 / #2023). Caddy terminates all
@@ -237,6 +244,17 @@ services:
       # subnets; keep it in sync with the actual proxy network.
       RATE_LIMIT_TRUSTED_PROXY_CIDRS: ${RATE_LIMIT_TRUSTED_PROXY_CIDRS:-172.30.0.0/24}
       TRIVY_URL: http://trivy:8090
+      # Trivy scanner-adapter URL (container-image scanning, #2471 / #2305).
+      # TRIVY_URL above only wires the legacy trivy *server* used for
+      # filesystem / incus (rootfs) scanning. To get first-class Trivy
+      # container-*image* reports, point the backend at the in-repo
+      # scanner-adapter (Harbor Pluggable Scanner API); this registers the
+      # dedicated `ImageScanner`. WITHOUT it, images are still covered by grype
+      # (registry mode), but no Trivy image report is produced and operators
+      # cannot tell why. When set it also drives fs/incus scans over HTTP
+      # (adapter >= 1.2.0), taking precedence over TRIVY_URL there. Uncomment
+      # this line and the `scanner-adapter` service block below to enable it.
+      # TRIVY_ADAPTER_URL: http://scanner-adapter:8080
       OPENSCAP_URL: http://openscap:8091
       SCAN_WORKSPACE_PATH: /scan-workspace
       OPENSEARCH_URL: http://opensearch:9200
@@ -333,6 +351,29 @@ services:
       - trivy_cache:/root/.cache/trivy
       - scan_workspace:/scan-workspace:ro
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Trivy scanner-adapter (container-image scanning) — optional
+  # ---------------------------------------------------------------------------
+  # Fronts trivy with the Harbor Pluggable Scanner API so the backend can run
+  # first-class container-*image* scans (the `ImageScanner`) and, from adapter
+  # 1.2.0, filesystem/incus scans over HTTP with no trivy binary in the backend
+  # image. Uncomment this service AND set `TRIVY_ADAPTER_URL` on the backend
+  # (see the commented line in the backend `environment:` above) to enable it.
+  # Without it, container images are still scanned by grype (registry mode) but
+  # no Trivy image report is produced. See docker/scanner-adapter/README.md.
+  # scanner-adapter:
+  #   image: ghcr.io/artifact-keeper/artifact-keeper-scanner-adapter:1  # or artifactkeeper/scanner-adapter:1
+  #   container_name: artifact-keeper-scanner-adapter
+  #   environment:
+  #     SCANNER_ADAPTER_ADDR: ":8080"
+  #     # Pull image manifests/blobs from the AK registry over the compose
+  #     # network's plain HTTP. Leave true on the internal network.
+  #     SCANNER_TRIVY_INSECURE: "true"
+  #   volumes:
+  #     - trivy_cache:/home/scanner/.cache/trivy
+  #     - scan_workspace:/scan-workspace:ro
+  #   restart: unless-stopped
 
   # ---------------------------------------------------------------------------
   # OpenSCAP (compliance scanner)

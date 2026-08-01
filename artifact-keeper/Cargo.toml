@@ -3,7 +3,7 @@ resolver = "2"
 members = ["backend"]
 
 [workspace.package]
-version = "1.5.4"
+version = "1.7.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
@@ -121,6 +121,7 @@ tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 tonic-build = "0.12"
+prost-build = "0.13"
 
 # URL parsing and resolution
 url = "2.5"

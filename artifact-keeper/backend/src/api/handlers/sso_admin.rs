@@ -1093,6 +1093,8 @@ mod tests {
             groups_attribute: "memberOf".to_string(),
             admin_group_dn: None,
             use_starttls: false,
+            insecure_skip_verify: false,
+            has_ca_certificate: false,
             is_enabled: true,
             priority: 1,
             created_at: chrono::Utc::now(),
@@ -1103,6 +1105,8 @@ mod tests {
         assert_eq!(json["has_bind_password"], true);
         assert_eq!(json["priority"], 1);
         assert!(json["group_base_dn"].is_null());
+        assert_eq!(json["insecure_skip_verify"], false);
+        assert_eq!(json["has_ca_certificate"], false);
     }
 
     // -----------------------------------------------------------------------
@@ -1126,6 +1130,7 @@ mod tests {
             admin_group: Some("admin-group".to_string()),
             is_enabled: false,
             use_absolute_acs_url: false,
+            map_groups_to_groups: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

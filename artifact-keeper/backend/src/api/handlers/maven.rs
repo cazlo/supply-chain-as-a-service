@@ -39,6 +39,35 @@ use crate::models::repository::RepositoryType;
 // TODO: Remaining format handlers (beyond maven, npm, pypi, cargo) still use
 // plain-text error responses and should be migrated to AppError (#553).
 
+/// Roll back a pre-write flat-key claim ([`claim_flat_key_for_write`]) when the
+/// gated `storage.put` fails, so an aborted write leaves a foreign unattributed
+/// key unattributed (#2586 / V3b). Best-effort: a release failure is logged but
+/// never masks the original storage error the caller is about to return.
+async fn release_flat_key_claim_best_effort(
+    db: &PgPool,
+    claim: crate::services::maven_flat_attribution::FlatKeyWriteClaim,
+    repository_id: Uuid,
+    storage_backend: &str,
+    storage_key: &str,
+) {
+    if let Err(e) = crate::services::maven_flat_attribution::release_flat_key_claim(
+        db,
+        claim,
+        repository_id,
+        storage_backend,
+        storage_key,
+    )
+    .await
+    {
+        warn!(
+            error = %e,
+            storage_key = %storage_key,
+            "failed to release flat-key write claim after a failed put; \
+             a later write or the migration-163 backfill will reconcile it"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Maven `maven-metadata.xml` generation cache (#2079)
 // ---------------------------------------------------------------------------
@@ -73,6 +102,113 @@ pub async fn invalidate_maven_metadata_cache(repo_id: Uuid, group_id: &str, arti
         .invalidate(&(repo_id, group_id.to_string(), artifact_id.to_string()))
         .await;
 }
+
+/// Storage path (relative to the `maven/` format prefix) of the group/artifact
+/// `maven-metadata.xml` for one GAV, e.g.
+/// `com/example/my-lib/maven-metadata.xml`.
+fn maven_metadata_object_path(group_id: &str, artifact_id: &str) -> String {
+    format!(
+        "{}/{}/maven-metadata.xml",
+        group_id.replace('.', "/"),
+        artifact_id
+    )
+}
+
+/// Drop the *stored* `maven-metadata.xml` document (and its checksum sidecars)
+/// for a `(repo, group, artifact)` GAV, then invalidate the in-memory
+/// generation cache.
+///
+/// `mvn deploy` uploads a verbatim `maven-metadata.xml` alongside each artifact,
+/// and the download path serves that stored document in preference to dynamic
+/// generation (a deliberately-uploaded document is authoritative for its owner —
+/// see `fetch_maven_metadata_bytes`). When a version is deleted, that stored
+/// document is stale: it still advertises the removed version in
+/// `<versions>`/`<latest>`/`<release>`, so a client resolves a version that now
+/// 404s (#2845). Removing the stored object lets the dynamic generator — which
+/// reads only non-deleted `artifacts` rows — take over on the next GET, and also
+/// produce a correct (or absent) document when the last version is deleted.
+///
+/// Best-effort: a missing object or a storage error is ignored (the document may
+/// never have been uploaded, e.g. some Gradle publish flows), and clearing it is
+/// never allowed to fail the delete. Both the repo-scoped (#2624) and legacy flat
+/// key candidates are removed so the fix holds under either
+/// [`StorageKeyScheme`](crate::storage::StorageKeyScheme).
+pub async fn clear_stored_maven_metadata(
+    state: &SharedState,
+    repo_id: Uuid,
+    storage_backend: &str,
+    storage_location: &crate::storage::StorageLocation,
+    group_id: &str,
+    artifact_id: &str,
+) {
+    // Always drop the generation cache, even if there is no stored object.
+    invalidate_maven_metadata_cache(repo_id, group_id, artifact_id).await;
+
+    let storage = match state.storage_for_repo(storage_location) {
+        Ok(storage) => storage,
+        Err(e) => {
+            warn!(error = %e, "clear_stored_maven_metadata: storage unavailable");
+            return;
+        }
+    };
+
+    let meta_path = maven_metadata_object_path(group_id, artifact_id);
+    let scheme = crate::storage::StorageKeyScheme::from_env();
+
+    // Base keys: repo-scoped candidate (cloud RepoScoped) first, then legacy flat.
+    let mut base_keys = Vec::with_capacity(2);
+    if let Some(scoped) = scheme.scoped_read_key(storage_backend, "maven", repo_id, &meta_path) {
+        base_keys.push(scoped);
+    }
+    base_keys.push(format!("maven/{}", meta_path));
+
+    // Remove the document itself plus the checksum sidecars Maven stores beside it.
+    for base in &base_keys {
+        for key in [
+            base.clone(),
+            format!("{}.md5", base),
+            format!("{}.sha1", base),
+            format!("{}.sha256", base),
+        ] {
+            if let Err(e) = storage.delete(&key).await {
+                // A missing object is the common case (never uploaded); log at
+                // debug so it doesn't look like a failure.
+                tracing::debug!(error = %e, key = %key, "clear_stored_maven_metadata: delete miss");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual-repo GA-level metadata merge cache (#2302)
+// ---------------------------------------------------------------------------
+//
+// A GET of `maven-metadata.xml` on a *virtual* repository fans out across every
+// member (proxying upstream metadata and generating local metadata) then merges
+// the version sets. That fan-out is the expensive part of a Maven resolve; for a
+// multi-thousand-dependency build the same GA tuple is requested repeatedly in a
+// short window. This LRU memoizes the merged result so those repeats skip the
+// member iteration entirely.
+//
+// KNOWN GAP: invalidation is TTL-only (60 s). Unlike the #2079 per-GAV cache
+// above, this merge cache is NOT actively invalidated when a member repo
+// receives an upload — a freshly published version can therefore be masked for
+// up to the TTL. This is acceptable under Maven's own release semantics (release
+// coordinates are immutable and clients already tolerate metadata propagation
+// delay), so the bounded staleness is the intended trade-off rather than active
+// cross-member invalidation.
+const VIRTUAL_MAVEN_METADATA_CACHE_CAPACITY: u64 = 4_000;
+const VIRTUAL_MAVEN_METADATA_CACHE_TTL: Duration = Duration::from_secs(60);
+
+type VirtualMetadataCacheKey = (Uuid, String, String);
+
+static VIRTUAL_MAVEN_METADATA_CACHE: Lazy<MokaCache<VirtualMetadataCacheKey, Option<Bytes>>> =
+    Lazy::new(|| {
+        MokaCache::builder()
+            .max_capacity(VIRTUAL_MAVEN_METADATA_CACHE_CAPACITY)
+            .time_to_live(VIRTUAL_MAVEN_METADATA_CACHE_TTL)
+            .build()
+    });
 
 // ---------------------------------------------------------------------------
 // Router
@@ -230,6 +366,7 @@ async fn resolve_snapshot_artifact(
 
     use sqlx::Row;
     Some(ResolvedSnapshot {
+        id: row.get("id"),
         storage_key: row.get("storage_key"),
         checksum_sha256: row.get("checksum_sha256"),
         path: row.get("path"),
@@ -237,6 +374,7 @@ async fn resolve_snapshot_artifact(
 }
 
 struct ResolvedSnapshot {
+    id: uuid::Uuid,
     storage_key: String,
     checksum_sha256: String,
     path: String,
@@ -352,9 +490,15 @@ async fn maven_local_fetch_snapshot(
 
     let ct = content_type_for_path(path).to_string();
     Ok(proxy_helpers::StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body: stream,
         content_type: Some(ct),
         content_length: None,
+        // Local snapshot artifact resolved: surface its id so a virtual
+        // maven-snapshot member download is recorded exactly once (#2260).
+        artifact_id: Some(resolved.id),
+        etag: None,
     })
 }
 
@@ -830,6 +974,19 @@ async fn download(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
+    // Curation enforcement (#2930): block a curated artifact pull on a
+    // remote/virtual repo. The package identity is `groupId:artifactId`
+    // (`maven_proxy_package_name`, the same shape the proxy-sync catalog uses),
+    // so a rule authored for the curation catalog matches here. Metadata and
+    // checksum/signature sidecars derive no package identity (the helper returns
+    // `None`) and pass through untouched; hosted repos / curation-off are no-ops.
+    if let Some(pkg) = crate::services::proxy_service::maven_proxy_package_name(&path) {
+        let version = crate::formats::maven::MavenHandler::parse_coordinates(&path)
+            .ok()
+            .map(|c| c.version);
+        proxy_helpers::enforce_curation(&state.db, &repo, &pkg, version.as_deref()).await?;
+    }
+
     // 1. Check if this is a checksum request for metadata.
     //    Always compute the checksum from the actual metadata XML bytes
     //    so the result is guaranteed to match what this same URL returns
@@ -871,9 +1028,42 @@ async fn download(
         // under `maven/`. (The SNAPSHOT branch below is inherently hosted-only:
         // `resolve_snapshot_artifact` reads the `artifacts` table, which never
         // has rows for Remote/Virtual repos, so it short-circuits for them.)
+        // The stored-sidecar reads below fetch a bare `maven/<path>` key with no
+        // artifact row scoped to the caller's repository. On repo-isolated
+        // (filesystem) backends that is always sound; on shared cloud namespaces
+        // (S3/GCS/Azure) the flat key could belong to a *different* repository,
+        // so it is served only to the repository the catalog attributes the key
+        // to (#2504, #2574 — the same ownership rule as the write guard).
+        // Foreign-owned and unattributed keys fall through to the row-gated
+        // computed-checksum path below.
+        // #2624: new sidecar writes on cloud land at the repo-scoped key,
+        // which embeds this repository's id and therefore needs no catalog
+        // attribution gate — it cannot name another repository's object.
+        let key_scheme = crate::storage::StorageKeyScheme::from_env();
         if checksum_compute_eligible(&repo.repo_type) {
+            if let Some(scoped_key) =
+                key_scheme.scoped_read_key(&repo.storage_backend, "maven", repo.id, &path)
+            {
+                if let Ok(content) = storage.get(&scoped_key).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+            }
+        }
+        let checksum_storage_key = format!("maven/{}", path);
+        if checksum_compute_eligible(&repo.repo_type)
+            && crate::services::maven_flat_attribution::flat_key_readable(
+                &state.db,
+                repo.id,
+                &repo.storage_backend,
+                &checksum_storage_key,
+            )
+            .await
+        {
             // First try to find a stored checksum file
-            let checksum_storage_key = format!("maven/{}", path);
             if let Ok(content) = storage.get(&checksum_storage_key).await {
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -884,17 +1074,45 @@ async fn download(
         }
 
         // If this is a SNAPSHOT path, try the stored checksum under the
-        // timestamp-resolved filename before falling through to compute.
+        // timestamp-resolved filename before falling through to compute. Same
+        // shared-namespace hazard as above: the sidecar key is unanchored, so it
+        // is served only to its attributed owner (#2504, #2574).
         if base_path.contains("-SNAPSHOT") {
             if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, base_path).await {
-                let resolved_checksum_key =
-                    format!("maven/{}.{}", resolved.path, checksum_suffix(checksum_type));
-                if let Ok(content) = storage.get(&resolved_checksum_key).await {
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "text/plain")
-                        .body(Body::from(content))
-                        .unwrap());
+                let resolved_sidecar_path =
+                    format!("{}.{}", resolved.path, checksum_suffix(checksum_type));
+                // Repo-scoped candidate first (#2624): physically owned by
+                // this repository, no attribution gate needed.
+                if let Some(scoped_key) = key_scheme.scoped_read_key(
+                    &repo.storage_backend,
+                    "maven",
+                    repo.id,
+                    &resolved_sidecar_path,
+                ) {
+                    if let Ok(content) = storage.get(&scoped_key).await {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/plain")
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
+                }
+                let resolved_checksum_key = format!("maven/{}", resolved_sidecar_path);
+                if crate::services::maven_flat_attribution::flat_key_readable(
+                    &state.db,
+                    repo.id,
+                    &repo.storage_backend,
+                    &resolved_checksum_key,
+                )
+                .await
+                {
+                    if let Ok(content) = storage.get(&resolved_checksum_key).await {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/plain")
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
                 }
             }
         }
@@ -921,15 +1139,16 @@ async fn download(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, _content_type) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    &path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await?;
+                let (content, _content_type, _budget_permit) =
+                    proxy_helpers::proxy_fetch_capped_budgeted(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        upstream_url,
+                        &path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                    )
+                    .await?;
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "text/plain")
@@ -960,15 +1179,16 @@ async fn download(
                     if let (Some(ref upstream_url), Some(ref proxy)) =
                         (&member.upstream_url, &state.proxy_service)
                     {
-                        if let Ok((content, _)) = proxy_helpers::proxy_fetch_capped(
-                            proxy,
-                            member.id,
-                            &member.key,
-                            upstream_url,
-                            &path,
-                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                        )
-                        .await
+                        if let Ok((content, _, _budget_permit)) =
+                            proxy_helpers::proxy_fetch_capped_budgeted(
+                                proxy,
+                                member.id,
+                                &member.key,
+                                upstream_url,
+                                &path,
+                                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                            )
+                            .await
                         {
                             return Ok(Response::builder()
                                 .status(StatusCode::OK)
@@ -1020,7 +1240,7 @@ async fn fetch_remote_member_metadata(
     }
     let upstream_url = member.upstream_url.as_deref()?;
     let proxy = state.proxy_service.as_ref()?;
-    let (content, _) = proxy_helpers::proxy_fetch_capped(
+    let (content, _, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
         proxy,
         member.id,
         &member.key,
@@ -1031,6 +1251,48 @@ async fn fetch_remote_member_metadata(
     .await
     .ok()?;
     std::str::from_utf8(&content).ok().map(|s| s.to_string())
+}
+
+/// Read a Local/Staging virtual member's stored metadata document at `path`.
+///
+/// Tries the member's repo-scoped key first (#2624) — the key embeds the
+/// member's repository id, so it is physically owned and needs no catalog
+/// attribution gate — then falls back to the legacy flat `maven/{path}` key.
+/// On shared cloud namespaces the flat key is served only when the catalog
+/// attributes it to the member (#2504, #2574). Scoped to `member.id`, both
+/// reads compose with the #1804 member authorization done by the caller.
+async fn read_member_stored_metadata(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    path: &str,
+) -> Option<String> {
+    let member_storage = state.storage_for_repo(&member.storage_location()).ok()?;
+    if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env().scoped_read_key(
+        &member.storage_backend,
+        "maven",
+        member.id,
+        path,
+    ) {
+        if let Ok(content) = member_storage.get(&scoped_key).await {
+            if let Ok(s) = std::str::from_utf8(&content) {
+                return Some(s.to_string());
+            }
+        }
+    }
+    let member_storage_key = format!("maven/{}", path);
+    if crate::services::maven_flat_attribution::flat_key_readable(
+        &state.db,
+        member.id,
+        &member.storage_backend,
+        &member_storage_key,
+    )
+    .await
+    {
+        if let Ok(content) = member_storage.get(&member_storage_key).await {
+            return std::str::from_utf8(&content).ok().map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 async fn fetch_maven_metadata_bytes(
@@ -1046,7 +1308,7 @@ async fn fetch_maven_metadata_bytes(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, _) = proxy_helpers::proxy_fetch_capped(
+            let (content, _, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
                 proxy,
                 repo.id,
                 repo_key,
@@ -1068,72 +1330,97 @@ async fn fetch_maven_metadata_bytes(
                 .await;
 
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
-            let mut all_versions: Vec<String> = Vec::new();
-            // Newest `<lastUpdated>` reported by any member. Reused for the
-            // merged body so it is byte-identical across the separate metadata
-            // and checksum requests (#1922) instead of a per-request wall clock.
-            let mut max_last_updated: Option<String> = None;
+            let cache_key: VirtualMetadataCacheKey =
+                (repo.id, group_id.clone(), artifact_id.clone());
 
-            // Fan out across members CONCURRENTLY (#2069) in priority-order
-            // batches of at most `MAX_VIRTUAL_FANOUT`: Remote members proxy their
-            // metadata from upstream, Local/Staging members generate it from
-            // artifact rows. Batching bounds concurrent upstream connections;
-            // `join_all` preserves within-batch (member) order.
-            for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
-                let member_docs = futures::future::join_all(chunk.iter().map(|member| async {
-                    if member.repo_type == RepositoryType::Remote {
-                        fetch_remote_member_metadata(state, member, path).await
-                    } else {
-                        generate_metadata_for_artifact(
-                            &state.db,
-                            member.id,
-                            &group_id,
-                            &artifact_id,
-                        )
-                        .await
-                        .ok()
-                    }
-                }))
-                .await;
-                for xml in member_docs.into_iter().flatten() {
-                    if let Some(ts) = crate::formats::maven::parse_metadata_last_updated(&xml) {
-                        if max_last_updated.as_deref() < Some(ts.as_str()) {
-                            max_last_updated = Some(ts);
+            // Consult the GA-level merge cache before iterating members (#2302).
+            // A hit — including a definitive `Some(None)` empty-merge — skips the
+            // fan-out entirely; a miss runs the merge below and stores its result.
+            let ga_merge: Option<Bytes> = match VIRTUAL_MAVEN_METADATA_CACHE.get(&cache_key).await {
+                Some(cached) => cached,
+                None => {
+                    let mut all_versions: Vec<String> = Vec::new();
+                    // Newest `<lastUpdated>` reported by any member. Reused for the
+                    // merged body so it is byte-identical across the separate metadata
+                    // and checksum requests (#1922) instead of a per-request wall clock.
+                    let mut max_last_updated: Option<String> = None;
+
+                    // Fan out across members CONCURRENTLY (#2069) in priority-order
+                    // batches of at most `MAX_VIRTUAL_FANOUT`: Remote members proxy their
+                    // metadata from upstream, Local/Staging members generate it from
+                    // artifact rows. Batching bounds concurrent upstream connections;
+                    // `join_all` preserves within-batch (member) order.
+                    for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+                        let member_docs =
+                            futures::future::join_all(chunk.iter().map(|member| async {
+                                if member.repo_type == RepositoryType::Remote {
+                                    fetch_remote_member_metadata(state, member, path).await
+                                } else {
+                                    generate_metadata_for_artifact(
+                                        &state.db,
+                                        member.id,
+                                        &group_id,
+                                        &artifact_id,
+                                    )
+                                    .await
+                                    .ok()
+                                }
+                            }))
+                            .await;
+                        for xml in member_docs.into_iter().flatten() {
+                            if let Some(ts) =
+                                crate::formats::maven::parse_metadata_last_updated(&xml)
+                            {
+                                if max_last_updated.as_deref() < Some(ts.as_str()) {
+                                    max_last_updated = Some(ts);
+                                }
+                            }
+                            if let Some((_, _, versions)) =
+                                crate::formats::maven::parse_metadata_versions(&xml)
+                            {
+                                all_versions.extend(versions);
+                            }
                         }
                     }
-                    if let Some((_, _, versions)) =
-                        crate::formats::maven::parse_metadata_versions(&xml)
-                    {
-                        all_versions.extend(versions);
-                    }
+
+                    let merged = if all_versions.is_empty() {
+                        None
+                    } else {
+                        all_versions.sort();
+                        all_versions.dedup();
+
+                        use crate::formats::maven_version;
+                        let sorted = maven_version::sort_maven_versions(&all_versions);
+                        let latest = sorted.last().unwrap().clone();
+                        let release = maven_version::latest_release(&sorted).cloned();
+
+                        // Reuse the newest member `<lastUpdated>` so the merged body is
+                        // reproducible across the separate metadata and checksum
+                        // requests (#1922); fall back to wall clock only if no member
+                        // reported one (e.g. all-remote members omitting the element).
+                        let last_updated = max_last_updated.unwrap_or_else(|| {
+                            chrono::Utc::now().format("%Y%m%d%H%M%S").to_string()
+                        });
+                        let xml = generate_metadata_xml(
+                            &group_id,
+                            &artifact_id,
+                            &sorted,
+                            &latest,
+                            release.as_deref(),
+                            &last_updated,
+                        );
+                        Some(Bytes::from(xml))
+                    };
+
+                    VIRTUAL_MAVEN_METADATA_CACHE
+                        .insert(cache_key, merged.clone())
+                        .await;
+                    merged
                 }
-            }
+            };
 
-            if !all_versions.is_empty() {
-                all_versions.sort();
-                all_versions.dedup();
-
-                use crate::formats::maven_version;
-                let sorted = maven_version::sort_maven_versions(&all_versions);
-                let latest = sorted.last().unwrap().clone();
-                let release = maven_version::latest_release(&sorted).cloned();
-
-                // Reuse the newest member `<lastUpdated>` so the merged body is
-                // reproducible across the separate metadata and checksum
-                // requests (#1922); fall back to wall clock only if no member
-                // reported one (e.g. all-remote members omitting the element).
-                let last_updated = max_last_updated
-                    .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d%H%M%S").to_string());
-                let xml = generate_metadata_xml(
-                    &group_id,
-                    &artifact_id,
-                    &sorted,
-                    &latest,
-                    release.as_deref(),
-                    &last_updated,
-                );
-
-                return Ok(Bytes::from(xml));
+            if let Some(xml) = ga_merge {
+                return Ok(xml);
             }
 
             // Group-level plugin-prefix metadata (#1595). A path like
@@ -1149,20 +1436,13 @@ async fn fetch_maven_metadata_bytes(
             let mut member_docs: Vec<String> = Vec::new();
             for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
                 let batch = futures::future::join_all(chunk.iter().map(|member| async {
+                    // Stored-document read: repo-scoped key first, then the
+                    // attribution-gated legacy flat key (#2624, #2504, #2574);
+                    // see `read_member_stored_metadata`.
                     if member.repo_type == RepositoryType::Remote {
                         fetch_remote_member_metadata(state, member, path).await
                     } else {
-                        let member_storage_key = format!("maven/{}", path);
-                        match state.storage_for_repo(&member.storage_location()) {
-                            Ok(member_storage) => {
-                                member_storage.get(&member_storage_key).await.ok().and_then(
-                                    |content| {
-                                        std::str::from_utf8(&content).ok().map(|s| s.to_string())
-                                    },
-                                )
-                            }
-                            Err(_) => None,
-                        }
+                        read_member_stored_metadata(state, member, path).await
                     }
                 }))
                 .await;
@@ -1194,15 +1474,14 @@ async fn fetch_maven_metadata_bytes(
                             entries.extend(parse_snapshot_versions_xml(&xml_str));
                         }
                     } else {
-                        let member_storage_key = format!("maven/{}", path);
-                        if let Ok(member_storage) =
-                            state.storage_for_repo(&member.storage_location())
+                        // Stored-document read: repo-scoped key first, then the
+                        // attribution-gated legacy flat key (#2624, #2504,
+                        // #2574); see `read_member_stored_metadata`. A miss
+                        // falls through to the row-scoped snapshot entries.
+                        if let Some(xml_str) =
+                            read_member_stored_metadata(state, member, path).await
                         {
-                            if let Ok(content) = member_storage.get(&member_storage_key).await {
-                                if let Ok(xml_str) = std::str::from_utf8(&content) {
-                                    entries.extend(parse_snapshot_versions_xml(xml_str));
-                                }
-                            }
+                            entries.extend(parse_snapshot_versions_xml(&xml_str));
                         }
                         entries.extend(
                             collect_snapshot_entries(
@@ -1240,9 +1519,38 @@ async fn fetch_maven_metadata_bytes(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
+    // The stored maven-metadata.xml read fetches a bare `maven/<path>` key with
+    // no artifact row scoped to the caller's repository. On repo-isolated
+    // (filesystem) backends that is always sound; on shared cloud namespaces the
+    // same key could hold a *different* repository's metadata, so the stored
+    // document is served only when the catalog attributes the key to this
+    // repository (#2504, #2574). This keeps a deliberately-uploaded verbatim
+    // document authoritative for its owner instead of degrading to the dynamic
+    // generation below, while foreign/unattributed keys fall through.
+    // Repo-scoped candidate first (#2624): the key embeds this repository's
+    // id, so no attribution gate is needed for it.
+    if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env().scoped_read_key(
+        &repo.storage_backend,
+        "maven",
+        repo.id,
+        path,
+    ) {
+        if let Ok(content) = storage.get(&scoped_key).await {
+            return Ok(content);
+        }
+    }
     let meta_storage_key = format!("maven/{}", path);
-    if let Ok(content) = storage.get(&meta_storage_key).await {
-        return Ok(content);
+    if crate::services::maven_flat_attribution::flat_key_readable(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        &meta_storage_key,
+    )
+    .await
+    {
+        if let Ok(content) = storage.get(&meta_storage_key).await {
+            return Ok(content);
+        }
     }
 
     if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
@@ -1422,6 +1730,23 @@ async fn serve_artifact(
                     let storage = state
                         .storage_for_repo(&repo.storage_location())
                         .map_err(|e| e.into_response())?;
+
+                    // #1945: redirect eligible SNAPSHOT blob binaries to a
+                    // presigned URL (records the download before the 302);
+                    // non-blob SNAPSHOT files and filesystem backends stream.
+                    if let Some(redirect) = proxy_helpers::try_hosted_blob_redirect(
+                        state,
+                        storage.as_ref(),
+                        path,
+                        &resolved.storage_key,
+                        resolved.id,
+                        ctx,
+                    )
+                    .await
+                    {
+                        return Ok(redirect);
+                    }
+
                     let content = storage
                         .get(&resolved.storage_key)
                         .await
@@ -1622,13 +1947,53 @@ async fn serve_artifact(
             // uploads started indexing every physical asset as an artifact row.
             // Direct byte access remains available for those older companion
             // files while new uploads resolve through the exact `artifacts.path`.
+            //
+            // This fallback reads a bare `maven/{path}` key with no artifact row
+            // scoped to the caller's repository. On backends that physically
+            // isolate each repository's key space (filesystem, rooted at the
+            // repo's storage_path) that is always sound. On shared cloud
+            // namespaces (S3/GCS/Azure) the same flat key can belong to a
+            // *different* repository, so the fallback runs only when the catalog
+            // attributes the key to this repository (#2504, #2574 — the same
+            // ownership rule as the write guard). A foreign-owned or
+            // unattributed key 404s rather than serving another repo's bytes.
+            // Repo-scoped candidate first (#2624): row-less sidecars written
+            // under the scoped scheme (checksums, verbatim metadata) live at
+            // `maven/{repo.id}/{path}`. The key embeds this repository's id,
+            // so it needs no attribution gate.
             if repo.repo_type == RepositoryType::Local || repo.repo_type == RepositoryType::Staging
+            {
+                if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env()
+                    .scoped_read_key(&repo.storage_backend, "maven", repo.id, path)
+                {
+                    let storage = state
+                        .storage_for_repo(&repo.storage_location())
+                        .map_err(|e| e.into_response())?;
+                    if let Ok(stream) = storage.get_stream(&scoped_key).await {
+                        let ct = content_type_for_path(path);
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, ct)
+                            .body(Body::from_stream(stream))
+                            .unwrap());
+                    }
+                }
+            }
+            let legacy_storage_key = format!("maven/{}", path);
+            if (repo.repo_type == RepositoryType::Local
+                || repo.repo_type == RepositoryType::Staging)
+                && crate::services::maven_flat_attribution::flat_key_readable(
+                    &state.db,
+                    repo.id,
+                    &repo.storage_backend,
+                    &legacy_storage_key,
+                )
+                .await
             {
                 let storage = state
                     .storage_for_repo(&repo.storage_location())
                     .map_err(|e| e.into_response())?;
-                let storage_key = format!("maven/{}", path);
-                if let Ok(stream) = storage.get_stream(&storage_key).await {
+                if let Ok(stream) = storage.get_stream(&legacy_storage_key).await {
                     let ct = content_type_for_path(path);
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
@@ -1650,6 +2015,25 @@ async fn serve_artifact(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+
+    // #1945: offload large hosted blob binaries (.jar/.war/.aar/.zip/.tar.gz/
+    // .jmod) to a presigned S3 redirect instead of streaming them through the
+    // backend process. POM/module/metadata (non-blob extensions) and filesystem
+    // backends fall through to the inline stream below. The helper records the
+    // download before issuing the 302 (count-at-redirect, #2260).
+    if let Some(redirect) = proxy_helpers::try_hosted_blob_redirect(
+        state,
+        storage.as_ref(),
+        path,
+        &artifact.storage_key,
+        artifact.id,
+        ctx,
+    )
+    .await
+    {
+        return Ok(redirect);
+    }
+
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
@@ -1893,11 +2277,11 @@ async fn upload(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: read-scoped API tokens were being accepted on
     // this push endpoint. Require the write scope before doing any work.
-    let auth = require_auth_basic_scope(auth, "maven", "write")?;
+    let auth = require_auth_basic_scope(auth, "maven", "write:artifacts")?;
     let user_id = auth.user_id;
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
 
@@ -1916,29 +2300,110 @@ async fn upload(
     .unwrap_or(false);
     proxy_helpers::reject_direct_upload_if_promotion_only(promotion_only, auth.is_admin)?;
 
-    let storage_key = format!("maven/{}", path);
+    // #2624: on shared cloud namespaces new objects are written under a
+    // repository-scoped key (`maven/{repository_id}/{path}`) so the physical
+    // key can never collide with — or be claimed by — another repository.
+    // Filesystem backends and the `STORAGE_KEY_SCHEME=flat` opt-out keep the
+    // legacy `maven/{path}` shape. Existing objects are untouched: their
+    // artifact rows still carry the flat key they were written under, and the
+    // derived-read sites fall back to the flat key.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "maven",
+        repo.id,
+        &path,
+    );
+    // Guard every flat-key write before it reaches storage (#2584). On a shared
+    // cloud namespace this refuses to overwrite a *different* repository's object
+    // living at this exact key (403). A repo-scoped key embeds this repository's
+    // id and can never be foreign-owned, so the guard passes trivially there.
+    // It is a READ-ONLY check: it must not
+    // attribute the key here, because this runs before the bytes are written and
+    // before coordinate parsing/validation that can still reject the request --
+    // claiming here would flip ownership of a foreign *unattributed* key on any
+    // aborted write and leak the victim's bytes (V3b). The attribution claim is
+    // committed only after a successful `storage.put`, per branch below.
+    crate::services::maven_flat_attribution::guard_flat_key_writable(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        &storage_key,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
 
-    // If this is a checksum file (.sha1, .md5, .sha256), just store it and return
+    // Stream the request body to a bounded scratch file, computing
+    // SHA-256/SHA-1/MD5 in one pass — never buffering the artifact in memory
+    // (#2517). All three branches below (checksum sidecar, maven-metadata.xml,
+    // and the artifact itself) store from the staged file. The stager enforces
+    // `max_upload_size_bytes` mid-stream (413 on breach).
+    let (staged, digests) =
+        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+
+    // If this is a checksum file (.sha1, .md5, .sha256), just store it and return.
+    // These row-less puts create no artifact row, so attribution is committed
+    // here -- only after the object bytes are durably written (#2574, V3b).
     if parse_checksum_path(&path).is_some() {
-        storage
-            .put(&storage_key, body)
-            .await
-            .map_err(map_storage_err)?;
+        // Atomically claim the flat key BEFORE writing its bytes: exactly one
+        // concurrent first-publisher wins, the rest are refused, so the stored
+        // bytes and the attributed owner can never disagree (#2586). Release the
+        // freshly-inserted claim if the put itself fails (V3b). The staged
+        // stream is opened first so a local scratch-file failure never claims.
+        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+        let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
+            &state.db,
+            repo.id,
+            &repo.storage_backend,
+            &storage_key,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
+        if let Err(e) = storage.put_stream(&storage_key, stream).await {
+            release_flat_key_claim_best_effort(
+                &state.db,
+                claim,
+                repo.id,
+                &repo.storage_backend,
+                &storage_key,
+            )
+            .await;
+            return Err(map_storage_err(e));
+        }
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
             .unwrap());
     }
 
-    // If this is a maven-metadata.xml upload, just store it
+    // If this is a maven-metadata.xml upload, just store it. Row-less put: same
+    // claim-on-write-success rule as the checksum branch (#2574, V3b).
     if MavenHandler::is_metadata(&path) {
-        storage
-            .put(&storage_key, body)
-            .await
-            .map_err(map_storage_err)?;
+        // Row-less metadata put: atomic claim-gate before the write, same as the
+        // checksum branch (#2586); release on put failure (V3b). Staged stream
+        // opened first so a local scratch-file failure never claims.
+        let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+        let claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
+            &state.db,
+            repo.id,
+            &repo.storage_backend,
+            &storage_key,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
+        if let Err(e) = storage.put_stream(&storage_key, stream).await {
+            release_flat_key_claim_best_effort(
+                &state.db,
+                claim,
+                repo.id,
+                &repo.storage_backend,
+                &storage_key,
+            )
+            .await;
+            return Err(map_storage_err(e));
+        }
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -1949,17 +2414,15 @@ async fn upload(
     let coords = MavenHandler::parse_coordinates(&path)
         .map_err(|e| AppError::Validation(format!("Invalid Maven path: {}", e)).into_response())?;
 
-    // Compute checksums for the canonical artifact row. Maven checksum
-    // sidecars are stored separately, but the artifact ledger should still
-    // carry the common digests so checksum search, replication, and API
-    // responses have the same fidelity as generic uploads.
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let checksum_sha256 = format!("{:x}", hasher.finalize());
-    let checksum_sha1 = compute_checksum(&body, ChecksumType::Sha1);
-    let checksum_md5 = compute_checksum(&body, ChecksumType::Md5);
+    // Content digests for the canonical artifact row come from the single
+    // streaming stage pass. Maven checksum sidecars are stored separately, but
+    // the artifact ledger still carries the common digests so checksum search,
+    // replication, and API responses have the same fidelity as generic uploads.
+    let checksum_sha256 = digests.sha256.clone();
+    let checksum_sha1 = digests.sha1.clone();
+    let checksum_md5 = digests.md5.clone();
 
-    let size_bytes = body.len() as i64;
+    let size_bytes = staged.size_bytes();
     let ct = content_type_for_path(&path);
 
     // Check for active (non-deleted) duplicate
@@ -2001,24 +2464,64 @@ async fn upload(
         .map_err(|e| e.into_response())?;
     }
 
-    // Store file in object storage regardless of grouping outcome
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(map_storage_err)?;
+    // Atomically claim the flat key BEFORE writing its bytes so that of two
+    // concurrent first-publishers of the same key exactly one proceeds and the
+    // other is refused (#2586). This runs after coordinate parsing + the
+    // duplicate check, so an invalid/aborted request never claims (V3b); if the
+    // put fails, the freshly-inserted claim is released below. The staged
+    // stream is opened first so a local scratch-file failure never claims.
+    let stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+    let flat_key_claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        &storage_key,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
-    // Build metadata JSON for this physical Maven file.
+    // Store file in object storage regardless of grouping outcome — streamed
+    // from the staged scratch file, not a heap buffer (#2517).
+    if let Err(e) = storage.put_stream(&storage_key, stream).await {
+        release_flat_key_claim_best_effort(
+            &state.db,
+            flat_key_claim,
+            repo.id,
+            &repo.storage_backend,
+            &storage_key,
+        )
+        .await;
+        return Err(map_storage_err(e));
+    }
+
+    // Build metadata JSON for this physical Maven file. `parse_metadata` only
+    // inspects the body for POM files (small XML); every other maven file (jars,
+    // ...) derives its metadata from the coordinates alone. Read the small POM
+    // back from the staged file; skip the read entirely for everything else so a
+    // large artifact is never materialised in memory.
     let handler = MavenHandler::new();
-    let mut file_metadata = crate::formats::FormatHandler::parse_metadata(&handler, &path, &body)
-        .await
-        .unwrap_or_else(|_| {
-            serde_json::json!({
-                "groupId": coords.group_id,
-                "artifactId": coords.artifact_id,
-                "version": coords.version,
-                "extension": coords.extension,
-            })
-        });
+    let pom_bytes = if MavenHandler::is_pom(&path) {
+        Bytes::from(
+            tokio::fs::read(staged.path())
+                .await
+                .map_err(|e| proxy_helpers::internal_error("Reading staged POM", e))?,
+        )
+    } else {
+        Bytes::new()
+    };
+    // Scratch file no longer needed once the object is stored and any POM read.
+    drop(staged);
+    let mut file_metadata =
+        crate::formats::FormatHandler::parse_metadata(&handler, &path, &pom_bytes)
+            .await
+            .unwrap_or_else(|_| {
+                serde_json::json!({
+                    "groupId": coords.group_id,
+                    "artifactId": coords.artifact_id,
+                    "version": coords.version,
+                    "extension": coords.extension,
+                })
+            });
 
     let name = coords.artifact_id.clone();
     let package_name = maven_package_name(&coords);
@@ -2068,6 +2571,13 @@ async fn upload(
         .fetch_one(&state.db)
         .await
         .map_err(map_db_err)?;
+
+    // The durable attribution claim for this key was already committed by the
+    // atomic `claim_flat_key_for_write` gate above (before the put), so it is
+    // not re-inserted here. The live `artifacts` row also attributes the key
+    // (resolution layer (a)); the durable claim additionally keeps ownership
+    // after a later soft-delete of the row, matching the #2504 write guard's
+    // soft-delete awareness.
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
@@ -2551,7 +3061,10 @@ mod tests {
     // build_maven_storage_key
     // -----------------------------------------------------------------------
 
-    /// Build the Maven storage key from a raw path.
+    /// Build the LEGACY flat Maven storage key from a raw path — the shape
+    /// used on repo-isolated (filesystem) backends and under
+    /// `STORAGE_KEY_SCHEME=flat`. Cloud writes under the default repo-scoped
+    /// scheme use `StorageKeyScheme::write_key` instead (#2624).
     fn build_maven_storage_key(path: &str) -> String {
         format!("maven/{}", path)
     }
@@ -2614,6 +3127,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.repo_type, "hosted");
@@ -2632,6 +3147,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
@@ -3536,6 +4053,203 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #2624: on a shared cloud namespace (registered "s3" backend) Maven
+    /// uploads must write REPO-SCOPED storage keys (`maven/{repo_id}/{path}`)
+    /// so the same coordinate in two repositories can never collide on one
+    /// physical object — and every read path (row-anchored artifact download,
+    /// row-less checksum sidecar, verbatim maven-metadata.xml) must resolve
+    /// the scoped object back.
+    #[tokio::test]
+    async fn test_cloud_upload_uses_repo_scoped_key_2624() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        // -- Artifact upload lands at the repo-scoped key, and ONLY there.
+        let path = "com/example/scoped2624/demo/1.0.0/demo-1.0.0.jar";
+        let jar = bytes::Bytes::from_static(b"scoped-jar-bytes-2624");
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{path}"), jar.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "PUT failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let scoped_key = format!("maven/{repo_id}/{path}");
+        let db_key: String = sqlx::query_scalar(
+            "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(&pool)
+        .await
+        .expect("artifact row");
+        assert_eq!(
+            db_key, scoped_key,
+            "artifact row must record the repo-scoped physical key"
+        );
+        {
+            let objects = mem.objects.lock().unwrap();
+            assert!(
+                objects.contains_key(&scoped_key),
+                "bytes must live at the repo-scoped key"
+            );
+            assert!(
+                !objects.contains_key(&format!("maven/{path}")),
+                "the legacy flat key must NOT be written"
+            );
+        }
+
+        // -- Row-anchored download resolves the recorded scoped key.
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, jar);
+
+        // -- Row-less checksum sidecar: stored scoped, served via the scoped
+        //    read candidate (no attribution row needed).
+        let sha1_path = format!("{path}.sha1");
+        let sha1 = bytes::Bytes::from_static(b"da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        let (status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{sha1_path}"), sha1.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(mem
+            .objects
+            .lock()
+            .unwrap()
+            .contains_key(&format!("maven/{repo_id}/{sha1_path}")));
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{sha1_path}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, sha1);
+
+        // -- Verbatim maven-metadata.xml round-trips through the scoped key.
+        let meta_path = "com/example/scoped2624/demo/maven-metadata.xml";
+        let meta = bytes::Bytes::from_static(
+            b"<metadata><groupId>com.example.scoped2624</groupId>\
+              <artifactId>demo</artifactId><versioning><versions>\
+              <version>1.0.0</version></versions></versioning></metadata>",
+        );
+        let (status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{repo_key}/{meta_path}"), meta.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(mem
+            .objects
+            .lock()
+            .unwrap()
+            .contains_key(&format!("maven/{repo_id}/{meta_path}")));
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{meta_path}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, meta);
+
+        let _ = sqlx::query("DELETE FROM maven_flat_object_owner WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #2624 back-compat: objects stored under the LEGACY flat scheme
+    /// (`maven/{path}`) must stay readable after the repo-scoped scheme takes
+    /// over new writes — row-anchored artifacts through the storage_key their
+    /// row recorded, and row-less sidecars through the attribution-gated flat
+    /// fallback (owner inherited from the base artifact row). Nothing is
+    /// re-keyed or stranded.
+    #[tokio::test]
+    async fn test_cloud_legacy_flat_keys_still_served_2624() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set cloud backend");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let router =
+            tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+
+        // Seed a pre-scheme artifact: bytes at the FLAT key, row recording it.
+        let path = "com/example/legacy2624/old/1.0.0/old-1.0.0.jar";
+        let flat_key = format!("maven/{path}");
+        let jar = bytes::Bytes::from_static(b"legacy-flat-jar-bytes-2624");
+        mem.objects
+            .lock()
+            .unwrap()
+            .insert(flat_key.clone(), jar.clone());
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key, uploaded_by) \
+             VALUES ($1, $2, 'old', '1.0.0', $3, $4, 'application/java-archive', $5, $6)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(jar.len() as i64)
+        .bind("ab".repeat(32))
+        .bind(&flat_key)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("seed legacy artifact row");
+
+        // Row-anchored read: served through the row's recorded flat key.
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, jar);
+
+        // Row-less legacy sidecar at the flat key: the scoped candidate
+        // misses, and the flat fallback serves it because attribution
+        // inherits the base artifact row's owner (#2504/#2574 rules intact).
+        let sha1_flat_key = format!("{flat_key}.sha1");
+        let sha1 = bytes::Bytes::from_static(b"cafebabecafebabecafebabecafebabecafebabe");
+        mem.objects
+            .lock()
+            .unwrap()
+            .insert(sha1_flat_key, sha1.clone());
+        let (status, body) =
+            tdh::send(router.clone(), tdh::get(format!("/{repo_key}/{path}.sha1"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, sha1);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
     /// Direct Maven uploads bypass the generic ArtifactService upload path, so
     /// the Maven handler must explicitly fan out peer sync tasks for each
     /// physical artifact row it creates.
@@ -4305,7 +5019,7 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), path.to_string())),
             axum::http::HeaderMap::new(),
-            bytes::Bytes::copy_from_slice(body),
+            axum::body::Body::from(body.to_vec()),
         )
         .await
         .expect("upload must succeed");
@@ -4725,6 +5439,70 @@ mod tests {
         );
     }
 
+    // -- #2302: in-process virtual-repo metadata merge cache --------------
+
+    #[tokio::test]
+    async fn test_virtual_maven_metadata_cache_caches_positive_result() {
+        let repo_id = Uuid::new_v4();
+        let group = format!("g-{}", Uuid::new_v4());
+        let artifact = format!("a-{}", Uuid::new_v4());
+        let key: VirtualMetadataCacheKey = (repo_id, group.clone(), artifact.clone());
+        VIRTUAL_MAVEN_METADATA_CACHE
+            .insert(key.clone(), Some(Bytes::from_static(b"<merged/>")))
+            .await;
+        let cached = VIRTUAL_MAVEN_METADATA_CACHE.get(&key).await;
+        assert!(
+            matches!(cached, Some(Some(_))),
+            "Some(Some(_)) on a positive cache entry"
+        );
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key).await;
+    }
+
+    #[tokio::test]
+    async fn test_virtual_maven_metadata_cache_caches_definitive_miss() {
+        let repo_id = Uuid::new_v4();
+        let key: VirtualMetadataCacheKey = (repo_id, "g".to_string(), "a".to_string());
+        VIRTUAL_MAVEN_METADATA_CACHE.insert(key.clone(), None).await;
+        let cached = VIRTUAL_MAVEN_METADATA_CACHE.get(&key).await;
+        assert!(
+            matches!(cached, Some(None)),
+            "Some(None) signals a known-empty merge (do not re-iterate members)"
+        );
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key).await;
+    }
+
+    #[tokio::test]
+    async fn test_virtual_maven_metadata_cache_isolates_keys() {
+        let repo_id = Uuid::new_v4();
+        let key_a: VirtualMetadataCacheKey = (repo_id, "g1".to_string(), "a1".to_string());
+        let key_b: VirtualMetadataCacheKey = (repo_id, "g2".to_string(), "a2".to_string());
+        VIRTUAL_MAVEN_METADATA_CACHE
+            .insert(key_a.clone(), Some(Bytes::from_static(b"a")))
+            .await;
+        VIRTUAL_MAVEN_METADATA_CACHE
+            .insert(key_b.clone(), Some(Bytes::from_static(b"b")))
+            .await;
+        assert_eq!(
+            VIRTUAL_MAVEN_METADATA_CACHE
+                .get(&key_a)
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"a"),
+        );
+        assert_eq!(
+            VIRTUAL_MAVEN_METADATA_CACHE
+                .get(&key_b)
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"b"),
+        );
+        assert_ne!(key_a, key_b);
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key_a).await;
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key_b).await;
+    }
+
     /// #2328: a local member owning ONE version of a Maven coordinate must
     /// not shadow the virtual repo's remote members for OTHER versions of
     /// the same coordinate. The GA-granular shadowing guard suppressed the
@@ -5018,6 +5796,185 @@ mod maven_prefix_reserved_tests {
             !fx.storage_dir.join("maven").exists(),
             "remote proxy checksum probe must not create anything under maven/ (#1547)"
         );
+        fx.teardown().await;
+    }
+
+    #[test]
+    fn test_maven_metadata_object_path_maps_group_dots_to_slashes() {
+        assert_eq!(
+            super::maven_metadata_object_path("com.example.del", "demo-lib"),
+            "com/example/del/demo-lib/maven-metadata.xml"
+        );
+        // Single-segment group id.
+        assert_eq!(
+            super::maven_metadata_object_path("acme", "widget"),
+            "acme/widget/maven-metadata.xml"
+        );
+    }
+
+    /// #2845 regression. `mvn deploy` uploads a verbatim `maven-metadata.xml`
+    /// which the download path serves in preference to dynamic generation. When
+    /// a version is deleted, that stored document is stale and keeps advertising
+    /// the removed version; clearing it (the delete handler now does) makes the
+    /// next GET regenerate the version list from the live (non-deleted) rows.
+    #[tokio::test]
+    async fn test_delete_clears_stored_metadata_so_version_disappears() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let router = fx.router_with_auth(super::router());
+        let pom = |v: &str| {
+            bytes::Bytes::from(format!(
+                r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example.del</groupId>
+  <artifactId>demo</artifactId>
+  <version>{v}</version>
+</project>"#
+            ))
+        };
+
+        // Publish two release versions (each creates an artifacts row).
+        for v in ["1.0.0", "2.0.0"] {
+            let path = format!("com/example/del/demo/{v}/demo-{v}.pom");
+            let (status, body) = tdh::send(
+                router.clone(),
+                tdh::put(format!("/{}/{}", fx.repo_key, path), pom(v)),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "publish {v} must succeed; body={}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // Publish the verbatim group/artifact maven-metadata.xml listing both,
+        // exactly as the Maven deploy plugin does.
+        let meta_path = "com/example/del/demo/maven-metadata.xml";
+        let stored_meta = bytes::Bytes::from_static(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.example.del</groupId>
+  <artifactId>demo</artifactId>
+  <versioning>
+    <latest>2.0.0</latest>
+    <release>2.0.0</release>
+    <versions>
+      <version>1.0.0</version>
+      <version>2.0.0</version>
+    </versions>
+    <lastUpdated>20260101000000</lastUpdated>
+  </versioning>
+</metadata>"#,
+        );
+        let (status, _) = tdh::send(
+            router.clone(),
+            tdh::put(format!("/{}/{}", fx.repo_key, meta_path), stored_meta),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "metadata upload must succeed");
+
+        let meta_url = format!("/{}/{}", fx.repo_key, meta_path);
+        let get_meta = |r: axum::Router, url: String| async move {
+            let (status, body) = tdh::send(r, tdh::get(url)).await;
+            (status, String::from_utf8(body.to_vec()).expect("utf-8"))
+        };
+
+        // Baseline: the stored document is served and lists both versions.
+        let (status, xml) = get_meta(router.clone(), meta_url.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            xml.contains("<version>1.0.0</version>"),
+            "baseline lists 1.0.0"
+        );
+        assert!(
+            xml.contains("<version>2.0.0</version>"),
+            "baseline lists 2.0.0"
+        );
+
+        // Soft-delete version 2.0.0 (the DB effect of the web-UI delete).
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(fx.repo_id)
+        .bind("2.0.0")
+        .execute(&fx.pool)
+        .await
+        .expect("soft-delete 2.0.0");
+
+        // Pre-fix behaviour anchor: with the stored document still in place, the
+        // GET keeps advertising the just-deleted 2.0.0 — this is exactly #2845.
+        let (_, xml_stale) = get_meta(router.clone(), meta_url.clone()).await;
+        assert!(
+            xml_stale.contains("<version>2.0.0</version>"),
+            "stored document shadows dynamic generation until it is cleared (#2845)"
+        );
+
+        // The fix: clear the stored document (as the delete handler now does).
+        let repo_info = fx.repo_info("local", None);
+        super::clear_stored_maven_metadata(
+            &fx.state,
+            fx.repo_id,
+            &repo_info.storage_backend,
+            &repo_info.storage_location(),
+            "com.example.del",
+            "demo",
+        )
+        .await;
+
+        // Now the served metadata is regenerated from the live rows: 2.0.0 is
+        // gone and latest/release fall back to 1.0.0.
+        let (status, xml_fixed) = get_meta(router.clone(), meta_url.clone()).await;
+        assert_eq!(status, StatusCode::OK, "metadata still served after delete");
+        assert!(
+            xml_fixed.contains("<version>1.0.0</version>"),
+            "surviving version 1.0.0 still listed"
+        );
+        assert!(
+            !xml_fixed.contains("<version>2.0.0</version>"),
+            "deleted version 2.0.0 must no longer be advertised (#2845); got: {xml_fixed}"
+        );
+        assert!(
+            xml_fixed.contains("<latest>1.0.0</latest>"),
+            "latest updated to surviving version"
+        );
+        assert!(
+            xml_fixed.contains("<release>1.0.0</release>"),
+            "release updated to surviving version"
+        );
+
+        // Delete the last remaining version too: metadata now has no versions
+        // and 404s (empty-metadata handling), instead of serving a stale list.
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(fx.repo_id)
+        .bind("1.0.0")
+        .execute(&fx.pool)
+        .await
+        .expect("soft-delete 1.0.0");
+        super::clear_stored_maven_metadata(
+            &fx.state,
+            fx.repo_id,
+            &repo_info.storage_backend,
+            &repo_info.storage_location(),
+            "com.example.del",
+            "demo",
+        )
+        .await;
+        let (status, _) = get_meta(router.clone(), meta_url.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "with every version deleted the metadata must not resurrect a stale list"
+        );
+
         fx.teardown().await;
     }
 }

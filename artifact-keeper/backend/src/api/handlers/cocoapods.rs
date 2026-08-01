@@ -3,10 +3,23 @@
 //! Implements the endpoints required for CocoaPods pod install and pod push.
 //!
 //! Routes are mounted at `/cocoapods/{repo_key}/...`:
-//!   GET  /cocoapods/{repo_key}/Specs/{name}/{version}/{name}.podspec.json - Get podspec
+//!   GET  /cocoapods/{repo_key}/CocoaPods-version.yml                     - CDN entrypoint
+//!   GET  /cocoapods/{repo_key}/all_pods_versions_{a}_{b}_{c}.txt         - CDN shard index
+//!   GET  /cocoapods/{repo_key}/deprecated_podspecs.txt                   - CDN deprecation list
+//!   GET  /cocoapods/{repo_key}/Specs/{a}/{b}/{c}/{name}/{version}/{name}.podspec.json - Get podspec (CDN)
+//!   GET  /cocoapods/{repo_key}/Specs/{name}/{version}/{name}.podspec.json - Get podspec (flat)
 //!   GET  /cocoapods/{repo_key}/pods/{name}-{version}.tar.gz              - Download pod archive
 //!   POST /cocoapods/{repo_key}/pods                                      - Push pod (auth required)
 //!   GET  /cocoapods/{repo_key}/all_specs                                 - List all specs
+//!
+//! A real CocoaPods client resolves pods over the CDN layout: it probes
+//! `CocoaPods-version.yml` to recognise the URL as a CDN source and to learn the
+//! shard fan-out, reads the pre-rendered `all_pods_versions_*` index for the
+//! shard a pod name hashes into, then fetches the podspec from the MD5-sharded
+//! `Specs/` tree. Those files are generated on demand from the repository's
+//! artifacts; see `crate::formats::cocoapods` for the layout rules. The flat
+//! `Specs/{name}/{version}/...` layout and the `all_specs` JSON listing predate
+//! CDN support and are kept for existing callers.
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -19,12 +32,13 @@ use axum::Router;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::collections::{BTreeMap, BTreeSet};
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
-use crate::formats::cocoapods::CocoaPodsHandler;
+use crate::formats::cocoapods::{self, CocoaPodsHandler};
 use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
@@ -37,11 +51,22 @@ pub fn router() -> Router<SharedState> {
         .route("/:repo_key/pods", post(push_pod))
         // List all specs
         .route("/:repo_key/all_specs", get(all_specs))
-        // Get podspec
+        // CDN entrypoint
         .route(
-            "/:repo_key/Specs/:name/:version/*podspec_file",
-            get(get_podspec),
+            &format!("/:repo_key/{}", cocoapods::CDN_VERSION_FILE),
+            get(cdn_version_file),
         )
+        // CDN deprecation list
+        .route(
+            &format!("/:repo_key/{}", cocoapods::CDN_DEPRECATED_PODSPECS_FILE),
+            get(cdn_deprecated_podspecs),
+        )
+        // CDN shard index (all_pods_versions_{a}_{b}_{c}.txt). The shard is part
+        // of the file name rather than the path, so this is matched as a single
+        // segment and validated in the handler.
+        .route("/:repo_key/:index_file", get(cdn_all_pods_versions))
+        // Get podspec (CDN sharded layout and flat layout, dispatched by shape)
+        .route("/:repo_key/Specs/*spec_path", get(get_podspec))
         // Download pod archive
         .route("/:repo_key/pods/*pod_file", get(download_pod))
 }
@@ -54,24 +79,244 @@ async fn resolve_cocoapods_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo,
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["cocoapods"], "a CocoaPods").await
 }
 
+/// Resolve a repository for a CDN route, which only a hosted repository serves.
+///
+/// The CDN documents are rendered from the repository's own artifacts, so they
+/// only describe a hosted repository truthfully. On a remote (proxy) repository
+/// they would describe whatever happens to be cached: `pod repo add-cdn` would
+/// succeed, and the client would then be told -- with no signal that the catalog
+/// is partial -- that pods which exist upstream do not exist. On a virtual
+/// repository, which owns no artifacts, they would describe an empty repository
+/// even though `download_pod` resolves that repository's members. A 404 is the
+/// honest answer for both: it is what these routes returned before the CDN
+/// layout existed, and it makes `pod repo add-cdn` fail cleanly rather than
+/// register a source that half-works.
+///
+/// Serving an upstream's CDN documents through a proxy repository is a separate
+/// piece of work (it needs pull-through for the index and podspec documents,
+/// not just the pod archives).
+async fn resolve_hosted_cocoapods_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
+    let repo = resolve_cocoapods_repo(db, repo_key).await?;
+    reject_cdn_if_not_hosted(&repo)?;
+    Ok(repo)
+}
+
+/// Refuse a CDN route on a repository that is not hosted (`Local`/`Staging`).
+#[allow(clippy::result_large_err)]
+fn reject_cdn_if_not_hosted(repo: &RepoInfo) -> Result<(), Response> {
+    let hosted =
+        repo.repo_type == RepositoryType::Local || repo.repo_type == RepositoryType::Staging;
+    if hosted {
+        Ok(())
+    } else {
+        Err((StatusCode::NOT_FOUND, "Not found").into_response())
+    }
+}
+
 // ---------------------------------------------------------------------------
+// GET /cocoapods/{repo_key}/CocoaPods-version.yml
+// ---------------------------------------------------------------------------
+//
+// The CDN entrypoint. `pod repo add-cdn`, and the Podfile `source` resolution
+// that follows it, GET this file first: a URL that does not serve it is not
+// treated as a CDN source at all, so every later request is never made. The
+// body tells the client the shard fan-out to use (`prefix_lengths`) and the
+// minimum client version the layout supports (`Source::Metadata`).
+
+async fn cdn_version_file(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    resolve_hosted_cocoapods_repo(&state.db, &repo_key).await?;
+
+    let body = serde_yaml::to_string(&cocoapods::CdnMetadata::default()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to render CDN metadata: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/yaml")
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /cocoapods/{repo_key}/deprecated_podspecs.txt
+// ---------------------------------------------------------------------------
+//
+// The CDN's list of deprecated podspec paths. Artifact Keeper does not track
+// podspec deprecation, so the list is empty, but it still has to be served: the
+// client reads the file straight back off disk after downloading it
+// (`CDNSource#deprecated_local_podspecs`) and a 404 leaves nothing to read.
+
+async fn cdn_deprecated_podspecs(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    resolve_hosted_cocoapods_repo(&state.db, &repo_key).await?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain")
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /cocoapods/{repo_key}/all_pods_versions_{a}_{b}_{c}.txt
+// ---------------------------------------------------------------------------
+//
+// A CDN cannot be listed, so the client cannot discover a pod's versions by
+// walking the `Specs/` tree. Instead each shard publishes a pre-rendered index
+// of every pod that hashes into it, one pod per line:
+//
+//     <pod>/<version>/<version>/...
+//
+// The client picks the index file from the pod name alone, so a pod is only
+// resolvable if it appears in the index for its own shard.
+
+async fn cdn_all_pods_versions(
+    State(state): State<SharedState>,
+    Path((repo_key, index_file)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let shard = cocoapods::parse_cdn_index_file_name(&index_file)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response())?;
+    let repo = resolve_hosted_cocoapods_repo(&state.db, &repo_key).await?;
+
+    // The shard is selected in SQL rather than by reading the repository and
+    // discarding the ~4095/4096 of it that belongs to other shards. These files
+    // are anonymously reachable on a public repository and there are 4096 of
+    // them, so a sweep of the whole index must not cost 4096 full reads of the
+    // repository's artifacts.
+    //
+    // The shard fragments are consecutive slices off the front of the hash, so
+    // their concatenation is exactly the first `CDN_SHARD_HEX_LEN` characters of
+    // `md5(name)`, which is what `left(md5(name), N)` yields. Postgres hashes the
+    // UTF-8 bytes of the name, the same bytes `cdn_shard_fragment` hashes, so the
+    // two agree (including for the non-ASCII pod names that exist in the wild).
+    //
+    // `N` is spelled as a literal so that it matches the expression index
+    // `idx_artifacts_repo_cocoapods_shard` (a bound parameter would not), and the
+    // assertion below turns any drift from `CDN_PREFIX_LENGTHS` into a build
+    // failure rather than a silently unindexed scan.
+    const _: () = assert!(
+        cocoapods::CDN_SHARD_HEX_LEN == 3,
+        "the shard prefix length is inlined into the index query and its \
+         expression index; update both when CDN_PREFIX_LENGTHS changes"
+    );
+    let shard_prefix = shard.concat();
+
+    let artifacts = sqlx::query!(
+        r#"
+        SELECT name, version
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+          AND left(md5(name), 3) = $2
+          AND (
+            quarantine_status IS NULL
+            OR quarantine_status NOT IN ('quarantined', 'rejected')
+            OR (
+              quarantine_status = 'quarantined'
+              AND quarantine_until IS NOT NULL
+              AND quarantine_until <= NOW()
+            )
+          )
+        "#,
+        repo.id,
+        shard_prefix,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+
+    // Group versions by pod name. BTree collections give the deterministic,
+    // sorted output the trunk CDN publishes; the client sorts versions itself, so
+    // the order within a line is presentational only.
+    let mut versions_by_pod: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for artifact in artifacts {
+        let Some(version) = artifact.version else {
+            continue;
+        };
+        // `push_pod` rejects a name or version that could not be rendered into a
+        // line-oriented record, but rows written before that gate existed cannot
+        // be trusted: a `/` or newline here would close this pod's record and
+        // open a synthetic one for a pod the publisher does not own. Skip such a
+        // row rather than emit it.
+        if !cocoapods::is_indexable_pod(&artifact.name, &version) {
+            tracing::warn!(
+                repository_id = %repo.id,
+                name = ?artifact.name,
+                "skipping artifact with a name/version that is not representable \
+                 in the CocoaPods shard index",
+            );
+            continue;
+        }
+        versions_by_pod
+            .entry(artifact.name)
+            .or_default()
+            .insert(version);
+    }
+
+    let mut body = String::new();
+    for (pod, versions) in &versions_by_pod {
+        body.push_str(pod);
+        for version in versions {
+            body.push('/');
+            body.push_str(version);
+        }
+        body.push('\n');
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain")
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /cocoapods/{repo_key}/Specs/{a}/{b}/{c}/{name}/{version}/{name}.podspec.json
 // GET /cocoapods/{repo_key}/Specs/{name}/{version}/{name}.podspec.json
 // ---------------------------------------------------------------------------
 
 async fn get_podspec(
     State(state): State<SharedState>,
-    Path((repo_key, name, version, podspec_file)): Path<(String, String, String, String)>,
+    Path((repo_key, spec_path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_cocoapods_repo(&state.db, &repo_key).await?;
 
-    let podspec_file = podspec_file.trim_start_matches('/');
+    let spec_path = spec_path.trim_start_matches('/');
 
-    // Validate via the format handler
-    let full_path = format!("Specs/{}/{}/{}", name, version, podspec_file);
+    // Validate via the format handler, which accepts both the CDN MD5-sharded
+    // layout and the flat layout.
+    let full_path = format!("Specs/{}", spec_path);
     let path_info = CocoaPodsHandler::parse_path(&full_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
-    // Find the artifact
+    // The sharded tree is part of the CDN layout, so it is served on the same
+    // terms as the CDN entrypoints. The flat tree predates the CDN layout and is
+    // left as it was.
+    let cdn_layout = path_info.layout == cocoapods::CocoaPodsSpecLayout::Cdn;
+    if cdn_layout {
+        reject_cdn_if_not_hosted(&repo)?;
+    }
+
+    // Find the artifact.
+    //
+    // The CDN tree is looked up case-sensitively: the shard is keyed by the MD5
+    // of the exact bytes of the name, `parse_path` has already checked the
+    // requested name against the requested shard, and the index only ever
+    // publishes the canonical name -- so a case-folded match here would serve
+    // `Alamofire` under the shard of `alamofire`, a path the real CDN 404s. The
+    // flat tree keeps the case-insensitive lookup it has always had.
     let artifact = sqlx::query!(
         r#"
         SELECT a.id, a.storage_key, am.metadata as "metadata?"
@@ -79,18 +324,28 @@ async fn get_podspec(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND LOWER(a.name) = LOWER($2)
+          AND (
+            CASE WHEN $4 THEN a.name = $2 ELSE LOWER(a.name) = LOWER($2) END
+          )
           AND a.version = $3
         LIMIT 1
         "#,
         repo.id,
         path_info.name,
-        path_info.version
+        path_info.version,
+        cdn_layout,
     )
     .fetch_optional(&state.db)
     .await
     .map_err(crate::api::handlers::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Podspec not found").into_response())?;
+
+    // A held pod must not have its podspec served: `download_pod` blocks the
+    // archive, so serving the spec only sends the client to a download it cannot
+    // complete.
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
 
     // Return the podspec from metadata if available, otherwise read from storage
     let podspec_from_meta: Option<String> = artifact
@@ -108,10 +363,7 @@ async fn get_podspec(
     }
 
     // Fall back to reading the podspec file from storage
-    let podspec_key = format!(
-        "cocoapods/{}/{}/{}.podspec.json",
-        path_info.name, path_info.version, path_info.name
-    );
+    let podspec_key = build_cocoapods_podspec_key(&path_info.name, &path_info.version);
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -273,7 +525,7 @@ async fn push_pod(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "cocoapods", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "cocoapods", "write:artifacts")?.user_id;
     let repo = resolve_cocoapods_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -284,7 +536,12 @@ async fn push_pod(
 
     // Try to extract podspec from the archive body.
     // The body should contain a tar.gz with a podspec.json inside.
-    let podspec = extract_podspec_from_archive(&body).map_err(|e| {
+    // #2561: permit-scoped decode, fast-fail 503 on saturation.
+    let podspec = crate::util::bounded_archive::with_ingest_extraction(|| {
+        extract_podspec_from_archive(&body)
+    })
+    .map_err(|e| e.into_response())?
+    .map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             format!("Invalid pod archive: {}", e),
@@ -295,12 +552,20 @@ async fn push_pod(
     let pod_name = &podspec.name;
     let pod_version = &podspec.version;
 
-    if pod_name.is_empty() || pod_version.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Pod name and version are required").into_response());
-    }
+    // The name and version come from the uploaded podspec JSON and are written
+    // verbatim into the line-oriented CDN shard index, so they have to satisfy
+    // the CocoaPods naming rules before they are stored. Without this, a
+    // publisher can put a `/` or a newline in the name and, by brute-forcing a
+    // name into another pod's 4096-way shard, inject a synthetic record for a pod
+    // it does not own. See `formats::cocoapods` for the rule and how it was
+    // checked against the published trunk index.
+    cocoapods::validate_pod_name(pod_name)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+    cocoapods::validate_pod_version(pod_version)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
 
-    let filename = format!("{}-{}.tar.gz", pod_name, pod_version);
-    let artifact_path = format!("{}/{}/{}", pod_name, pod_version, filename);
+    let filename = build_cocoapods_filename(pod_name, pod_version);
+    let artifact_path = build_cocoapods_artifact_path(pod_name, pod_version);
 
     // Compute SHA256
     let mut hasher = Sha256::new();
@@ -324,7 +589,9 @@ async fn push_pod(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the pod archive
-    let storage_key = format!("cocoapods/{}/{}/{}", pod_name, pod_version, filename);
+    let storage_key = build_cocoapods_storage_key(pod_name, pod_version);
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -337,11 +604,10 @@ async fn push_pod(
     })?;
 
     // Also store the podspec JSON separately for direct retrieval
-    let podspec_key = format!(
-        "cocoapods/{}/{}/{}.podspec.json",
-        pod_name, pod_version, pod_name
-    );
+    let podspec_key = build_cocoapods_podspec_key(pod_name, pod_version);
     let podspec_json = serde_json::to_vec(&podspec).unwrap_or_default();
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &podspec_key)
+        .await?;
     storage
         .put(&podspec_key, Bytes::from(podspec_json))
         .await
@@ -354,10 +620,7 @@ async fn push_pod(
         })?;
 
     // Build metadata JSON
-    let pod_metadata = serde_json::json!({
-        "podspec": serde_json::to_value(&podspec).unwrap_or_default(),
-        "filename": filename,
-    });
+    let pod_metadata = build_cocoapods_metadata(&podspec, &filename);
 
     let size_bytes = body.len() as i64;
 
@@ -488,40 +751,54 @@ use crate::formats::cocoapods::PodSpec;
 /// Scans the archive entries for any file ending in `.podspec.json` and
 /// deserializes it into a PodSpec.
 fn extract_podspec_from_archive(data: &[u8]) -> Result<PodSpec, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    use tar::Archive;
+    // Bound the gzip/tar decompression: total-byte budget + entry-count cap +
+    // per-metadata-entry cap so a crafted pod archive cannot inflate unbounded
+    // during metadata parsing (#2556).
+    let contents = crate::util::bounded_archive::read_metadata_from_tar_gz(data, |path| {
+        path.to_string_lossy().ends_with(".podspec.json")
+    })
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "No .podspec.json found in archive".to_string())?;
 
-    let gz = GzDecoder::new(data);
-    let mut archive = Archive::new(gz);
+    let podspec: PodSpec =
+        serde_json::from_slice(&contents).map_err(|e| format!("Invalid podspec JSON: {}", e))?;
 
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("Failed to read archive: {}", e))?;
+    Ok(podspec)
+}
 
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+// ---------------------------------------------------------------------------
+// Path/key builders (single source of truth; unit tests pin these against
+// hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
 
-        let path = entry
-            .path()
-            .map_err(|e| format!("Failed to read path: {}", e))?
-            .to_string_lossy()
-            .to_string();
+/// Build the filename for a CocoaPods archive.
+fn build_cocoapods_filename(name: &str, version: &str) -> String {
+    format!("{}-{}.tar.gz", name, version)
+}
 
-        if path.ends_with(".podspec.json") {
-            let mut contents = Vec::new();
-            entry
-                .read_to_end(&mut contents)
-                .map_err(|e| format!("Failed to read podspec: {}", e))?;
+/// Build the artifact path for a CocoaPods package.
+fn build_cocoapods_artifact_path(name: &str, version: &str) -> String {
+    let filename = build_cocoapods_filename(name, version);
+    format!("{}/{}/{}", name, version, filename)
+}
 
-            let podspec: PodSpec = serde_json::from_slice(&contents)
-                .map_err(|e| format!("Invalid podspec JSON: {}", e))?;
+/// Build the storage key for a CocoaPods archive.
+fn build_cocoapods_storage_key(name: &str, version: &str) -> String {
+    let filename = build_cocoapods_filename(name, version);
+    format!("cocoapods/{}/{}/{}", name, version, filename)
+}
 
-            return Ok(podspec);
-        }
-    }
+/// Build the storage key for a CocoaPods podspec JSON file.
+fn build_cocoapods_podspec_key(name: &str, version: &str) -> String {
+    format!("cocoapods/{}/{}/{}.podspec.json", name, version, name)
+}
 
-    Err("No .podspec.json found in archive".to_string())
+/// Build the metadata JSON for a published pod.
+fn build_cocoapods_metadata(podspec: &PodSpec, filename: &str) -> serde_json::Value {
+    serde_json::json!({
+        "podspec": serde_json::to_value(podspec).unwrap_or_default(),
+        "filename": filename,
+    })
 }
 
 #[cfg(test)]
@@ -570,37 +847,15 @@ mod tests {
     use crate::formats::cocoapods::PodSpec;
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
+    // CDN routing
     // -----------------------------------------------------------------------
 
-    /// Build the filename for a CocoaPods archive.
-    fn build_cocoapods_filename(name: &str, version: &str) -> String {
-        format!("{}-{}.tar.gz", name, version)
-    }
-
-    /// Build the artifact path for a CocoaPods package.
-    fn build_cocoapods_artifact_path(name: &str, version: &str) -> String {
-        let filename = build_cocoapods_filename(name, version);
-        format!("{}/{}/{}", name, version, filename)
-    }
-
-    /// Build the storage key for a CocoaPods archive.
-    fn build_cocoapods_storage_key(name: &str, version: &str) -> String {
-        let filename = build_cocoapods_filename(name, version);
-        format!("cocoapods/{}/{}/{}", name, version, filename)
-    }
-
-    /// Build the storage key for a CocoaPods podspec JSON file.
-    fn build_cocoapods_podspec_key(name: &str, version: &str) -> String {
-        format!("cocoapods/{}/{}/{}.podspec.json", name, version, name)
-    }
-
-    /// Build the metadata JSON for a published pod.
-    fn build_cocoapods_metadata(podspec: &PodSpec, filename: &str) -> serde_json::Value {
-        serde_json::json!({
-            "podspec": serde_json::to_value(podspec).unwrap_or_default(),
-            "filename": filename,
-        })
+    /// The CDN shard index is matched as a bare path segment, so it sits
+    /// alongside the static `all_specs` / `Specs` / `pods` segments in the same
+    /// position. Building the router asserts those do not collide.
+    #[test]
+    fn test_router_builds_with_cdn_routes() {
+        let _ = super::router();
     }
 
     // -----------------------------------------------------------------------
@@ -951,6 +1206,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.repo_type, "hosted");
@@ -969,6 +1226,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
@@ -981,6 +1240,49 @@ mod tests {
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #2561: an authenticated pod push decodes the podspec through the
+    /// permit-scoped decode (uncontended) and stores the pod.
+    #[tokio::test]
+    async fn test_cocoapods_push_pod_succeeds_2561() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        let podspec_bytes = serde_json::to_vec(&serde_json::json!({
+            "name": "PushPod",
+            "version": "1.0.0",
+            "summary": "coverage pod",
+        }))
+        .unwrap();
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("PushPod.podspec.json").unwrap();
+            header.set_size(podspec_bytes.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &podspec_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &tar_data).unwrap();
+        let targz = gz.finish().unwrap();
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .body(axum::body::Body::from(targz))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "pod push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+        fx.teardown().await;
+    }
 
     // Exercises the DB-query happy paths so the sweep's db_err/db_status
     // call-site lines are covered by cargo llvm-cov --lib (#2083).
@@ -1000,6 +1302,585 @@ mod db_cov_tests {
             let app = fx.router_with_auth(super::router());
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
+        fx.teardown().await;
+    }
+
+    /// Build a pushable pod archive carrying just a `<name>.podspec.json`.
+    fn pod_archive(name: &str, version: &str) -> Vec<u8> {
+        let podspec_bytes = serde_json::to_vec(&serde_json::json!({
+            "name": name,
+            "version": version,
+            "summary": "cdn layout pod",
+        }))
+        .unwrap();
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path(format!("{}.podspec.json", name)).unwrap();
+            header.set_size(podspec_bytes.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &podspec_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &tar_data).unwrap();
+        gz.finish().unwrap()
+    }
+
+    async fn push_pod(fx: &tdh::Fixture, name: &str, version: &str) {
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .body(axum::body::Body::from(pod_archive(name, version)))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "pod push must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+    }
+
+    /// The CDN entrypoint has to be served for a client to treat the repo as a
+    /// CDN source at all, and it has to advertise the shard fan-out that the
+    /// index/Specs routes are keyed by.
+    #[tokio::test]
+    async fn test_cocoapods_cdn_version_file_served() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/CocoaPods-version.yml", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let meta: crate::formats::cocoapods::CdnMetadata =
+            serde_yaml::from_slice(&body[..]).expect("CocoaPods-version.yml must be valid YAML");
+        assert_eq!(
+            meta.prefix_lengths,
+            crate::formats::cocoapods::CDN_PREFIX_LENGTHS.to_vec()
+        );
+        assert_eq!(
+            meta.min,
+            crate::formats::cocoapods::CDN_MIN_COCOAPODS_VERSION
+        );
+        fx.teardown().await;
+    }
+
+    /// `deprecated_podspecs.txt` is read straight back off disk by the client
+    /// after download, so it must resolve even though we never deprecate.
+    #[tokio::test]
+    async fn test_cocoapods_cdn_deprecated_podspecs_served_empty() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/deprecated_podspecs.txt", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(body.is_empty());
+        fx.teardown().await;
+    }
+
+    /// A pushed pod must be listed in the index file for the shard its name
+    /// hashes into, in the `<pod>/<version>...` line format the client parses,
+    /// and must not leak into any other shard.
+    #[tokio::test]
+    async fn test_cocoapods_cdn_index_lists_pod_in_its_own_shard() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        push_pod(&fx, "Alamofire", "5.8.0").await;
+        push_pod(&fx, "Alamofire", "5.9.0").await;
+
+        // Alamofire hashes to shard d/a/2 (pinned against the trunk CDN).
+        let index_file = crate::formats::cocoapods::cdn_index_file_name("Alamofire");
+        assert_eq!(index_file, "all_pods_versions_d_a_2.txt");
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, index_file))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec!["Alamofire/5.8.0/5.9.0"],
+            "index must list the pod and every version on one line",
+        );
+
+        // The same pod must not appear in a shard it does not hash into.
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/all_pods_versions_0_0_0.txt", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            !String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("Alamofire"),
+            "pod must only be indexed under its own shard",
+        );
+        fx.teardown().await;
+    }
+
+    /// The podspec must resolve at the MD5-sharded path the client derives from
+    /// the pod name, and only there.
+    #[tokio::test]
+    async fn test_cocoapods_cdn_sharded_podspec_resolves() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        push_pod(&fx, "Alamofire", "5.8.0").await;
+
+        let spec_path = crate::formats::cocoapods::cdn_podspec_path("Alamofire", "5.8.0");
+        assert_eq!(
+            spec_path,
+            "Specs/d/a/2/Alamofire/5.8.0/Alamofire.podspec.json"
+        );
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) =
+            tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, spec_path))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let spec: serde_json::Value = serde_json::from_slice(&body[..]).unwrap();
+        assert_eq!(spec["name"], "Alamofire");
+        assert_eq!(spec["version"], "5.8.0");
+
+        // Wrong fan-out is not an alias for the pod.
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/Specs/0/0/0/Alamofire/5.8.0/Alamofire.podspec.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        fx.teardown().await;
+    }
+
+    /// The pre-existing flat layout keeps working next to the CDN tree.
+    #[tokio::test]
+    async fn test_cocoapods_flat_podspec_still_resolves() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        push_pod(&fx, "Alamofire", "5.8.0").await;
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/Specs/Alamofire/5.8.0/Alamofire.podspec.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let spec: serde_json::Value = serde_json::from_slice(&body[..]).unwrap();
+        assert_eq!(spec["name"], "Alamofire");
+        fx.teardown().await;
+    }
+
+    /// Build a pushable pod archive whose podspec carries an arbitrary name,
+    /// independent of the tar entry name.
+    ///
+    /// `push_pod` derives everything from the podspec JSON inside the archive
+    /// (the tar entry only has to end in `.podspec.json`), which is the surface
+    /// an attacker actually controls.
+    fn pod_archive_named(podspec_name: &str, version: &str) -> Vec<u8> {
+        let podspec_bytes = serde_json::to_vec(&serde_json::json!({
+            "name": podspec_name,
+            "version": version,
+            "summary": "injection probe",
+        }))
+        .unwrap();
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("pod.podspec.json").unwrap();
+            header.set_size(podspec_bytes.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &podspec_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &tar_data).unwrap();
+        gz.finish().unwrap()
+    }
+
+    async fn try_push_named(
+        fx: &tdh::Fixture,
+        podspec_name: &str,
+        version: &str,
+    ) -> axum::http::StatusCode {
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .body(axum::body::Body::from(pod_archive_named(
+                podspec_name,
+                version,
+            )))
+            .unwrap();
+        tdh::send(app, req).await.0
+    }
+
+    /// A pod name carrying the index record separators must not be publishable.
+    ///
+    /// The shard is no defence: the payload below is a name brute-forced into
+    /// Alamofire's own shard (`d/a/2`), which is only a 4096-way search. If it
+    /// were stored, the rendered index for that shard would carry a synthetic
+    /// `Alamofire/99.99.99` record and a client resolving Alamofire would pick a
+    /// version whose podspec does not exist.
+    #[tokio::test]
+    async fn test_cocoapods_push_rejects_index_injection_in_name() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        push_pod(&fx, "Alamofire", "1.0.0").await;
+
+        let payload = "evilpod3722\nAlamofire/99.99.99";
+        // The payload really does collide into Alamofire's shard.
+        assert_eq!(
+            crate::formats::cocoapods::cdn_shard_fragment(payload),
+            crate::formats::cocoapods::cdn_shard_fragment("Alamofire"),
+        );
+
+        let status = try_push_named(&fx, payload, "1.0.0").await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a name carrying index record separators must be rejected at push",
+        );
+
+        // Nothing was stored, so the shard index is exactly what it was.
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/all_pods_versions_d_a_2.txt", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec!["Alamofire/1.0.0"],
+            "the index must carry only the genuine pod",
+        );
+        assert!(!text.contains("99.99.99"));
+        fx.teardown().await;
+    }
+
+    /// The same for a version, which shares the index record with the name.
+    #[tokio::test]
+    async fn test_cocoapods_push_rejects_index_injection_in_version() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        for bad in ["1.0.0\nAlamofire/99.99.99", "1.0.0/99.99.99", "1.0.0 x"] {
+            assert_eq!(
+                try_push_named(&fx, "SomePod", bad).await,
+                axum::http::StatusCode::BAD_REQUEST,
+                "version {:?} must be rejected at push",
+                bad,
+            );
+        }
+        fx.teardown().await;
+    }
+
+    /// Rows written before the push-time grammar existed cannot be trusted, so
+    /// the renderer skips a record it cannot represent rather than emitting it.
+    #[tokio::test]
+    async fn test_cocoapods_index_skips_preexisting_poisoned_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        push_pod(&fx, "Alamofire", "1.0.0").await;
+
+        // Write the payload straight to the table, as a row that predates the
+        // push-time validation would look. `artifacts.name` is VARCHAR(512) with
+        // no CHECK, so this stores fine.
+        let payload = "evilpod3722\nAlamofire/99.99.99";
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key, uploaded_by) \
+             VALUES ($1, $2, $3, '1.0.0', 1, 'x', 'application/gzip', $4, $5)",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("{}/1.0.0/poisoned.tar.gz", payload))
+        .bind(payload)
+        .bind(format!("cocoapods/{}/1.0.0/poisoned.tar.gz", payload))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("poisoned row must be storable: the column has no CHECK");
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/all_pods_versions_d_a_2.txt", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec!["Alamofire/1.0.0"],
+            "the poisoned row must be skipped, leaving only the genuine pod",
+        );
+        assert!(
+            !text.contains("99.99.99"),
+            "no synthetic version may reach the client",
+        );
+        fx.teardown().await;
+    }
+
+    /// A remote (proxy) repository must not serve the CDN entrypoints: the
+    /// documents would describe only what happens to be cached, so
+    /// `pod repo add-cdn` would register a source that silently reports pods
+    /// which exist upstream as missing.
+    #[tokio::test]
+    async fn test_cocoapods_cdn_entrypoints_not_served_for_remote_repo() {
+        let Some(fx) = tdh::Fixture::setup("remote", "cocoapods").await else {
+            return;
+        };
+        assert_cdn_entrypoints_not_served(&fx).await;
+        fx.teardown().await;
+    }
+
+    /// A virtual repository owns no artifacts, so the CDN documents would
+    /// describe it as empty even though `download_pod` resolves its members.
+    #[tokio::test]
+    async fn test_cocoapods_cdn_entrypoints_not_served_for_virtual_repo() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "cocoapods").await else {
+            return;
+        };
+        assert_cdn_entrypoints_not_served(&fx).await;
+        fx.teardown().await;
+    }
+
+    /// Every CDN entrypoint 404s, so `pod repo add-cdn` fails cleanly instead of
+    /// registering a half-working source.
+    async fn assert_cdn_entrypoints_not_served(fx: &tdh::Fixture) {
+        let paths = [
+            // The probe that decides whether the URL is a CDN source at all.
+            format!("/{}/CocoaPods-version.yml", fx.repo_key),
+            format!("/{}/all_pods_versions_d_a_2.txt", fx.repo_key),
+            format!("/{}/deprecated_podspecs.txt", fx.repo_key),
+            // The sharded tree is part of the same layout.
+            format!(
+                "/{}/Specs/d/a/2/Alamofire/5.8.0/Alamofire.podspec.json",
+                fx.repo_key
+            ),
+        ];
+        for path in paths {
+            let app = fx.router_with_auth(super::router());
+            let (status, _) = tdh::send(app, tdh::get(path.clone())).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::NOT_FOUND,
+                "{} must not be served for a non-hosted repository",
+                path,
+            );
+        }
+    }
+
+    /// The shard filter runs in SQL, so it has to agree with the Rust rule the
+    /// rest of the layout is derived from -- including for the non-ASCII pod
+    /// names that exist on the trunk CDN, where the two could disagree if one
+    /// side hashed something other than the UTF-8 bytes.
+    #[tokio::test]
+    async fn test_cocoapods_sql_shard_filter_agrees_with_rust_shard_rule() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        // Published trunk pod names, ASCII and not.
+        let pods = ["Alamofire", "SnapKit", "cocoapods制作", "Floater💩"];
+        for pod in pods {
+            push_pod(&fx, pod, "1.0.0").await;
+        }
+
+        for pod in pods {
+            let index_file = crate::formats::cocoapods::cdn_index_file_name(pod);
+            let app = fx.router_with_auth(super::router());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, index_file))).await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                text.lines().any(|l| l == format!("{}/1.0.0", pod)),
+                "{} must be listed in its own shard index {} (SQL filter must \
+                 agree with cdn_shard_fragment), got:\n{}",
+                pod,
+                index_file,
+                text,
+            );
+        }
+        fx.teardown().await;
+    }
+
+    /// The CDN tree is keyed by the MD5 of the exact bytes of the name, so it is
+    /// looked up case-sensitively: a real CDN 404s a pod requested under the
+    /// shard of a differently-cased name. The flat tree keeps its historical
+    /// case-insensitive lookup.
+    #[tokio::test]
+    async fn test_cocoapods_cdn_podspec_lookup_is_case_sensitive() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        push_pod(&fx, "Alamofire", "5.8.0").await;
+
+        // `alamofire` hashes into a different shard than `Alamofire`, and that is
+        // the shard the client would derive from the lowercased name. The path is
+        // internally consistent, so `parse_path` accepts it -- only the DB lookup
+        // can refuse to case-fold it into the real pod.
+        let lower_path = crate::formats::cocoapods::cdn_podspec_path("alamofire", "5.8.0");
+        assert_ne!(
+            crate::formats::cocoapods::cdn_shard_fragment("alamofire"),
+            crate::formats::cocoapods::cdn_shard_fragment("Alamofire"),
+        );
+        let app = fx.router_with_auth(super::router());
+        let (status, _) =
+            tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, lower_path))).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "{} must not serve Alamofire's podspec: a real CDN 404s it",
+            lower_path,
+        );
+
+        // The canonical name -- the only one the index publishes -- still works.
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/{}",
+                fx.repo_key,
+                crate::formats::cocoapods::cdn_podspec_path("Alamofire", "5.8.0")
+            )),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        // The flat tree is unchanged: it still case-folds.
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/Specs/alamofire/5.8.0/alamofire.podspec.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "the flat layout keeps its historical case-insensitive lookup",
+        );
+        fx.teardown().await;
+    }
+
+    /// A held pod must not be advertised in the index or have its podspec
+    /// served: `download_pod` blocks the archive, so doing either only sends the
+    /// client to a download it cannot complete.
+    #[tokio::test]
+    async fn test_cocoapods_quarantined_pod_is_not_advertised() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        push_pod(&fx, "Alamofire", "5.8.0").await;
+        push_pod(&fx, "Alamofire", "5.9.0").await;
+
+        // Hold 5.9.0, as an upload hold or a scan would.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+             quarantine_until = NOW() + interval '1 hour' \
+             WHERE repository_id = $1 AND version = '5.9.0'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+        let app = fx.router_with_auth(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/all_pods_versions_d_a_2.txt", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap().trim(),
+            "Alamofire/5.8.0",
+            "a held version must not be advertised",
+        );
+
+        // And its podspec is not served.
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/{}",
+                fx.repo_key,
+                crate::formats::cocoapods::cdn_podspec_path("Alamofire", "5.9.0")
+            )),
+        )
+        .await;
+        assert_ne!(
+            status,
+            axum::http::StatusCode::OK,
+            "a held pod's podspec must not be served",
+        );
+
+        // The released version is unaffected.
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/{}",
+                fx.repo_key,
+                crate::formats::cocoapods::cdn_podspec_path("Alamofire", "5.8.0")
+            )),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        fx.teardown().await;
+    }
+
+    /// A path that is not a shard index file is not swallowed by the index
+    /// route.
+    #[tokio::test]
+    async fn test_cocoapods_cdn_non_index_file_not_found() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/all_pods_versions_zz_a_2.txt", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+        // The pre-existing all_specs listing must still route to its own handler.
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::get(format!("/{}/all_specs", fx.repo_key))).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
         fx.teardown().await;
     }
 }

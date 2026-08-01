@@ -687,8 +687,8 @@ pub async fn promote_artifact(
         if !eval_result.passed && eval_result.action == PolicyAction::Block {
             return Ok(Json(PromotionResponse {
                 promoted: false,
-                source: format!("{}/{}", repo_key, artifact.path),
-                target: format!("{}/{}", target_key, artifact.path),
+                source: build_promotion_source_display(&repo_key, &artifact.path),
+                target: build_promotion_target_display(&target_key, &artifact.path),
                 promotion_id: None,
                 policy_violations,
                 message: Some("Promotion blocked by policy violations".to_string()),
@@ -711,8 +711,8 @@ pub async fn promote_artifact(
         if !failing.is_empty() {
             return Ok(Json(PromotionResponse {
                 promoted: false,
-                source: format!("{}/{}", repo_key, artifact.path),
-                target: format!("{}/{}", target_key, artifact.path),
+                source: build_promotion_source_display(&repo_key, &artifact.path),
+                target: build_promotion_target_display(&target_key, &artifact.path),
                 promotion_id: None,
                 policy_violations: rule_violations_to_policy_violations(&failing),
                 message: Some("Promotion blocked by promotion rule violations".to_string()),
@@ -751,6 +751,23 @@ pub async fn promote_artifact(
     }
 
     let new_artifact_id = Uuid::new_v4();
+
+    // Cross-repository write guard (#2511): the promotion copy re-uses the
+    // SOURCE artifact's flat storage key when writing into the TARGET repo. On a
+    // shared-namespace cloud backend that key may already be owned by a third
+    // repository, so a grant-holding promoter could overwrite/collide another
+    // repo's object. This is the same guard the per-format upload handlers apply;
+    // it is skipped for repo-isolated (filesystem) backends where each repo has
+    // its own directory tree. `require_promotion_tenant_access` above already
+    // gates who may promote — this closes the residual write attribution hole.
+    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+        &state.db,
+        target_repo.id,
+        &target_repo.storage_backend,
+        &artifact.storage_key,
+    )
+    .await?;
+
     let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
     let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
 
@@ -827,14 +844,11 @@ pub async fn promote_artifact(
         "Artifact promoted successfully"
     );
 
-    Ok(Json(PromotionResponse {
-        promoted: true,
-        source: format!("{}/{}", repo_key, artifact.path),
-        target: format!("{}/{}", target_key, artifact.path),
-        promotion_id: Some(promotion_id),
-        policy_violations: vec![],
-        message: Some("Artifact promoted successfully".to_string()),
-    }))
+    Ok(Json(build_success_response(
+        build_promotion_source_display(&repo_key, &artifact.path),
+        build_promotion_target_display(&target_key, &artifact.path),
+        promotion_id,
+    )))
 }
 
 #[utoipa::path(
@@ -940,8 +954,8 @@ pub async fn promote_artifacts_bulk(
             }
         };
 
-        let source_display = format!("{}/{}", repo_key, artifact.path);
-        let target_display = format!("{}/{}", target_key, artifact.path);
+        let source_display = build_promotion_source_display(&repo_key, &artifact.path);
+        let target_display = build_promotion_target_display(&target_key, &artifact.path);
 
         // Enforce per-pair promotion_rules per item before copying. Mirrors the
         // single-promote gate; a rule-blocked item fails and the batch continues
@@ -1000,6 +1014,28 @@ pub async fn promote_artifacts_bulk(
                 ));
                 continue;
             }
+        }
+
+        // Cross-repository write guard (#2511): fail just this item (not the
+        // batch) if the source's flat storage key is already owned by another
+        // repository on a shared-namespace cloud backend. Same guard the
+        // per-format upload handlers apply; skipped for repo-isolated
+        // (filesystem) backends. See the single-promote path for the rationale.
+        if let Err(e) = crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+            &state.db,
+            target_repo.id,
+            &target_repo.storage_backend,
+            &artifact.storage_key,
+        )
+        .await
+        {
+            failed += 1;
+            results.push(failed_response(
+                source_display,
+                target_display,
+                e.to_string(),
+            ));
+            continue;
         }
 
         let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
@@ -1101,12 +1137,12 @@ pub async fn promote_artifacts_bulk(
         "Bulk promotion completed"
     );
 
-    Ok(Json(BulkPromotionResponse {
-        total: req.artifact_ids.len(),
+    Ok(Json(build_bulk_summary(
+        req.artifact_ids.len(),
         promoted,
         failed,
         results,
-    }))
+    )))
 }
 
 #[utoipa::path(
@@ -1185,13 +1221,12 @@ pub async fn reject_artifact(
         "Artifact rejected"
     );
 
-    Ok(Json(RejectionResponse {
-        rejected: true,
+    Ok(Json(build_rejection_response(
         artifact_id,
-        source: repo_key,
-        reason: req.reason,
+        repo_key,
+        req.reason,
         rejection_id,
-    }))
+    )))
 }
 
 #[utoipa::path(
@@ -1220,9 +1255,7 @@ pub async fn promotion_history(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&repo_key).await?;
 
-    let page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).min(100);
-    let offset = ((page - 1) * per_page) as i64;
+    let (page, per_page, offset) = compute_promotion_pagination(query.page, query.per_page);
 
     #[derive(sqlx::FromRow)]
     struct HistoryRow {
@@ -1287,7 +1320,7 @@ pub async fn promotion_history(
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
 
-    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let total_pages = compute_total_pages(total, per_page);
 
     let items = rows
         .into_iter()
@@ -1561,6 +1594,81 @@ pub fn validate_release_target_link(
 )]
 pub struct PromotionApiDoc;
 
+// ---------------------------------------------------------------------------
+// Display/response builders (single source of truth; unit tests pin these
+// against hardcoded literals so a format change here fails the tests — #2657)
+// ---------------------------------------------------------------------------
+
+/// Build the source display string for promotion responses.
+fn build_promotion_source_display(repo_key: &str, artifact_path: &str) -> String {
+    format!("{}/{}", repo_key, artifact_path)
+}
+
+/// Build the target display string for promotion responses.
+fn build_promotion_target_display(target_repo: &str, artifact_path: &str) -> String {
+    format!("{}/{}", target_repo, artifact_path)
+}
+
+/// Compute promotion pagination values (page, per_page, offset).
+/// Returns `(page, per_page, offset)`.
+fn compute_promotion_pagination(
+    raw_page: Option<u32>,
+    raw_per_page: Option<u32>,
+) -> (u32, u32, i64) {
+    let page = raw_page.unwrap_or(1).max(1);
+    let per_page = raw_per_page.unwrap_or(20).min(100);
+    let offset = ((page - 1) * per_page) as i64;
+    (page, per_page, offset)
+}
+
+/// Compute total pages from total items and per_page.
+fn compute_total_pages(total: i64, per_page: u32) -> u32 {
+    ((total as f64) / (per_page as f64)).ceil() as u32
+}
+
+/// Build a successful promotion response.
+fn build_success_response(source: String, target: String, promotion_id: Uuid) -> PromotionResponse {
+    PromotionResponse {
+        promoted: true,
+        source,
+        target,
+        promotion_id: Some(promotion_id),
+        policy_violations: vec![],
+        message: Some("Artifact promoted successfully".to_string()),
+    }
+}
+
+/// Build a bulk promotion summary response.
+fn build_bulk_summary(
+    total: usize,
+    promoted: usize,
+    failed: usize,
+    results: Vec<PromotionResponse>,
+) -> BulkPromotionResponse {
+    BulkPromotionResponse {
+        total,
+        promoted,
+        failed,
+        results,
+    }
+}
+
+/// Build a rejection response.
+fn build_rejection_response(
+    artifact_id: Uuid,
+    source: String,
+    reason: String,
+    rejection_id: Uuid,
+) -> RejectionResponse {
+    RejectionResponse {
+        rejected: true,
+        artifact_id,
+        source,
+        reason,
+        rejection_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1688,84 +1796,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extracted pure functions (moved into test module)
-    // -----------------------------------------------------------------------
-
-    /// Build the source display string for promotion responses.
-    fn build_promotion_source_display(repo_key: &str, artifact_path: &str) -> String {
-        format!("{}/{}", repo_key, artifact_path)
-    }
-
-    /// Build the target display string for promotion responses.
-    fn build_promotion_target_display(target_repo: &str, artifact_path: &str) -> String {
-        format!("{}/{}", target_repo, artifact_path)
-    }
-
-    /// Compute promotion pagination values (page, per_page, offset).
-    /// Returns `(page, per_page, offset)`.
-    fn compute_promotion_pagination(
-        raw_page: Option<u32>,
-        raw_per_page: Option<u32>,
-    ) -> (u32, u32, i64) {
-        let page = raw_page.unwrap_or(1).max(1);
-        let per_page = raw_per_page.unwrap_or(20).min(100);
-        let offset = ((page - 1) * per_page) as i64;
-        (page, per_page, offset)
-    }
-
-    /// Compute total pages from total items and per_page.
-    fn compute_total_pages(total: i64, per_page: u32) -> u32 {
-        ((total as f64) / (per_page as f64)).ceil() as u32
-    }
-
-    /// Build a successful promotion response.
-    fn build_success_response(
-        source: String,
-        target: String,
-        promotion_id: Uuid,
-    ) -> PromotionResponse {
-        PromotionResponse {
-            promoted: true,
-            source,
-            target,
-            promotion_id: Some(promotion_id),
-            policy_violations: vec![],
-            message: Some("Artifact promoted successfully".to_string()),
-        }
-    }
-
-    /// Build a bulk promotion summary response.
-    fn build_bulk_summary(
-        total: usize,
-        promoted: usize,
-        failed: usize,
-        results: Vec<PromotionResponse>,
-    ) -> BulkPromotionResponse {
-        BulkPromotionResponse {
-            total,
-            promoted,
-            failed,
-            results,
-        }
-    }
-
-    /// Build a rejection response.
-    fn build_rejection_response(
-        artifact_id: Uuid,
-        source: String,
-        reason: String,
-        rejection_id: Uuid,
-    ) -> RejectionResponse {
-        RejectionResponse {
-            rejected: true,
-            artifact_id,
-            source,
-            reason,
-            rejection_id,
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // validate_promotion_repos
     // -----------------------------------------------------------------------
 
@@ -1796,6 +1826,7 @@ mod tests {
             curation_auto_fetch: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            project_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

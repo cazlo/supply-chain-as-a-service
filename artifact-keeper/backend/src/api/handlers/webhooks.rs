@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::cluster_work::{Claimed, WorkerIdentity};
 use crate::services::webhook_payloads::{self, PayloadTemplate};
 use crate::services::webhook_secret_crypto;
 
@@ -241,11 +242,16 @@ pub struct WebhookSecretCreatedResponse {
 }
 
 /// Response returned by the rotate-secret endpoint.
+///
+/// GHSA-qcmj: the raw signing secret is intentionally NOT returned here. A
+/// rotation only reports success and non-reversible metadata (the display
+/// `secret_digest` and the previous-secret expiry); the new raw secret is
+/// retained only in encrypted form and delivered/consumed out-of-band, so it
+/// cannot be disclosed via this response body or logs.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RotateWebhookSecretResponse {
     pub id: Uuid,
-    /// Raw signing secret produced by this rotation. Shown exactly once.
-    pub secret: String,
+    /// Short, non-reversible identifier for the newly active signing secret.
     pub secret_digest: String,
     /// When the previously active secret stops being accepted.
     pub previous_secret_expires_at: chrono::DateTime<chrono::Utc>,
@@ -666,7 +672,10 @@ pub async fn delete_webhook(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: deleting a webhook is a management action, not a read.
+    // Require admin (scope-aware via GHSA-vvc3) rather than the softer
+    // creator/repo-access gate, matching the contract `create_webhook` uses.
+    auth.require_admin()?;
 
     let result = sqlx::query!("DELETE FROM webhooks WHERE id = $1", id)
         .execute(&state.db)
@@ -716,7 +725,8 @@ pub async fn enable_webhook(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: enabling a webhook is a management action -> admin only.
+    auth.require_admin()?;
     set_webhook_enabled(&state, id, true).await
 }
 
@@ -740,7 +750,8 @@ pub async fn disable_webhook(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: disabling a webhook is a management action -> admin only.
+    auth.require_admin()?;
     set_webhook_enabled(&state, id, false).await
 }
 
@@ -772,7 +783,9 @@ pub async fn test_webhook(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TestWebhookResponse>> {
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: firing a test delivery is a management/egress-triggering
+    // action, not a read -> require admin (scope-aware via GHSA-vvc3).
+    auth.require_admin()?;
 
     use sqlx::Row;
 
@@ -988,7 +1001,10 @@ pub async fn redeliver(
     Extension(auth): Extension<AuthExtension>,
     Path((webhook_id, delivery_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<DeliveryResponse>> {
-    authorize_webhook_access(&state, &auth, webhook_id).await?;
+    // GHSA-qcmj: re-sending a delivery triggers outbound egress, the same
+    // management/egress class as `test` -> require admin (scope-aware via
+    // GHSA-vvc3). Read-only delivery LISTing stays on the visibility gate.
+    auth.require_admin()?;
 
     // Get original delivery
     let delivery = sqlx::query!(
@@ -1128,8 +1144,11 @@ fn rotation_guard_allows(
 ///
 /// Generates a new raw secret, encrypts it, moves the existing
 /// `secret_encrypted` into `secret_previous_encrypted`, and stamps an
-/// expiry 24 hours in the future. The new raw secret is returned in the
-/// response body **once**. The HMAC signing path (added in a later ticket)
+/// expiry 24 hours in the future. GHSA-qcmj: the new raw secret is NOT
+/// returned in the response body — only success and non-reversible
+/// metadata (`secret_digest`, previous-secret expiry). The new secret is
+/// retained encrypted at rest and consumed out-of-band. The HMAC signing
+/// path (added in a later ticket)
 /// signs deliveries with both secrets while the previous one is within
 /// its expiry window so consumers can rotate without dropped events.
 ///
@@ -1148,7 +1167,7 @@ fn rotation_guard_allows(
         ("id" = Uuid, Path, description = "Webhook ID")
     ),
     responses(
-        (status = 200, description = "Secret rotated. Body includes the new raw secret exactly once.", body = RotateWebhookSecretResponse),
+        (status = 200, description = "Secret rotated. Body reports success and metadata only; the raw secret is not returned.", body = RotateWebhookSecretResponse),
         (status = 404, description = "Webhook not found"),
         (status = 409, description = "A previous rotation overlap window is still active"),
         (status = 500, description = "Encryption key not configured")
@@ -1162,7 +1181,9 @@ pub async fn rotate_webhook_secret(
 ) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
 
-    authorize_webhook_access(&state, &auth, id).await?;
+    // GHSA-qcmj: rotating the signing secret is a management action -> admin
+    // only (scope-aware via GHSA-vvc3), matching `create_webhook`.
+    auth.require_admin()?;
 
     let new_secret = webhook_secret_crypto::generate_secret();
     let new_encrypted = webhook_secret_crypto::encrypt_secret(&new_secret).map_err(|e| {
@@ -1241,9 +1262,11 @@ pub async fn rotate_webhook_secret(
         };
     }
 
+    // GHSA-qcmj: return success + non-reversible metadata only. The raw
+    // `new_secret` is never echoed in the response body; it is stored
+    // encrypted and delivered out-of-band.
     Ok(Json(RotateWebhookSecretResponse {
         id,
-        secret: new_secret,
         secret_digest: new_digest,
         previous_secret_expires_at: previous_expires_at,
     })
@@ -1582,43 +1605,151 @@ async fn load_active_secrets(
     Ok(out)
 }
 
+/// TTL for one webhook retry-delivery claim, in seconds.
+///
+/// Sized to comfortably cover one send attempt (30s HTTP timeout) plus result
+/// bookkeeping; the processor re-extends the claim immediately before each
+/// send, so a large claimed batch does not need a batch-sized TTL. If a
+/// replica dies mid-send, the delivery becomes claimable again after this
+/// long, which is well under the shortest retry backoff step.
+const WEBHOOK_RETRY_CLAIM_TTL_SECS: f64 = 120.0;
+
+/// Atomically claim up to `limit` deliveries that are due for retry
+/// (RowClaimedQueue pattern, see [`crate::services::cluster_work`]).
+///
+/// Rows are selected with `FOR UPDATE SKIP LOCKED` and stamped with a fresh
+/// `claim_token` in the same statement, so concurrent replicas drain disjoint
+/// deliveries. A row whose previous claim expired (owner crashed mid-send) is
+/// claimable again once `next_retry_at` keeps it due.
+async fn claim_due_webhook_deliveries(
+    db: &sqlx::PgPool,
+    limit: i64,
+    claimed_by: &str,
+    claim_ttl_secs: f64,
+) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
+    use sqlx::Row;
+
+    let raw_rows = sqlx::query(
+        r#"
+        WITH candidate AS (
+            SELECT id
+            FROM webhook_deliveries
+            WHERE success = false
+              AND next_retry_at IS NOT NULL
+              AND next_retry_at <= NOW()
+              AND attempts < max_attempts
+              AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+            ORDER BY next_retry_at ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE webhook_deliveries d
+        SET claimed_by = $2,
+            claim_token = gen_random_uuid(),
+            claim_expires_at = NOW() + make_interval(secs => $3)
+        FROM candidate
+        WHERE d.id = candidate.id
+        RETURNING d.id, d.webhook_id, d.event, d.payload, d.attempts, d.max_attempts,
+                  d.claim_token, d.claimed_by, d.claim_expires_at
+        "#,
+    )
+    .bind(limit)
+    .bind(claimed_by)
+    .bind(claim_ttl_secs)
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("Failed to claim retry queue: {}", e))?;
+
+    Ok(raw_rows
+        .into_iter()
+        .map(|row| {
+            Claimed::from_claim_row(
+                RetryDeliveryRow {
+                    id: row.get("id"),
+                    webhook_id: row.get("webhook_id"),
+                    event: row.get("event"),
+                    payload: row.get("payload"),
+                    attempts: row.get("attempts"),
+                    max_attempts: row.get("max_attempts"),
+                },
+                row.get("claim_token"),
+                row.get("claimed_by"),
+                row.get("claim_expires_at"),
+            )
+        })
+        .collect())
+}
+
+/// Re-extend the caller's claim on one delivery immediately before the send.
+///
+/// Returns `false` when the claim was lost (expired and re-claimed by another
+/// replica while earlier batch items were being processed) — the caller must
+/// then skip the send entirely, because the new owner will POST it.
+async fn extend_webhook_delivery_claim(
+    db: &sqlx::PgPool,
+    delivery: &Claimed<RetryDeliveryRow>,
+    claim_ttl_secs: f64,
+) -> bool {
+    let result = sqlx::query(
+        r#"
+        UPDATE webhook_deliveries
+        SET claim_expires_at = NOW() + make_interval(secs => $2)
+        WHERE id = $1
+          AND claim_token = $3
+        "#,
+    )
+    .bind(delivery.id)
+    .bind(claim_ttl_secs)
+    .bind(delivery.claim_token())
+    .execute(db)
+    .await;
+
+    match result {
+        Ok(r) => r.rows_affected() == 1,
+        Err(e) => {
+            tracing::warn!(
+                delivery_id = %delivery.id,
+                error = %e,
+                "Failed to extend webhook delivery claim; skipping send"
+            );
+            false
+        }
+    }
+}
+
+/// Mark a claimed delivery as dead (no further retries) without recording an
+/// attempt result: webhook deleted/disabled, URL failed validation, or the
+/// payload could not be serialized. Token-guarded like every other finalizer.
+async fn dead_letter_claimed_delivery(db: &sqlx::PgPool, delivery: &Claimed<RetryDeliveryRow>) {
+    let _ = sqlx::query(
+        "UPDATE webhook_deliveries \
+         SET next_retry_at = NULL, \
+             claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL \
+         WHERE id = $1 AND claim_token = $2",
+    )
+    .bind(delivery.id)
+    .bind(delivery.claim_token())
+    .execute(db)
+    .await;
+}
+
 /// Process failed webhook deliveries that are due for retry.
 ///
-/// Queries the retry queue for deliveries where `next_retry_at <= NOW()`,
-/// attempts the HTTP POST again, and updates the delivery record with the
-/// result. Uses `sqlx::query()` (not the macro) because the new columns
-/// are not in the offline SQLx cache.
+/// Claims due rows (`next_retry_at <= NOW()`) with an atomic
+/// FOR UPDATE SKIP LOCKED batch — so concurrent replicas drain disjoint
+/// deliveries instead of each POSTing the same one — then attempts the HTTP
+/// POST and updates the delivery record by claim token. Uses `sqlx::query()`
+/// (not the macro) because the new columns are not in the offline SQLx cache.
 pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(), String> {
     use sqlx::Row;
 
-    // Fetch deliveries due for retry (using sqlx::query, not the macro)
-    let raw_rows = sqlx::query(
-        r#"
-        SELECT id, webhook_id, event, payload, attempts, max_attempts
-        FROM webhook_deliveries
-        WHERE success = false
-          AND next_retry_at IS NOT NULL
-          AND next_retry_at <= NOW()
-          AND attempts < max_attempts
-        ORDER BY next_retry_at ASC
-        LIMIT 50
-        "#,
+    let rows = claim_due_webhook_deliveries(
+        db,
+        50,
+        WorkerIdentity::for_process().as_str(),
+        WEBHOOK_RETRY_CLAIM_TTL_SECS,
     )
-    .fetch_all(db)
-    .await
-    .map_err(|e| format!("Failed to fetch retry queue: {}", e))?;
-
-    let rows: Vec<RetryDeliveryRow> = raw_rows
-        .into_iter()
-        .map(|row| RetryDeliveryRow {
-            id: row.get("id"),
-            webhook_id: row.get("webhook_id"),
-            event: row.get("event"),
-            payload: row.get("payload"),
-            attempts: row.get("attempts"),
-            max_attempts: row.get("max_attempts"),
-        })
-        .collect();
+    .await?;
 
     if rows.is_empty() {
         return Ok(());
@@ -1650,11 +1781,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             Some(w) => w,
             None => {
                 // Webhook deleted or disabled: mark delivery as dead letter
-                let _ =
-                    sqlx::query("UPDATE webhook_deliveries SET next_retry_at = NULL WHERE id = $1")
-                        .bind(delivery.id)
-                        .execute(db)
-                        .await;
+                dead_letter_claimed_delivery(db, delivery).await;
                 continue;
             }
         };
@@ -1664,10 +1791,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
 
         // Validate URL before delivery (SSRF prevention)
         if validate_webhook_url(&url).is_err() {
-            let _ = sqlx::query("UPDATE webhook_deliveries SET next_retry_at = NULL WHERE id = $1")
-                .bind(delivery.id)
-                .execute(db)
-                .await;
+            dead_letter_claimed_delivery(db, delivery).await;
             tracing::warn!(
                 "Webhook URL failed validation during retry, delivery {} dead-lettered",
                 delivery.id
@@ -1684,11 +1808,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
                     error = %e,
                     "Failed to serialize webhook payload; dead-lettering"
                 );
-                let _ =
-                    sqlx::query("UPDATE webhook_deliveries SET next_retry_at = NULL WHERE id = $1")
-                        .bind(delivery.id)
-                        .execute(db)
-                        .await;
+                dead_letter_claimed_delivery(db, delivery).await;
                 continue;
             }
         };
@@ -1720,6 +1840,18 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             unix_secs,
             body_bytes: &body_bytes,
         };
+        // Re-assert ownership immediately before the side effect: earlier
+        // items in this batch may have taken long enough (30s timeout each)
+        // that this row's claim lapsed and another replica took it over. The
+        // new owner will POST it; sending here too would duplicate it.
+        if !extend_webhook_delivery_claim(db, delivery, WEBHOOK_RETRY_CLAIM_TTL_SECS).await {
+            tracing::info!(
+                delivery_id = %delivery.id,
+                "Webhook retry claim lost before send; skipping (new owner will deliver)"
+            );
+            continue;
+        }
+
         let mut request = client.post(&url);
         for (name, value) in build_delivery_request_headers(&header_inputs) {
             request = request.header(name, value);
@@ -1752,69 +1884,91 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
                     response_body = $3,
                     attempts = $4,
                     delivered_at = NOW(),
-                    next_retry_at = NULL
+                    next_retry_at = NULL,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
                 WHERE id = $1
+                  AND claim_token = $5
                 "#,
             )
             .bind(delivery.id)
             .bind(response_status)
             .bind(&response_body)
             .bind(new_attempts)
+            .bind(delivery.claim_token())
             .execute(db)
             .await;
         } else if outcome == RetryOutcome::DeadLetter {
-            // Max attempts exhausted: dead letter
-            let _ = sqlx::query(
+            // Max attempts exhausted: dead letter. Token-guarded so a stale
+            // owner cannot dead-letter (and auto-disable the webhook for) a
+            // delivery that a new owner is still driving.
+            let dead_lettered = sqlx::query(
                 r#"
                 UPDATE webhook_deliveries
                 SET response_status = $2,
                     response_body = $3,
                     attempts = $4,
-                    next_retry_at = NULL
+                    next_retry_at = NULL,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
                 WHERE id = $1
+                  AND claim_token = $5
                 "#,
             )
             .bind(delivery.id)
             .bind(response_status)
             .bind(&response_body)
             .bind(new_attempts)
+            .bind(delivery.claim_token())
             .execute(db)
             .await;
 
-            tracing::info!(
-                "Webhook delivery {} exhausted {} attempts, dead-lettered",
-                delivery.id,
-                new_attempts
-            );
-
-            // Auto-disable + notifier. Failures here are logged but do
-            // not retry the (already dead-lettered) delivery.
-            if let Err(e) = crate::services::webhook_notifier::auto_disable_webhook_for_dead_letter(
-                db,
-                delivery.webhook_id,
-                delivery.id,
-            )
-            .await
-            {
-                tracing::warn!(
-                    delivery_id = %delivery.id,
-                    webhook_id = %delivery.webhook_id,
-                    error = %e,
-                    "auto-disable on dead-letter failed"
+            let owns_dead_letter =
+                matches!(dead_lettered, Ok(ref result) if result.rows_affected() == 1);
+            if owns_dead_letter {
+                tracing::info!(
+                    "Webhook delivery {} exhausted {} attempts, dead-lettered",
+                    delivery.id,
+                    new_attempts
                 );
-            }
 
-            crate::services::metrics_service::record_webhook_dead_letter(&delivery.event);
+                // Auto-disable + notifier. Failures here are logged but do
+                // not retry the (already dead-lettered) delivery.
+                if let Err(e) =
+                    crate::services::webhook_notifier::auto_disable_webhook_for_dead_letter(
+                        db,
+                        delivery.webhook_id,
+                        delivery.id,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        delivery_id = %delivery.id,
+                        webhook_id = %delivery.webhook_id,
+                        error = %e,
+                        "auto-disable on dead-letter failed"
+                    );
+                }
+
+                crate::services::metrics_service::record_webhook_dead_letter(&delivery.event);
+            }
         } else if let RetryOutcome::Retry { delay_secs } = outcome {
-            // Schedule next retry
+            // Schedule next retry, releasing the claim so any replica can
+            // pick the delivery up once the backoff elapses.
             let _ = sqlx::query(
                 r#"
                 UPDATE webhook_deliveries
                 SET response_status = $2,
                     response_body = $3,
                     attempts = $4,
-                    next_retry_at = NOW() + ($5 || ' seconds')::interval
+                    next_retry_at = NOW() + ($5 || ' seconds')::interval,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
                 WHERE id = $1
+                  AND claim_token = $6
                 "#,
             )
             .bind(delivery.id)
@@ -1822,6 +1976,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             .bind(&response_body)
             .bind(new_attempts)
             .bind(delay_secs.to_string())
+            .bind(delivery.claim_token())
             .execute(db)
             .await;
         }
@@ -3260,6 +3415,12 @@ mod tests {
             matches!(r, Err(AppError::NotFound(_)))
         }
 
+        /// A 403 Forbidden — the deny a management verb emits for a non-admin
+        /// caller after the GHSA-qcmj hardening.
+        fn is_forbidden<T: std::fmt::Debug>(r: &Result<T>) -> bool {
+            matches!(r, Err(AppError::Authorization(_)))
+        }
+
         async fn cleanup(pool: &PgPool, repos: &[Uuid], users: &[Uuid]) {
             for u in users {
                 sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
@@ -3412,8 +3573,9 @@ mod tests {
 
             let wh = insert_webhook(&pool, Some(owner), None).await;
 
-            // Stranger denied: 404 AND the row survives.
-            assert!(is_not_found(
+            // GHSA-qcmj: delete is a management verb -> admin only. A non-admin
+            // stranger is denied with 403 AND the row survives.
+            assert!(is_forbidden(
                 &delete_webhook(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
@@ -3426,26 +3588,30 @@ mod tests {
                 "denied delete must not remove the row"
             );
 
-            // Owner can delete their own.
+            // The non-admin CREATOR is also denied now (the pre-fix soft gate
+            // let the creator delete their own webhook; management is admin-only).
+            assert!(is_forbidden(
+                &delete_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+            assert!(
+                webhook_exists(&pool, wh).await,
+                "non-admin creator delete must not remove the row"
+            );
+
+            // Admin can delete.
             assert!(delete_webhook(
                 axum::extract::State(state.clone()),
-                axum::Extension(auth_for(owner, false)),
+                axum::Extension(auth_for(admin, true)),
                 axum::extract::Path(wh),
             )
             .await
             .is_ok());
             assert!(!webhook_exists(&pool, wh).await);
-
-            // Admin can delete another principal's webhook.
-            let wh2 = insert_webhook(&pool, Some(owner), None).await;
-            assert!(delete_webhook(
-                axum::extract::State(state.clone()),
-                axum::Extension(auth_for(admin, true)),
-                axum::extract::Path(wh2),
-            )
-            .await
-            .is_ok());
-            assert!(!webhook_exists(&pool, wh2).await);
 
             cleanup(&pool, &[], &[owner, stranger, admin]).await;
         }
@@ -3461,12 +3627,14 @@ mod tests {
             };
             let owner = create_user(&pool, false).await;
             let stranger = create_user(&pool, false).await;
+            let admin = create_user(&pool, true).await;
             let state = tdh::build_state(pool.clone(), "/tmp");
 
             let wh = insert_webhook(&pool, Some(owner), None).await;
 
-            // Stranger denied on disable -> 404, state unchanged (still enabled).
-            assert!(is_not_found(
+            // GHSA-qcmj: enable/disable are management verbs -> admin only.
+            // Non-admin stranger denied on disable -> 403, state unchanged.
+            assert!(is_forbidden(
                 &disable_webhook(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
@@ -3479,10 +3647,25 @@ mod tests {
                 "denied disable must not change state"
             );
 
-            // Owner can disable then enable.
+            // The non-admin CREATOR is also denied now (pre-fix, the creator
+            // could toggle their own webhook).
+            assert!(is_forbidden(
+                &disable_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+            assert!(
+                is_enabled(&pool, wh).await,
+                "non-admin creator disable must not change state"
+            );
+
+            // Admin can disable then enable.
             assert!(disable_webhook(
                 axum::extract::State(state.clone()),
-                axum::Extension(auth_for(owner, false)),
+                axum::Extension(auth_for(admin, true)),
                 axum::extract::Path(wh),
             )
             .await
@@ -3491,15 +3674,15 @@ mod tests {
 
             assert!(enable_webhook(
                 axum::extract::State(state.clone()),
-                axum::Extension(auth_for(owner, false)),
+                axum::Extension(auth_for(admin, true)),
                 axum::extract::Path(wh),
             )
             .await
             .is_ok());
             assert!(is_enabled(&pool, wh).await);
 
-            // Stranger denied on enable too.
-            assert!(is_not_found(
+            // Non-admin stranger denied on enable too.
+            assert!(is_forbidden(
                 &enable_webhook(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
@@ -3508,7 +3691,7 @@ mod tests {
                 .await
             ));
 
-            cleanup(&pool, &[], &[owner, stranger]).await;
+            cleanup(&pool, &[], &[owner, stranger, admin]).await;
         }
 
         // ===================================================================
@@ -3526,12 +3709,23 @@ mod tests {
 
             let wh = insert_webhook(&pool, Some(owner), None).await;
 
-            // Stranger denied -> 404 (authz runs before the delivery attempt, so
-            // no outbound request is made for another principal's endpoint).
-            assert!(is_not_found(
+            // GHSA-qcmj: `test` fires an outbound delivery -> management verb,
+            // admin only. A non-admin stranger is denied -> 403, before any
+            // outbound request is made for another principal's endpoint.
+            assert!(is_forbidden(
                 &test_webhook(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+
+            // The non-admin CREATOR is also denied (pre-fix soft gate allowed it).
+            assert!(is_forbidden(
+                &test_webhook(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
                     axum::extract::Path(wh),
                 )
                 .await
@@ -3603,12 +3797,23 @@ mod tests {
             let wh = insert_webhook(&pool, Some(owner), None).await;
             let delivery_id = Uuid::new_v4();
 
-            // Stranger denied -> 404 from the webhook authz gate, before the
-            // delivery row is ever looked up or re-sent.
-            assert!(is_not_found(
+            // GHSA-qcmj: redeliver re-sends (egress) -> management verb, admin
+            // only. Non-admin stranger denied -> 403, before the delivery row is
+            // ever looked up or re-sent.
+            assert!(is_forbidden(
                 &redeliver(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
+                    axum::extract::Path((wh, delivery_id)),
+                )
+                .await
+            ));
+
+            // The non-admin CREATOR is also denied.
+            assert!(is_forbidden(
+                &redeliver(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
                     axum::extract::Path((wh, delivery_id)),
                 )
                 .await
@@ -3633,8 +3838,9 @@ mod tests {
 
             let wh = insert_webhook(&pool, Some(owner), None).await;
 
-            // Stranger denied -> 404.
-            assert!(is_not_found(
+            // GHSA-qcmj: rotate-secret is a management verb -> admin only.
+            // Non-admin stranger denied -> 403.
+            assert!(is_forbidden(
                 &rotate_webhook_secret(
                     axum::extract::State(state.clone()),
                     axum::Extension(auth_for(stranger, false)),
@@ -3643,25 +3849,23 @@ mod tests {
                 .await
             ));
 
-            // Owner passes the authz gate (the rotation may still fail later if
+            // The non-admin CREATOR is also denied now (pre-fix the creator
+            // could rotate — and thus mint — a signing secret for their webhook).
+            assert!(is_forbidden(
+                &rotate_webhook_secret(
+                    axum::extract::State(state.clone()),
+                    axum::Extension(auth_for(owner, false)),
+                    axum::extract::Path(wh),
+                )
+                .await
+            ));
+
+            // Admin passes the authz gate (the rotation may still fail later if
             // the deployment has no `AK_WEBHOOK_SECRET_KEY` configured for
             // encryption — that is orthogonal to authorization, so we only
-            // assert it is NOT the existence-hiding 404 the gate emits).
+            // assert it is NOT the authz 403 the gate emits).
             assert!(
-                !is_not_found(
-                    &rotate_webhook_secret(
-                        axum::extract::State(state.clone()),
-                        axum::Extension(auth_for(owner, false)),
-                        axum::extract::Path(wh),
-                    )
-                    .await
-                ),
-                "owner must pass the rotate authz gate"
-            );
-
-            // Admin passes the authz gate on another principal's webhook.
-            assert!(
-                !is_not_found(
+                !is_forbidden(
                     &rotate_webhook_secret(
                         axum::extract::State(state.clone()),
                         axum::Extension(auth_for(admin, true)),
@@ -3673,6 +3877,35 @@ mod tests {
             );
 
             cleanup(&pool, &[], &[owner, stranger, admin]).await;
+        }
+
+        // ===================================================================
+        // rotate_webhook_secret — secret non-disclosure (GHSA-qcmj)
+        // ===================================================================
+
+        /// The rotate-secret response body must not carry the raw signing
+        /// secret. This is a pure serialization guard (no DB): before the fix
+        /// the response embedded the raw `secret`; after it, only the
+        /// non-reversible `secret_digest` and expiry metadata are present.
+        #[test]
+        fn rotate_response_omits_raw_secret() {
+            let resp = RotateWebhookSecretResponse {
+                id: Uuid::new_v4(),
+                secret_digest: "whsec_pub_abcdef".to_string(),
+                previous_secret_expires_at: chrono::Utc::now(),
+            };
+            let v = serde_json::to_value(&resp).expect("serialize rotate response");
+            let obj = v.as_object().expect("rotate response is a JSON object");
+            assert!(
+                !obj.contains_key("secret"),
+                "rotate response must not carry the raw signing secret, got: {v}"
+            );
+            // The non-reversible digest is still surfaced so callers can
+            // identify the newly active secret.
+            assert!(
+                obj.contains_key("secret_digest"),
+                "rotate response should still expose the display digest"
+            );
         }
 
         // ===================================================================
@@ -3870,6 +4103,192 @@ mod tests {
                 "non-admin create_webhook must be 403, got: {result:?}"
             );
             assert_eq!(count, 0, "a denied create must not persist a webhook");
+        }
+    }
+
+    // =======================================================================
+    // Retry-delivery claims (Tier-2: no-op without DATABASE_URL)
+    // =======================================================================
+
+    mod retry_claim_tests {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        async fn insert_claim_test_webhook(pool: &sqlx::PgPool) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO webhooks (id, name, url, events, is_enabled) \
+                 VALUES ($1, $2, 'http://198.51.100.7/hook', ARRAY['artifact.created'], true)",
+            )
+            .bind(id)
+            .bind(format!("wh-claim-{}", &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert webhook");
+            id
+        }
+
+        async fn insert_due_delivery(pool: &sqlx::PgPool, webhook_id: Uuid) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO webhook_deliveries \
+                     (webhook_id, event, payload, success, attempts, max_attempts, next_retry_at) \
+                 VALUES ($1, 'artifact.created', '{}'::jsonb, false, 1, 5, \
+                         NOW() - INTERVAL '1 minute') \
+                 RETURNING id",
+            )
+            .bind(webhook_id)
+            .fetch_one(pool)
+            .await
+            .expect("insert delivery")
+        }
+
+        async fn cleanup_claim_test(pool: &sqlx::PgPool, webhook_id: Uuid) {
+            let _ = sqlx::query("DELETE FROM webhook_deliveries WHERE webhook_id = $1")
+                .bind(webhook_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM webhooks WHERE id = $1")
+                .bind(webhook_id)
+                .execute(pool)
+                .await;
+        }
+
+        async fn release_test_claim(pool: &sqlx::PgPool, delivery: &Claimed<RetryDeliveryRow>) {
+            let _ = sqlx::query(
+                "UPDATE webhook_deliveries \
+                 SET claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL \
+                 WHERE id = $1 AND claim_token = $2",
+            )
+            .bind(delivery.id)
+            .bind(delivery.claim_token())
+            .execute(pool)
+            .await;
+        }
+
+        async fn release_foreign_test_claims(
+            pool: &sqlx::PgPool,
+            deliveries: &[Claimed<RetryDeliveryRow>],
+            fixture_delivery_id: Uuid,
+        ) {
+            for delivery in deliveries {
+                if delivery.id != fixture_delivery_id {
+                    release_test_claim(pool, delivery).await;
+                }
+            }
+        }
+
+        async fn claim_fixture_delivery(
+            pool: &sqlx::PgPool,
+            fixture_delivery_id: Uuid,
+            claimed_by: &str,
+            claim_ttl_secs: f64,
+        ) -> Claimed<RetryDeliveryRow> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
+
+            loop {
+                let mut claimed =
+                    claim_due_webhook_deliveries(pool, 50, claimed_by, claim_ttl_secs)
+                        .await
+                        .expect("claim ok");
+
+                let fixture_index = claimed
+                    .iter()
+                    .position(|delivery| delivery.id == fixture_delivery_id);
+
+                release_foreign_test_claims(pool, &claimed, fixture_delivery_id).await;
+
+                if let Some(index) = fixture_index {
+                    return claimed.swap_remove(index);
+                }
+
+                if tokio::time::Instant::now() >= deadline {
+                    let row: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+                        sqlx::query_as(
+                            "SELECT claimed_by, claim_expires_at \
+                             FROM webhook_deliveries WHERE id = $1",
+                        )
+                        .bind(fixture_delivery_id)
+                        .fetch_optional(pool)
+                        .await
+                        .expect("fetch fixture delivery claim state");
+                    panic!(
+                        "fixture delivery {fixture_delivery_id} was not claimed by {claimed_by}; \
+                         current claim state: {row:?}"
+                    );
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+
+        /// One due delivery is handed to exactly one claimer while the claim
+        /// lives — the property that stops one failed delivery being POSTed
+        /// once per replica per tick.
+        #[tokio::test]
+        async fn claim_due_webhook_deliveries_is_exactly_once() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let webhook_id = insert_claim_test_webhook(&pool).await;
+            let delivery_id = insert_due_delivery(&pool, webhook_id).await;
+
+            let first = claim_fixture_delivery(&pool, delivery_id, "replica-a", 60.0).await;
+            assert_eq!(first.id, delivery_id);
+            assert_eq!(first.claimed_by(), "replica-a");
+
+            let second = claim_due_webhook_deliveries(&pool, 50, "replica-b", 60.0)
+                .await
+                .expect("claim ok");
+            release_foreign_test_claims(&pool, &second, delivery_id).await;
+            assert!(
+                second.iter().all(|d| d.id != delivery_id),
+                "a claimed delivery must not be handed to a second replica"
+            );
+
+            cleanup_claim_test(&pool, webhook_id).await;
+        }
+
+        /// A crashed owner's claim expires and the delivery becomes claimable
+        /// again; the stale owner is then fenced out of both the pre-send
+        /// extension and the dead-letter finalizer.
+        #[tokio::test]
+        async fn expired_webhook_claim_recovers_and_fences_stale_owner() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let webhook_id = insert_claim_test_webhook(&pool).await;
+            let delivery_id = insert_due_delivery(&pool, webhook_id).await;
+
+            // "Dead" owner claims with an already-expired TTL.
+            let stale_delivery =
+                claim_fixture_delivery(&pool, delivery_id, "replica-dead", -1.0).await;
+
+            // A new owner can claim the same delivery once the TTL lapsed.
+            let fresh_delivery =
+                claim_fixture_delivery(&pool, delivery_id, "replica-new", 60.0).await;
+            assert_eq!(fresh_delivery.id, delivery_id);
+            assert_eq!(fresh_delivery.claimed_by(), "replica-new");
+
+            // The stale owner cannot re-extend its lapsed claim before a send.
+            assert!(
+                !extend_webhook_delivery_claim(&pool, &stale_delivery, 60.0).await,
+                "stale owner must not be able to extend a superseded claim"
+            );
+
+            // Nor can it dead-letter the row out from under the new owner.
+            dead_letter_claimed_delivery(&pool, &stale_delivery).await;
+            let next_retry_at: Option<chrono::DateTime<chrono::Utc>> =
+                sqlx::query_scalar("SELECT next_retry_at FROM webhook_deliveries WHERE id = $1")
+                    .bind(delivery_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("fetch delivery");
+            assert!(
+                next_retry_at.is_some(),
+                "stale owner must not dead-letter a re-claimed delivery"
+            );
+
+            cleanup_claim_test(&pool, webhook_id).await;
         }
     }
 }

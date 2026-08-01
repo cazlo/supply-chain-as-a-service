@@ -345,7 +345,7 @@ async fn upload_plugin(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "jetbrains", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "jetbrains", "write:artifacts")?.user_id;
     let repo = resolve_jetbrains_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -408,6 +408,8 @@ async fn upload_plugin(
 
     // Store the file
     let storage_key = format!("jetbrains/{}/{}/{}", plugin_name, plugin_version, filename);
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -880,6 +882,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());

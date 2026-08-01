@@ -151,7 +151,9 @@ pub struct Config {
     /// Deployment environment name (e.g. "development", "staging", "production")
     pub environment: String,
 
-    /// Storage backend: "filesystem" or "s3"
+    /// Storage backend: one of `filesystem`, `s3`, `gcs`, or `azure`.
+    /// Validated at startup by [`Config::validate_storage_backend`]; an
+    /// unrecognized value is rejected rather than silently defaulted.
     pub storage_backend: String,
 
     /// Filesystem storage path (when storage_backend = "filesystem")
@@ -159,6 +161,15 @@ pub struct Config {
 
     /// S3 bucket name (when storage_backend = "s3")
     pub s3_bucket: Option<String>,
+
+    /// Dedicated S3 bucket for backup archives (`BACKUP_S3_BUCKET`).
+    ///
+    /// When set (and `storage_backend = "s3"`) the backup subsystem reads and
+    /// writes backup archives to this bucket instead of the primary
+    /// `s3_bucket`, so operators can apply a different lifecycle/retention
+    /// policy to backups. When unset, backups continue to live in the primary
+    /// storage bucket, so existing deployments are unaffected.
+    pub backup_s3_bucket: Option<String>,
 
     /// GCS bucket name (when storage_backend = "gcs")
     pub gcs_bucket: Option<String>,
@@ -273,6 +284,15 @@ pub struct Config {
     /// endpoints regardless of this flag.
     pub expose_detailed_health: bool,
 
+    /// Optional operator-supplied instruction for retrieving the generated
+    /// initial admin password, shown on the first-time-setup login screen. The
+    /// default screen text assumes a Docker Compose deployment
+    /// (`docker exec ... cat .../admin.password`), which is wrong for
+    /// Kubernetes and packaged installs. When set, the web UI renders this
+    /// string in place of the default instruction; when unset (the default),
+    /// the existing built-in text is shown unchanged. Env `SETUP_PASSWORD_HINT`.
+    pub setup_password_hint: Option<String>,
+
     /// When true, the gRPC server registers the tonic server-reflection
     /// service, which lets clients enumerate the full service catalog, every
     /// RPC method, and message schemas without authentication. Reflection is
@@ -330,6 +350,12 @@ pub struct Config {
 
     /// Cron expression (6-field) for storage garbage collection (default: hourly).
     pub gc_schedule: String,
+
+    /// Cron expression (6-field) for the deduplicated storage-stats refresher
+    /// (#2056; default: every 4 hours). The refresher recomputes the
+    /// materialized `repository_storage_stats` / `instance_storage_stats` so
+    /// the storage API reads are O(1). It also runs right after each GC pass.
+    pub storage_stats_schedule: String,
 
     /// Whether scheduled blob garbage collection is allowed to actually
     /// delete blobs (#1408). Defaults to `false`: blob deletion is the
@@ -687,6 +713,19 @@ pub struct Config {
     /// so a Redis outage degrades to per-replica caching instead of failing
     /// requests. Env `NPM_PACKUMENT_CACHE_REDIS_URL`.
     pub npm_packument_cache_redis_url: Option<String>,
+
+    // -- npm upstream replication feed (#2249) --
+    /// Opt-in: subscribe to npm's public replication feed and proactively
+    /// invalidate cached computed packuments when packages change upstream,
+    /// so new releases become visible without waiting out the fresh window.
+    /// Best-effort: the packument cache TTLs remain the staleness floor. One
+    /// replica consumes cluster-wide (advisory lock). Env
+    /// `NPM_UPSTREAM_FEED_ENABLED`, default `false`.
+    pub npm_upstream_feed_enabled: bool,
+
+    /// Endpoint of the npm replication feed. Env `NPM_UPSTREAM_FEED_URL`,
+    /// default `https://replicate.npmjs.com/_changes`.
+    pub npm_upstream_feed_url: String,
 }
 
 redacted_debug!(Config {
@@ -697,6 +736,7 @@ redacted_debug!(Config {
     show storage_backend,
     show storage_path,
     show s3_bucket,
+    show backup_s3_bucket,
     show gcs_bucket,
     show s3_region,
     show s3_endpoint,
@@ -722,6 +762,7 @@ redacted_debug!(Config {
     show demo_mode,
     show guest_access_enabled,
     show expose_detailed_health,
+    show setup_password_hint,
     show grpc_reflection_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
@@ -733,6 +774,7 @@ redacted_debug!(Config {
     show otel_exporter_otlp_endpoint,
     show otel_service_name,
     show gc_schedule,
+    show storage_stats_schedule,
     show blob_gc_enabled,
     show blob_gc_sweep_grace_secs,
     show lifecycle_check_interval_secs,
@@ -793,6 +835,8 @@ redacted_debug!(Config {
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
     redact_option npm_packument_cache_redis_url,
+    show npm_upstream_feed_enabled,
+    redact npm_upstream_feed_url,
 });
 
 impl Default for Config {
@@ -805,6 +849,7 @@ impl Default for Config {
             storage_backend: "filesystem".into(),
             storage_path: "/tmp/artifact-keeper-test".into(),
             s3_bucket: None,
+            backup_s3_bucket: None,
             gcs_bucket: None,
             s3_region: None,
             s3_endpoint: None,
@@ -830,6 +875,7 @@ impl Default for Config {
             demo_mode: false,
             guest_access_enabled: true,
             expose_detailed_health: false,
+            setup_password_hint: None,
             grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
@@ -841,6 +887,7 @@ impl Default for Config {
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "artifact-keeper".into(),
             gc_schedule: "0 0 * * * *".into(),
+            storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
@@ -906,6 +953,9 @@ impl Default for Config {
             npm_packument_cache_stale_max_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
             npm_packument_cache_redis_url: None,
+            npm_upstream_feed_enabled: false,
+            npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
+                .into(),
         }
     }
 }
@@ -936,6 +986,7 @@ impl Config {
                 }
             }),
             s3_bucket: env::var("S3_BUCKET").ok(),
+            backup_s3_bucket: env::var("BACKUP_S3_BUCKET").ok(),
             gcs_bucket: env::var("GCS_BUCKET").ok(),
             s3_region: env::var("S3_REGION").ok(),
             s3_endpoint: env::var("S3_ENDPOINT").ok(),
@@ -986,6 +1037,14 @@ impl Config {
             expose_detailed_health: parse_opt_in_flag(
                 env::var("EXPOSE_DETAILED_HEALTH").ok().as_deref(),
             ),
+            // Deployment-aware first-run instruction (#2802): the default
+            // setup screen text assumes Docker Compose. Operators on
+            // Kubernetes or packaged installs can override it here. Empty or
+            // unset leaves the built-in default in place.
+            setup_password_hint: env::var("SETUP_PASSWORD_HINT")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             // Info-disclosure hardening (#2226): gRPC server reflection exposes
             // the whole service catalog + schemas to unauthenticated peers, so
             // it is OFF unless explicitly enabled (dev/CI grpcurl tooling).
@@ -1030,6 +1089,8 @@ impl Config {
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
+            storage_stats_schedule: env::var("STORAGE_STATS_SCHEDULE")
+                .unwrap_or_else(|_| "0 0 */4 * * *".into()),
             // Blob deletion is the dangerous half of GC. Defaults to false
             // so the scheduled pass dry-runs unless an operator opts in.
             // Accepts "true" / "1" (case-insensitive); anything else
@@ -1224,9 +1285,21 @@ impl Config {
             npm_packument_cache_redis_url: env::var("NPM_PACKUMENT_CACHE_REDIS_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            // Off by default; only an explicit, recognized positive enables
+            // the npm replication-feed consumer (#2249).
+            npm_upstream_feed_enabled: parse_opt_in_flag(
+                env::var("NPM_UPSTREAM_FEED_ENABLED").ok().as_deref(),
+            ),
+            npm_upstream_feed_url: env::var("NPM_UPSTREAM_FEED_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into()
+                }),
         };
 
         config.validate_jwt_secret()?;
+        config.validate_storage_backend()?;
         config.validate_storage_paths()?;
 
         Ok(config)
@@ -1247,6 +1320,28 @@ impl Config {
                 "JWT_SECRET is unsuitable: {reason} \
                  Generate a secure random secret (e.g. `openssl rand -base64 48`)."
             )));
+        }
+        Ok(())
+    }
+
+    /// Validate that `STORAGE_BACKEND` names a recognized backend.
+    ///
+    /// An unrecognized value (a typo such as `gcs-prod`, or `s3 ` with a stray
+    /// trailing space) must never reach runtime. `main.rs` selects the primary
+    /// backend with a `match` whose catch-all arm silently falls back to the
+    /// filesystem backend, so a typo boots green while the deployment believes
+    /// it is running a cloud object store. Worse, [`backend_is_repo_isolated`]
+    /// keys the #2504 cross-tenant isolation guards off this exact string, so a
+    /// silent mismatch runs the wrong store with the wrong isolation semantics.
+    /// Reject the misconfiguration at startup instead. This is a
+    /// `from_env`-only check (like [`Config::validate_jwt_secret`]);
+    /// constructing `Config` directly skips it. Detection lives in the pure,
+    /// unit-testable [`storage_backend_error`] helper.
+    ///
+    /// [`backend_is_repo_isolated`]: crate::storage::backend_is_repo_isolated
+    fn validate_storage_backend(&self) -> Result<()> {
+        if let Some(message) = storage_backend_error(&self.storage_backend) {
+            return Err(AppError::Config(message));
         }
         Ok(())
     }
@@ -1379,6 +1474,38 @@ pub(crate) fn jwt_secret_strength_error(secret: &str) -> Option<&'static str> {
     jwt_secret_warnings(secret).first().map(|w| w.message())
 }
 
+/// Storage backends recognized by `STORAGE_BACKEND`.
+///
+/// `filesystem` gives each repository a physically isolated key space;
+/// `s3`, `gcs`, and `azure` are shared cloud object stores. These are exactly
+/// the values `main.rs` builds a primary backend for — any other value is an
+/// operator misconfiguration. Kept as a single source of truth so the validator
+/// and its error message never drift from the set of backends the binary can
+/// actually construct.
+pub(crate) const SUPPORTED_STORAGE_BACKENDS: [&str; 4] = ["filesystem", "s3", "gcs", "azure"];
+
+/// Pure validator for `STORAGE_BACKEND`. Returns `Some(message)` naming the
+/// offending value and listing [`SUPPORTED_STORAGE_BACKENDS`] when the value is
+/// not recognized, or `None` when it is one of the supported backends.
+///
+/// Used by the startup `from_env` check so an unrecognized value fails fast
+/// instead of silently falling back to the filesystem backend (see
+/// [`Config::validate_storage_backend`] for why that silent fallback is unsafe).
+pub(crate) fn storage_backend_error(storage_backend: &str) -> Option<String> {
+    if SUPPORTED_STORAGE_BACKENDS.contains(&storage_backend) {
+        return None;
+    }
+    Some(format!(
+        "STORAGE_BACKEND=`{storage_backend}` is not a recognized storage backend. \
+         Supported values are: {}. An unrecognized value silently falls back to the \
+         `filesystem` backend at startup, so the service would run the wrong store \
+         while looking healthy and the #2504 cross-tenant isolation guards \
+         (keyed off the backend name) would apply the wrong semantics; set \
+         STORAGE_BACKEND to one of the supported values.",
+        SUPPORTED_STORAGE_BACKENDS.join(", ")
+    ))
+}
+
 /// Pure filesystem-storage path gate. Returns `Some(message)` describing the
 /// first offending path (naming the env var and value), or `None` if the paths
 /// are acceptable for the selected backend.
@@ -1464,6 +1591,16 @@ mod tests {
     // We use a mutex to prevent parallel test interference.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    // The sentinel DATABASE_URL these tests export deliberately points at
+    // `127.0.0.1:1` (a port nothing listens on, so connects are REFUSED
+    // instantly) rather than `localhost:5432`. `std::env` is process-global
+    // and ENV_MUTEX only serializes THIS module, so while any of these tests
+    // runs, concurrently-starting DB-gated tests elsewhere in the suite can
+    // observe the sentinel via `testing::require_db_url()`. Pointing it at a
+    // real Postgres port meant those tests tried to speak to whatever squats
+    // on :5432 — and a listener that accepts but never answers turned each
+    // observation into a long (pre-#2986: unbounded) stall. An
+    // instantly-refused sentinel makes a window-sampled URL cost microseconds.
     /// Restore an env var to a previously captured value (or remove it if it
     /// was unset), so env-mutating tests do not leak state to other tests.
     fn restore_env(key: &str, saved: Option<String>) {
@@ -1520,10 +1657,19 @@ mod tests {
     #[test]
     fn test_config_rate_limit_enabled_by_default() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("RATE_LIMIT_ENABLED").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("RATE_LIMIT_ENABLED");
         let config = Config::from_env().expect("config should load");
+        // Restore BEFORE asserting: a leaked `DATABASE_URL` outlives this
+        // test and re-routes every later DB-gated test in the process from
+        // "skip cleanly" to "connect to a bogus localhost database" (#2986).
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("RATE_LIMIT_ENABLED", saved_flag);
         assert!(
             config.rate_limit_enabled,
             "rate limiting must be ON by default (#1602)"
@@ -1533,11 +1679,16 @@ mod tests {
     #[test]
     fn test_config_rate_limit_disabled_via_env() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("RATE_LIMIT_ENABLED").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_ENABLED", "false");
         let config = Config::from_env().expect("config should load");
-        env::remove_var("RATE_LIMIT_ENABLED");
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("RATE_LIMIT_ENABLED", saved_flag);
         assert!(
             !config.rate_limit_enabled,
             "RATE_LIMIT_ENABLED=false must disable rate limiting"
@@ -1547,11 +1698,15 @@ mod tests {
     #[test]
     fn test_config_login_rate_limit_env_override() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_LOGIN_PER_WINDOW", "3");
         env::set_var("RATE_LIMIT_LOGIN_WINDOW_SECS", "600");
         let config = Config::from_env().expect("config should load");
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
         env::remove_var("RATE_LIMIT_LOGIN_PER_WINDOW");
         env::remove_var("RATE_LIMIT_LOGIN_WINDOW_SECS");
         assert_eq!(
@@ -1571,7 +1726,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("BLOB_GC_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("BLOB_GC_ENABLED");
 
@@ -1671,7 +1826,7 @@ mod tests {
         let saved_conc = env::var("GLOBAL_MAX_CONCURRENCY").ok();
         let saved_to = env::var("GLOBAL_REQUEST_TIMEOUT_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("GLOBAL_MAX_CONCURRENCY", "0");
         env::set_var("GLOBAL_REQUEST_TIMEOUT_SECS", "0");
@@ -1708,7 +1863,7 @@ mod tests {
         let saved_conc = env::var("GLOBAL_MAX_CONCURRENCY").ok();
         let saved_to = env::var("GLOBAL_REQUEST_TIMEOUT_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("GLOBAL_MAX_CONCURRENCY", "1024");
         env::set_var("GLOBAL_REQUEST_TIMEOUT_SECS", "300");
@@ -1888,7 +2043,7 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let saved_db = env::var("DATABASE_URL").ok();
         let saved_jwt = env::var("JWT_SECRET").ok();
-        env::set_var("DATABASE_URL", "postgresql://localhost/test");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/test");
         env::remove_var("JWT_SECRET");
 
         let result = Config::from_env();
@@ -1919,7 +2074,7 @@ mod tests {
         let saved_demo = env::var("DEMO_MODE").ok();
 
         // Set only required vars
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Remove optional vars to test defaults
@@ -1936,7 +2091,7 @@ mod tests {
 
         let config = Config::from_env().expect("Config should load with required vars");
 
-        assert_eq!(config.database_url, "postgresql://localhost/testdb");
+        assert_eq!(config.database_url, "postgresql://127.0.0.1:1/testdb");
         assert_eq!(config.jwt_secret, STRONG_SECRET);
         assert_eq!(config.bind_address, "0.0.0.0:8080");
         assert_eq!(config.log_level, "info");
@@ -2023,7 +2178,7 @@ mod tests {
         let saved_idle = env::var("DATABASE_IDLE_TIMEOUT_SECS").ok();
         let saved_life = env::var("DATABASE_MAX_LIFETIME_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DATABASE_MAX_CONNECTIONS", "50");
         env::set_var("DATABASE_MIN_CONNECTIONS", "10");
@@ -2071,7 +2226,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_max = env::var("DATABASE_MAX_CONNECTIONS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DATABASE_MAX_CONNECTIONS", "not-a-number");
 
@@ -2105,7 +2260,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_demo = env::var("DEMO_MODE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DEMO_MODE", "true");
 
@@ -2150,7 +2305,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("AK_GUEST_ACCESS_ENABLED");
 
@@ -2175,6 +2330,55 @@ mod tests {
     }
 
     #[test]
+    fn test_config_setup_password_hint() {
+        // Issue #2802: the first-run password retrieval hint is opt-in. Unset
+        // (and blank/whitespace-only) values must leave it as None so the web
+        // UI keeps its built-in default text; a real value is trimmed and
+        // passed through verbatim.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_hint = env::var("SETUP_PASSWORD_HINT").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Unset -> None (default behavior unchanged).
+        env::remove_var("SETUP_PASSWORD_HINT");
+        assert_eq!(Config::from_env().unwrap().setup_password_hint, None);
+
+        // Blank / whitespace-only -> None.
+        env::set_var("SETUP_PASSWORD_HINT", "   ");
+        assert_eq!(Config::from_env().unwrap().setup_password_hint, None);
+
+        // Real value -> Some, trimmed.
+        env::set_var(
+            "SETUP_PASSWORD_HINT",
+            "  kubectl exec deploy/artifact-keeper -- cat /data/storage/admin.password  ",
+        );
+        assert_eq!(
+            Config::from_env().unwrap().setup_password_hint.as_deref(),
+            Some("kubectl exec deploy/artifact-keeper -- cat /data/storage/admin.password"),
+        );
+
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_hint {
+            env::set_var("SETUP_PASSWORD_HINT", v);
+        } else {
+            env::remove_var("SETUP_PASSWORD_HINT");
+        }
+    }
+
+    #[test]
     fn test_config_guest_access_enabled_explicit_values() {
         // Verify that "false" and "0" disable guest access, while anything
         // else (including "true", "1", garbage, and empty string) keeps it
@@ -2186,7 +2390,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::set_var("AK_GUEST_ACCESS_ENABLED", "false");
@@ -2242,7 +2446,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("EXPOSE_DETAILED_HEALTH").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("EXPOSE_DETAILED_HEALTH");
 
@@ -2262,7 +2466,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("EXPOSE_DETAILED_HEALTH").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::set_var("EXPOSE_DETAILED_HEALTH", "true");
@@ -2292,7 +2496,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("GRPC_REFLECTION_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("GRPC_REFLECTION_ENABLED");
 
@@ -2311,7 +2515,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("GRPC_REFLECTION_ENABLED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::set_var("GRPC_REFLECTION_ENABLED", "true");
@@ -2348,7 +2552,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("PLUGINS_REQUIRE_SIGNED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("PLUGINS_REQUIRE_SIGNED");
 
@@ -2368,7 +2572,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("PLUGINS_REQUIRE_SIGNED").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::set_var("PLUGINS_REQUIRE_SIGNED", "false");
@@ -2402,7 +2606,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_key = env::var("PLUGINS_TRUSTED_PUBKEY").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         env::remove_var("PLUGINS_TRUSTED_PUBKEY");
@@ -2432,7 +2636,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("ALLOW_LOCAL_ADMIN_LOGIN").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Default is false
@@ -2480,7 +2684,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_flag = env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
 
         // Default is false: the admin break-glass stays enabled (#2018).
@@ -2517,7 +2721,7 @@ mod tests {
         let saved_access = env::var("JWT_ACCESS_TOKEN_EXPIRY_MINUTES").ok();
         let saved_refresh = env::var("JWT_REFRESH_TOKEN_EXPIRY_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("JWT_EXPIRATION_SECS", "3600");
         env::set_var("JWT_ACCESS_TOKEN_EXPIRY_MINUTES", "15");
@@ -2563,7 +2767,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_gc = env::var("GC_SCHEDULE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("GC_SCHEDULE");
 
@@ -2593,7 +2797,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_gc = env::var("GC_SCHEDULE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("GC_SCHEDULE", "0 30 2 * * *");
 
@@ -2625,7 +2829,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_lc = env::var("LIFECYCLE_CHECK_INTERVAL_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("LIFECYCLE_CHECK_INTERVAL_SECS");
 
@@ -2655,7 +2859,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_lc = env::var("LIFECYCLE_CHECK_INTERVAL_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("LIFECYCLE_CHECK_INTERVAL_SECS", "300");
 
@@ -2689,7 +2893,7 @@ mod tests {
         let saved_region = env::var("S3_REGION").ok();
         let saved_endpoint = env::var("S3_ENDPOINT").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("S3_BUCKET", "my-bucket");
         env::set_var("S3_REGION", "us-east-1");
@@ -2729,13 +2933,51 @@ mod tests {
     }
 
     #[test]
+    fn test_config_backup_s3_bucket_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_backup_bucket = env::var("BACKUP_S3_BUCKET").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Unset => None (default behavior, backups reuse the primary bucket).
+        env::remove_var("BACKUP_S3_BUCKET");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.backup_s3_bucket, None);
+
+        // Set => surfaced on the config so the backup subsystem can route to it.
+        env::set_var("BACKUP_S3_BUCKET", "ak-backups-cold");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.backup_s3_bucket.as_deref(), Some("ak-backups-cold"));
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_backup_bucket {
+            env::set_var("BACKUP_S3_BUCKET", v);
+        } else {
+            env::remove_var("BACKUP_S3_BUCKET");
+        }
+    }
+
+    #[test]
     fn test_config_max_upload_size_default() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let saved_db = env::var("DATABASE_URL").ok();
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_max = env::var("MAX_UPLOAD_SIZE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("MAX_UPLOAD_SIZE");
 
@@ -2765,7 +3007,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_max = env::var("MAX_UPLOAD_SIZE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("MAX_UPLOAD_SIZE", "1073741824"); // 1 GB
 
@@ -2797,7 +3039,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_port = env::var("METRICS_PORT").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("METRICS_PORT");
 
@@ -2827,7 +3069,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_port = env::var("METRICS_PORT").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("METRICS_PORT", "9091");
 
@@ -2859,7 +3101,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_port = env::var("METRICS_PORT").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("METRICS_PORT", "not-a-port");
 
@@ -2891,7 +3133,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_max = env::var("MAX_UPLOAD_SIZE").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("MAX_UPLOAD_SIZE", "0");
 
@@ -3023,7 +3265,7 @@ mod tests {
     #[test]
     fn test_proxy_singleflight_advisory_locks_disabled_by_default() {
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
         env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
@@ -3037,7 +3279,7 @@ mod tests {
     #[test]
     fn test_proxy_singleflight_advisory_locks_opt_in() {
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED", "true");
         env::set_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS", "125");
@@ -3071,7 +3313,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::remove_var("RATE_LIMIT_API_PER_MIN");
 
@@ -3105,7 +3347,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_API_PER_MIN", "25000");
 
@@ -3140,7 +3382,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "30,14,7,3,1");
 
@@ -3172,7 +3414,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "7,7,3,14,3");
 
@@ -3204,7 +3446,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "0,7,0,1");
 
@@ -3236,7 +3478,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "abc,7,,1,xyz");
 
@@ -3268,7 +3510,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_interval = env::var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS", "1800");
 
@@ -3303,7 +3545,7 @@ mod tests {
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_search = env::var("RATE_LIMIT_SEARCH_PER_MIN").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("RATE_LIMIT_SEARCH_PER_MIN", "500");
 
@@ -3344,7 +3586,7 @@ mod tests {
         let saved_db = env::var("DATABASE_URL").ok();
         let saved_jwt = env::var("JWT_SECRET").ok();
         let saved_dt = env::var("DEPENDENCY_TRACK_ENABLED").ok();
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         match value {
             Some(v) => env::set_var("DEPENDENCY_TRACK_ENABLED", v),
@@ -3450,7 +3692,7 @@ mod tests {
         let saved_dt = env::var("DEPENDENCY_TRACK_ENABLED").ok();
         let saved_url = env::var("DEPENDENCY_TRACK_URL").ok();
 
-        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
         env::set_var("JWT_SECRET", STRONG_SECRET);
         env::set_var("DEPENDENCY_TRACK_URL", "http://dt.example.com:8081");
         env::remove_var("DEPENDENCY_TRACK_ENABLED");
@@ -3717,6 +3959,49 @@ mod tests {
         assert!(storage_path_error("gcs", "some/prefix", "").is_none());
     }
 
+    // -- storage_backend_error (#2669) ---------------------------------------
+
+    #[test]
+    fn storage_backend_error_accepts_every_supported_backend() {
+        // Each recognized backend must validate cleanly (no error).
+        for backend in SUPPORTED_STORAGE_BACKENDS {
+            assert!(
+                storage_backend_error(backend).is_none(),
+                "supported backend `{backend}` should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_backend_error_rejects_typo_and_names_value_and_supported_set() {
+        // Regression for #2669: an unrecognized value (here a typo) must be an
+        // error rather than silently defaulting to filesystem. Before the fix
+        // this string was accepted verbatim and main.rs's catch-all arm ran the
+        // filesystem backend under the wrong isolation semantics.
+        let message = storage_backend_error("gcs-prod").expect("a typo backend must be rejected");
+        assert!(
+            message.contains("gcs-prod"),
+            "message should name the offending value: {message}"
+        );
+        // The message must list the supported set so the operator can fix it.
+        for backend in SUPPORTED_STORAGE_BACKENDS {
+            assert!(
+                message.contains(backend),
+                "message should list supported backend `{backend}`: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_backend_error_rejects_whitespace_padded_value() {
+        // `s3 ` (trailing space) is the classic env-var typo: it is NOT `s3`,
+        // so it must be rejected rather than silently falling back.
+        assert!(storage_backend_error("s3 ").is_some());
+        assert!(storage_backend_error(" s3").is_some());
+        assert!(storage_backend_error("S3").is_some());
+        assert!(storage_backend_error("").is_some());
+    }
+
     /// Extract the text of a top-level `services.<name>` block (a 2-space
     /// indented key) from a compose file, up to the next sibling service or
     /// 2-space-indented line. Comment lines are stripped so assertions match
@@ -3749,22 +4034,83 @@ mod tests {
         out
     }
 
+    /// Read a compose file relative to the repo root, panicking with the path
+    /// on failure so a missing/renamed file fails loudly instead of silently
+    /// passing an empty-string check. Test-only.
+    fn read_compose(repo_root: &std::path::Path, file_name: &str) -> String {
+        let compose_path = repo_root.join(file_name);
+        std::fs::read_to_string(&compose_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", compose_path.display()))
+    }
+
+    /// List every top-level `docker-compose*.yml` file at the repo root. Used
+    /// so the regression guard below automatically covers any compose file
+    /// added in future, instead of a hardcoded list that can silently miss
+    /// one the way `docker-compose.local-dev.yml` was missed after #2126.
+    /// Test-only.
+    fn discover_compose_files(repo_root: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(repo_root)
+            .expect("read repo root")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("docker-compose") && name.ends_with(".yml"))
+            .collect();
+        files.sort();
+        files
+    }
+
     /// Regression guard for #2084: the hardened runtime image (#2059) ships no
     /// `/bin/sh`, so no compose service that runs that image may be launched
     /// through a shell. On `main` the `backend` service used
     /// `entrypoint: ["/bin/sh","-c", <wait-for-DT-key>]` and `dtrack-init` ran
     /// the backend image via `/bin/sh`; both broke `docker compose up` with
     /// `exec: "/bin/sh": no such file or directory`.
+    ///
+    /// #2126 fixed this in `docker-compose.yml` only. `docker-compose.local-
+    /// dev.yml` carried an independent copy of the `dtrack-init` service that
+    /// pulled the same hardened `ghcr.io/.../artifact-keeper-backend` image
+    /// and drifted back into the identical broken pattern because nothing
+    /// checked it. Rather than hardcode that one other file, every
+    /// `docker-compose*.yml` at the repo root is scanned for a `dtrack-init`
+    /// service, so a future compose file can't reintroduce this silently.
+    ///
+    /// `docker-compose.yml`'s `backend` service additionally may never use a
+    /// shell entrypoint: unlike every other compose file's `backend`/`backend-
+    /// peer-*` services (which either build their own shell-bearing dev image
+    /// or run the hardened image with no entrypoint override), it is the only
+    /// one this repo has ever wrapped in `/bin/sh -c`.
     #[test]
     fn shipped_compose_does_not_run_hardened_image_through_a_shell() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("backend crate has a parent directory (repo root)");
-        let compose_path = repo_root.join("docker-compose.yml");
-        let compose = std::fs::read_to_string(&compose_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", compose_path.display()));
 
-        let backend = compose_service_block(&compose, "backend");
+        let compose_files = discover_compose_files(repo_root);
+        assert!(
+            compose_files.iter().any(|f| f == "docker-compose.yml")
+                && compose_files
+                    .iter()
+                    .any(|f| f == "docker-compose.local-dev.yml"),
+            "expected to discover both docker-compose.yml and \
+             docker-compose.local-dev.yml among the repo's compose files, \
+             found: {compose_files:?}"
+        );
+
+        for file_name in &compose_files {
+            let compose = read_compose(repo_root, file_name);
+            let dtrack_init = compose_service_block(&compose, "dtrack-init");
+            if dtrack_init.is_empty() {
+                continue;
+            }
+            assert!(
+                !dtrack_init.contains("artifact-keeper-backend"),
+                "dtrack-init in {file_name} must not run the shell-less backend \
+                 image (#2084). Offending block:\n{dtrack_init}"
+            );
+        }
+
+        let prod_compose = read_compose(repo_root, "docker-compose.yml");
+        let backend = compose_service_block(&prod_compose, "backend");
         assert!(
             !backend.is_empty(),
             "backend service not found in docker-compose.yml"
@@ -3773,19 +4119,6 @@ mod tests {
             !backend.contains("/bin/sh") && !backend.contains("/bin/bash"),
             "backend service must not use a shell entrypoint; the runtime image \
              has no shell (#2059/#2084). Offending block:\n{backend}"
-        );
-
-        // dtrack-init may legitimately use a shell, but not on the shell-less
-        // backend image — it must run a shell-bearing image instead.
-        let dtrack_init = compose_service_block(&compose, "dtrack-init");
-        assert!(
-            !dtrack_init.is_empty(),
-            "dtrack-init service not found in docker-compose.yml"
-        );
-        assert!(
-            !dtrack_init.contains("artifact-keeper-backend"),
-            "dtrack-init must not run the shell-less backend image (#2084). \
-             Offending block:\n{dtrack_init}"
         );
     }
 }

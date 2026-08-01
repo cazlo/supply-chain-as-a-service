@@ -289,6 +289,14 @@ pub fn spawn_all(
             // Kept for the blob-GC readiness gate below; the pool itself is
             // moved into the GC service on the next line.
             let gate_db = db.clone();
+            // Post-GC storage-stats refresher (#2056): recompute the
+            // deduplicated `repository_storage_stats` right after each GC pass
+            // so the materialized numbers settle once reclaim has run. This is
+            // read-only accounting and never touches the quota path.
+            let stats_service = crate::services::storage_stats_service::StorageStatsService::new(
+                db.clone(),
+                &config_clone.storage_backend,
+            );
             // Blob deletion is opt-in (#1408). When BLOB_GC_ENABLED is unset
             // the scheduled pass runs DRY-RUN: it logs what it would reclaim
             // but deletes nothing. Bias to leaking storage over losing data.
@@ -486,6 +494,89 @@ pub fn spawn_all(
                         tracing::warn!("Blob GC sweep pass failed: {}", e);
                     }
                 }
+
+                // Post-GC refresh (#2056): recompute deduplicated storage stats
+                // now that this tick's reclaim has settled so the materialized
+                // table reflects the post-GC footprint. Reporting-only.
+                if let Err(e) = stats_service.recompute_all().await {
+                    tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
+                }
+            }
+        });
+    }
+
+    // Deduplicated storage-stats refresher (cron-based, default: every 4h).
+    // Materializes `repository_storage_stats` / `instance_storage_stats` so the
+    // storage API reads are O(1). Independent of GC so stats stay fresh even
+    // when nothing is reclaimed (#2056). Read-only: never affects quota.
+    {
+        let db = db.clone();
+        let config_clone = config.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(150)).await;
+            let stats_service = crate::services::storage_stats_service::StorageStatsService::new(
+                db,
+                &config_clone.storage_backend,
+            );
+
+            let normalized = normalize_cron_expression(&config_clone.storage_stats_schedule);
+            let schedule = match parse_cron_schedule(&normalized) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(
+                        "Invalid STORAGE_STATS_SCHEDULE '{}', falling back to every 4h",
+                        config_clone.storage_stats_schedule,
+                    );
+                    Schedule::from_str("0 0 */4 * * *").expect("default 4-hourly cron is valid")
+                }
+            };
+
+            loop {
+                let next = schedule
+                    .upcoming(Utc)
+                    .next()
+                    .expect("cron schedule should always have a next occurrence");
+                let delay = (next - Utc::now())
+                    .to_std()
+                    .unwrap_or(std::time::Duration::from_secs(4 * 3600));
+                tokio::time::sleep(delay).await;
+
+                tracing::debug!("Running scheduled deduplicated storage-stats refresh");
+                if let Err(e) = stats_service.recompute_all().await {
+                    tracing::warn!("Scheduled storage-stats refresh failed: {}", e);
+                }
+            }
+        });
+    }
+
+    // Usage-ledger reconciler (PF-007 #2523, every 30 min).
+    // Trues up `repository_usage_ledger` against the authoritative live sums
+    // so drift from any write path that did not maintain the ledger self-heals.
+    // Cheap index-ranged aggregates off the request path; the mandatory safety
+    // net behind the ledger-serialized quota admission.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(200)).await;
+            let repo_service = crate::services::repository_service::RepositoryService::new(db);
+            let mut ticker = interval(Duration::from_secs(1800));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match repo_service.reconcile_all_usage_ledgers().await {
+                    Ok(report) if report.repositories_repaired > 0 => {
+                        tracing::warn!(
+                            repositories_checked = report.repositories_checked,
+                            repositories_repaired = report.repositories_repaired,
+                            drift_bytes = report.total_drift_bytes,
+                            "Repaired repository_usage_ledger drift"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Usage-ledger reconciliation failed: {}", e);
+                    }
+                }
             }
         });
     }
@@ -572,8 +663,31 @@ pub fn spawn_all(
                 ticker.tick().await;
                 tracing::debug!("Checking for curation repos due for upstream sync");
 
-                if let Err(e) = run_curation_sync_cycle(&db).await {
+                // Cluster-lease the sweep (#2357 S11): only one replica runs the
+                // scheduled curation sync per tick. Without this every replica
+                // fans out N concurrent upstream syncs. A TTL slightly above the
+                // 300s tick keeps the job pinned to its current holder; if the
+                // lease table is unreachable the replica skips the tick rather
+                // than crashing the loop.
+                let lease = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                    &db,
+                    "curation_sync",
+                    360.0,
+                )
+                .await;
+                if lease.is_none() {
+                    tracing::debug!(
+                        "Curation sync: another replica holds the lease; skipping tick"
+                    );
+                    continue;
+                }
+
+                if let Err(e) = run_curation_sync_cycle(&db, None).await {
                     tracing::warn!("Curation sync cycle failed: {}", e);
+                }
+
+                if let Some(lease) = lease {
+                    lease.release(&db).await;
                 }
             }
         });
@@ -776,6 +890,19 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
         }
     };
 
+    // Route backup archives to a dedicated bucket when BACKUP_S3_BUCKET is set
+    // (#2507); otherwise this is a clone of the primary storage handle.
+    let archive_storage = match StorageService::backup_archive_from_config(config, &storage).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                "Failed to create backup archive storage for scheduled backups: {}",
+                e
+            );
+            return Err(e);
+        }
+    };
+
     for schedule_row in &due_schedules {
         tracing::info!(
             "Executing scheduled backup '{}' (type: {:?})",
@@ -783,14 +910,21 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
             schedule_row.backup_type
         );
 
-        let service = BackupService::new(db.clone(), storage.clone());
+        let service = BackupService::with_archive_storage(
+            db.clone(),
+            storage.clone(),
+            archive_storage.clone(),
+        );
 
         // Create and execute the backup
         let create_result = service
             .create(CreateBackupRequest {
                 backup_type: schedule_row.backup_type,
                 repository_ids: schedule_row.include_repositories.clone(),
-                created_by: None, // system-initiated
+                exclude_repository_ids: None, // schedules use include-lists today
+                since: None,                  // schedules back up every artifact (#2789)
+                created_by: None,             // system-initiated
+                name: None,                   // scheduled backups keep the default {uuid} name
             })
             .await;
 
@@ -897,24 +1031,81 @@ async fn update_gauge_metrics(db: &PgPool) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// One row of the curation-sync work query: `(staging_id, format,
+/// remote_id, upstream_url, default_action, sync_interval_secs,
+/// trusted_gpg_key, allow_unverified)`. Named to keep the `query_as` type off
+/// clippy's `type_complexity` radar (#2357 added the trusted-key column; #2569
+/// added the fail-closed opt-out flag).
+type CurationSyncRow = (
+    uuid::Uuid,
+    String,
+    uuid::Uuid,
+    String,
+    String,
+    i32,
+    Option<String>,
+    bool,
+);
+
+/// Outcome of the keyless RPM curation-sync gate (#2569). When no trusted GPG
+/// key is configured, the sync no longer defaults open: it is fail-closed and
+/// ingests nothing unless the repo has explicitly opted into unverified
+/// upstream ingest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeylessSync {
+    /// The repo opted into unverified upstream (`curation_allow_unverified =
+    /// true`): proceed, but treat the batch as UNVERIFIED (no checksum-chain
+    /// enforcement — the legacy pre-#2357 behavior, preserved for existing
+    /// keyless repos that opt in).
+    ProceedUnverified,
+    /// No trusted key and no opt-in: refuse (fail-closed default). Skip this
+    /// repo — zero packages ingested — rather than trusting unauthenticated
+    /// upstream metadata.
+    Refuse,
+}
+
+/// Decide the keyless-upstream outcome (#2569). Pure so the fail-closed default
+/// is unit-testable without any DB or network I/O: `false` (no opt-in) must be
+/// `Refuse`; only an explicit `curation_allow_unverified = true` opts back into
+/// the legacy unverified-ingest behavior.
+fn keyless_sync_decision(allow_unverified: bool) -> KeylessSync {
+    if allow_unverified {
+        KeylessSync::ProceedUnverified
+    } else {
+        KeylessSync::Refuse
+    }
+}
+
 /// Find all staging repos with curation enabled, fetch upstream metadata, and evaluate new packages.
-async fn run_curation_sync_cycle(
+///
+/// When `only_repo` is `Some(id)` the cycle is restricted to that single staging
+/// repository — the code path the manual `POST /curation/repos/{key}/sync`
+/// trigger (#2357) uses; when `None` it sweeps every due repo (the scheduled
+/// path). The scheduled invocation is cluster-leased by its caller so only one
+/// replica sweeps per tick.
+pub(crate) async fn run_curation_sync_cycle(
     db: &PgPool,
+    only_repo: Option<uuid::Uuid>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::services::curation_service::CurationService;
     use crate::services::curation_sync;
 
-    // Find repos due for sync
-    let repos: Vec<(uuid::Uuid, String, uuid::Uuid, String, String, i32)> = sqlx::query_as(
+    // Find repos due for sync. `trusted_gpg_key` (#2357) is read from the remote
+    // so the RPM path can authenticate repomd.xml before ingest. The optional
+    // `only_repo` filter scopes the sweep to one repo for the manual trigger.
+    let repos: Vec<CurationSyncRow> = sqlx::query_as(
         r#"SELECT r.id, r.format::text, r.curation_source_repo_id, remote.upstream_url,
-                  r.curation_default_action, r.curation_sync_interval_secs
-           FROM repositories r
-           JOIN repositories remote ON remote.id = r.curation_source_repo_id
-           WHERE r.curation_enabled = true
-             AND r.curation_source_repo_id IS NOT NULL
-             AND r.repo_type = 'staging'
-             AND remote.upstream_url IS NOT NULL"#,
+                      r.curation_default_action, r.curation_sync_interval_secs,
+                      remote.trusted_gpg_key, r.curation_allow_unverified
+               FROM repositories r
+               JOIN repositories remote ON remote.id = r.curation_source_repo_id
+               WHERE r.curation_enabled = true
+                 AND r.curation_source_repo_id IS NOT NULL
+                 AND r.repo_type = 'staging'
+                 AND remote.upstream_url IS NOT NULL
+                 AND ($1::uuid IS NULL OR r.id = $1)"#,
     )
+    .bind(only_repo)
     .fetch_all(db)
     .await?;
 
@@ -923,35 +1114,150 @@ async fn run_curation_sync_cycle(
     }
 
     let curation = CurationService::new(db.clone());
+    // One TTL-cached download-count source for the whole sweep, so `popularity`
+    // rules (#2949) evaluated across many packages / staging repos share
+    // lookups instead of hammering the public stats APIs.
+    let popularity_source =
+        crate::services::curation::popularity_source::HttpPopularitySource::new().cached();
     let client = crate::services::http_client::base_client_builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
-    for (staging_id, format, remote_id, upstream_url, default_action, _interval) in &repos {
+    for (
+        staging_id,
+        format,
+        remote_id,
+        upstream_url,
+        default_action,
+        _interval,
+        trusted_gpg_key,
+        allow_unverified,
+    ) in &repos
+    {
         let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, *remote_id)
             .await
             .unwrap_or(None);
 
         let entries = match format.as_str() {
             "rpm" => {
-                let repomd_url =
-                    format!("{}/repodata/repomd.xml", upstream_url.trim_end_matches('/'));
-                // Try to find primary.xml location from repomd.xml, fall back to default path
+                let base = upstream_url.trim_end_matches('/');
+                let repomd_url = format!("{}/repodata/repomd.xml", base);
                 let mut repomd_req = client.get(&repomd_url);
                 if let Some(ref auth) = upstream_auth {
                     repomd_req =
                         crate::services::upstream_auth::apply_upstream_auth(repomd_req, auth);
                 }
-                let primary_path = match repomd_req.send().await {
+                // Fetch repomd.xml as raw bytes so a detached signature can be
+                // verified over the exact content before its checksums are trusted.
+                let repomd_bytes = match repomd_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
-                        let body = resp.text().await.unwrap_or_default();
-                        extract_primary_href(&body)
-                            .unwrap_or_else(|| "repodata/primary.xml.gz".to_string())
+                        #[allow(clippy::disallowed_methods)]
+                        // STREAMING-EXEMPT: capped-metadata (upstream repomd.xml) buffered for signature verify + href parse; not an artifact blob (#1608)
+                        match resp.bytes().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::warn!("RPM repomd.xml read error: {}", e);
+                                continue;
+                            }
+                        }
                     }
-                    _ => "repodata/primary.xml.gz".to_string(),
+                    Ok(resp) => {
+                        tracing::warn!("RPM repomd.xml fetch failed: {}", resp.status());
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("RPM repomd.xml fetch error: {}", e);
+                        continue;
+                    }
                 };
-                let primary_url =
-                    format!("{}/{}", upstream_url.trim_end_matches('/'), primary_path);
+
+                // GPG-verify-before-ingest (#2357 S4): when a trusted key is
+                // configured on the remote, fetch repomd.xml.asc and verify the
+                // detached signature over repomd.xml. Fail-closed — any fetch,
+                // parse, or verification failure skips this repo (zero packages
+                // ingested) rather than trusting unauthenticated metadata. With
+                // no trusted key the sync is now ALSO fail-closed by default
+                // (#2569): it refuses to ingest unverified upstream metadata
+                // unless the repo has explicitly opted in via
+                // `curation_allow_unverified`, in which case the batch proceeds
+                // as "unverified upstream" (the legacy behavior).
+                // `verified` gates the primary.xml checksum-chain enforcement
+                // below: a signature over repomd alone does NOT authenticate a
+                // tampered primary — repomd's <checksum> must pin it.
+                let verified = match trusted_gpg_key.as_deref().filter(|k| !k.trim().is_empty()) {
+                    Some(trusted_key) => {
+                        let asc_url = format!("{}/repodata/repomd.xml.asc", base);
+                        let mut asc_req = client.get(&asc_url);
+                        if let Some(ref auth) = upstream_auth {
+                            asc_req =
+                                crate::services::upstream_auth::apply_upstream_auth(asc_req, auth);
+                        }
+                        let asc = match asc_req.send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                resp.text().await.unwrap_or_default()
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "RPM curation sync: trusted GPG key set but repomd.xml.asc unavailable for staging repo {}; refusing unverified upstream",
+                                    staging_id
+                                );
+                                continue;
+                            }
+                        };
+                        match crate::services::signing_service::verify_detached(
+                            trusted_key,
+                            &repomd_bytes,
+                            &asc,
+                        ) {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    "RPM curation sync: verified repomd.xml signature for staging repo {}",
+                                    staging_id
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "RPM curation sync: repomd.xml signature verification FAILED for staging repo {}: {}; refusing upstream (0 packages ingested)",
+                                    staging_id,
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    None => match keyless_sync_decision(*allow_unverified) {
+                        // Fail-closed default (#2569): no trusted key and no
+                        // explicit opt-in — refuse the upstream, ingest nothing.
+                        KeylessSync::Refuse => {
+                            tracing::warn!(
+                                "RPM curation sync: no trusted GPG key configured for staging repo {} and curation_allow_unverified is not set; refusing UNVERIFIED upstream (0 packages ingested). Set trusted_gpg_key to authenticate the upstream, or curation_allow_unverified=true to opt into unverified ingest.",
+                                staging_id
+                            );
+                            continue;
+                        }
+                        // Explicit opt-in: proceed as "unverified upstream"
+                        // (legacy behavior; no checksum-chain enforcement).
+                        KeylessSync::ProceedUnverified => {
+                            tracing::warn!(
+                                "RPM curation sync: no trusted GPG key configured for staging repo {}; curation_allow_unverified is set, ingesting UNVERIFIED upstream metadata (set trusted_gpg_key to enforce upstream signatures)",
+                                staging_id
+                            );
+                            false
+                        }
+                    },
+                };
+
+                // Parse the primary reference (href + repomd-pinned checksums)
+                // from repomd. When `verified`, this comes from the signed
+                // repomd, so its <checksum> can be trusted to pin primary.xml.
+                let repomd_str = String::from_utf8_lossy(&repomd_bytes);
+                let primary_ref = crate::services::curation_sync::extract_primary_data(&repomd_str);
+                let primary_path = primary_ref
+                    .as_ref()
+                    .map(|d| d.href.clone())
+                    .unwrap_or_else(|| "repodata/primary.xml.gz".to_string());
+                let primary_url = format!("{}/{}", base, primary_path);
                 let mut primary_req = client.get(&primary_url);
                 if let Some(ref auth) = upstream_auth {
                     primary_req =
@@ -962,15 +1268,65 @@ async fn run_curation_sync_cycle(
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
                         let bytes = resp.bytes().await?;
+
+                        // Chain-of-trust (#2357 HIGH): when the repo is
+                        // signature-verified, the FETCHED primary.xml.gz must
+                        // match the <checksum> pinned in the signed repomd.xml
+                        // BEFORE it is parsed/ingested. Fail-closed on a
+                        // missing / unsupported / mismatching checksum — this is
+                        // what binds primary.xml to the signed repomd, defeating
+                        // a tampered/replayed primary served at the signed href.
+                        // (No enforcement on the unverified path: backward-compat
+                        // for existing no-key RPM curation repos.)
+                        if verified
+                            && !crate::services::curation_sync::primary_gz_pinned_by_repomd(
+                                primary_ref.as_ref(),
+                                &bytes,
+                            )
+                        {
+                            tracing::warn!(
+                                "RPM curation sync: primary.xml.gz does NOT match the checksum pinned in the signed repomd.xml for staging repo {}; refusing upstream (0 packages ingested)",
+                                staging_id
+                            );
+                            continue;
+                        }
+
                         let xml = if primary_path.ends_with(".gz") {
-                            use std::io::Read;
-                            let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
-                            let mut s = String::new();
-                            decoder.read_to_string(&mut s)?;
-                            s
+                            // Bound the upstream-index decompression (#2556): a
+                            // malicious/compromised upstream mirror cannot inflate
+                            // primary.xml.gz unbounded during sync. #2561: the
+                            // permit-scoped decode also caps CONCURRENT decodes.
+                            crate::util::bounded_archive::with_ingest_extraction(|| {
+                                decompress_upstream_index_gz(&bytes)
+                            })??
                         } else {
                             String::from_utf8_lossy(&bytes).to_string()
                         };
+
+                        // Defense-in-depth: when the signed repomd also declares
+                        // an <open-checksum> over the decompressed primary.xml,
+                        // enforce it too (only when present — the compressed
+                        // <checksum> above already binds the exact bytes).
+                        if verified {
+                            if let Some(d) = primary_ref.as_ref() {
+                                if let (Some(ot), Some(ov)) =
+                                    (d.open_checksum_type.as_deref(), d.open_checksum.as_deref())
+                                {
+                                    if !crate::services::curation_sync::repodata_checksum_matches(
+                                        ot,
+                                        ov,
+                                        xml.as_bytes(),
+                                    ) {
+                                        tracing::warn!(
+                                            "RPM curation sync: decompressed primary.xml open-checksum mismatch vs signed repomd for staging repo {}; refusing upstream",
+                                            staging_id
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
                         curation_sync::parse_rpm_primary_xml(&xml)
                     }
                     Ok(resp) => {
@@ -995,10 +1351,14 @@ async fn run_curation_sync_cycle(
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
                         let bytes = resp.bytes().await?;
-                        use std::io::Read;
-                        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
-                        let mut content = String::new();
-                        decoder.read_to_string(&mut content)?;
+                        // Bound the upstream-index decompression (#2556): a
+                        // malicious/compromised upstream mirror cannot inflate
+                        // Packages.gz unbounded during sync. #2561: the
+                        // permit-scoped decode also caps CONCURRENT decodes.
+                        let content =
+                            crate::util::bounded_archive::with_ingest_extraction(|| {
+                                decompress_upstream_index_gz(&bytes)
+                            })??;
                         curation_sync::parse_deb_packages_index(&content, "main")
                     }
                     _ => {
@@ -1048,28 +1408,32 @@ async fn run_curation_sync_cycle(
                     entry.checksum_sha256.as_deref(),
                     &entry.upstream_path,
                     &entry.metadata,
+                    entry.primary_metadata.as_ref(),
                 )
                 .await
             {
                 Ok(pkg) if pkg.status == "pending" => {
+                    // Typed dispatch (#2947): pattern + publisher_trust +
+                    // popularity rules all apply, with the upstream metadata
+                    // blob as the evaluation context.
                     let eval = curation
-                        .evaluate_package(
+                        .evaluate_package_typed(
                             *staging_id,
                             default_action,
+                            &entry.format,
                             &entry.package_name,
                             &entry.version,
                             entry.architecture.as_deref(),
+                            &entry.metadata,
+                            &popularity_source,
                         )
                         .await;
 
-                    if let Ok(eval) = eval {
-                        let status = match eval.action.as_str() {
-                            "allow" => "approved",
-                            "block" => "blocked",
-                            _ => "review",
-                        };
+                    if let Ok((decision, rule_id)) = eval {
+                        let (status, reason) =
+                            CurationService::decision_to_status_reason(&decision, rule_id);
                         let _ = curation
-                            .set_package_status(pkg.id, status, &eval.reason, None, eval.rule_id)
+                            .set_package_status(pkg.id, status, &reason, None, rule_id)
                             .await;
                     }
                 }
@@ -1088,24 +1452,113 @@ async fn run_curation_sync_cycle(
     Ok(())
 }
 
-/// Extract the primary.xml href from repomd.xml content.
-fn extract_primary_href(repomd: &str) -> Option<String> {
-    // Look for: <data type="primary"><location href="repodata/...-primary.xml.gz"/>
-    for data_block in repomd.split("<data type=\"primary\">").skip(1) {
-        if let Some(block) = data_block.split("</data>").next() {
-            let loc_start = block.find("<location href=\"")?;
-            let href_start = loc_start + "<location href=\"".len();
-            let remaining = &block[href_start..];
-            let href_end = remaining.find('"')?;
-            return Some(remaining[..href_end].to_string());
-        }
-    }
-    None
+/// Decompress a gzip-compressed upstream repo index (RPM `primary.xml.gz`,
+/// Debian `Packages.gz`) during proxy-sync, bounded by the shared total-byte
+/// budget (#2556) so a malicious/compromised upstream mirror cannot inflate the
+/// index unbounded. This is the egress analogue of the rubygems
+/// `parse_upstream_specs` upload-side hardening. A budget breach surfaces as an
+/// `io::Error`, which propagates up the sync path (the sync fails, bounded).
+fn decompress_upstream_index_gz(bytes: &[u8]) -> std::io::Result<String> {
+    decompress_upstream_index_gz_limited(
+        bytes,
+        crate::util::bounded_archive::max_ingest_decompressed_bytes(),
+    )
+}
+
+/// `_limited` seam for [`decompress_upstream_index_gz`] — lets tests drive a
+/// tiny budget against a tiny gzip-bomb fixture.
+fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut decoder =
+        crate::util::bounded_archive::budgeted_to(flate2::read::GzDecoder::new(bytes), budget);
+    let mut s = String::new();
+    decoder.read_to_string(&mut s)?;
+    Ok(s)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #2556 — bounded upstream-index decompression
+    // -----------------------------------------------------------------------
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn test_upstream_index_gz_normal_decompresses() {
+        let index = b"Package: nginx\nVersion: 1.24.0-1\n\nPackage: curl\nVersion: 8.0\n";
+        let gz = gzip(index);
+        let out = decompress_upstream_index_gz(&gz).expect("legit index decompresses");
+        assert_eq!(out.as_bytes(), index);
+    }
+
+    #[test]
+    fn test_upstream_index_gz_bomb_is_bounded() {
+        // A tiny gzip that inflates past a small budget → aborts mid-inflate
+        // with an io error rather than ballooning (a compromised upstream
+        // mirror serving primary.xml.gz / Packages.gz cannot exhaust memory).
+        let bomb = gzip(&vec![0u8; 4 * 1024 * 1024]);
+        assert!(bomb.len() < 64 * 1024, "gzip of zeros compresses tiny");
+        assert!(
+            decompress_upstream_index_gz_limited(&bomb, 4096).is_err(),
+            "upstream index bomb past budget must be bounded/rejected"
+        );
+    }
+
+    // #2357 regression fence: the RPM GPG-verify/lease changes edit the SHARED
+    // `run_curation_sync_cycle`, so the Debian curation path is in blast radius.
+    // Assert the Debian branch's decompress -> parse still works end to end:
+    // a gzip-encoded `Packages` index round-trips through the (now shared,
+    // bounded) `decompress_upstream_index_gz` and yields the expected packages.
+    #[test]
+    fn test_debian_packages_index_still_decompresses_and_parses() {
+        use crate::services::curation_sync;
+        let packages = "Package: nginx\nVersion: 1.24.0-1\nArchitecture: amd64\nFilename: pool/main/n/nginx/nginx_1.24.0-1_amd64.deb\nSHA256: abc123\n\nPackage: curl\nVersion: 8.5.0-1\nArchitecture: amd64\nFilename: pool/main/c/curl/curl_8.5.0-1_amd64.deb\nSHA256: def456\n";
+        let gz = gzip(packages.as_bytes());
+        let content =
+            decompress_upstream_index_gz(&gz).expect("debian Packages.gz must still decompress");
+        let entries = curation_sync::parse_deb_packages_index(&content, "main");
+        assert_eq!(entries.len(), 2, "both debian packages must parse");
+        assert!(
+            entries.iter().any(|e| e.package_name == "nginx"),
+            "nginx must be present after debian decompress+parse"
+        );
+        assert!(entries.iter().all(|e| e.format == "debian"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #2569 — RPM curation keyless-sync fail-closed default
+    // -----------------------------------------------------------------------
+
+    /// The security-relevant guard: with NO trusted GPG key configured, a
+    /// curation sync must be fail-closed by DEFAULT — it refuses to ingest
+    /// unverified upstream metadata. Only an explicit opt-in
+    /// (`curation_allow_unverified = true`) reverts to the legacy
+    /// unverified-ingest behavior. Before #2569 the keyless path always
+    /// ingested unverified (equivalent to `ProceedUnverified` for both inputs);
+    /// this pins the flipped default.
+    #[test]
+    fn test_keyless_sync_defaults_fail_closed() {
+        // Default (no opt-in) -> refuse (0 packages ingested).
+        assert_eq!(
+            keyless_sync_decision(false),
+            KeylessSync::Refuse,
+            "keyless sync with no opt-in must be fail-closed (refuse), not ingest unverified"
+        );
+        // Explicit opt-in -> proceed as unverified (legacy escape hatch).
+        assert_eq!(
+            keyless_sync_decision(true),
+            KeylessSync::ProceedUnverified,
+            "curation_allow_unverified=true must opt back into unverified ingest"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // compute_next_run

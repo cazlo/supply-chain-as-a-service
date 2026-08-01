@@ -155,6 +155,76 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<StreamingFetchResult, Response> {
+    // Gate 0: This helper ultimately reads a bare `maven/<path>` key that is not
+    // anchored to an artifact row scoped to the caller's repository. On backends
+    // that physically isolate each repository's key space (filesystem, rooted at
+    // the repo's storage_path) that is always sound, so the filesystem sibling +
+    // quarantine gates (1–3) below apply. On shared cloud namespaces
+    // (S3/GCS/Azure) the same flat key can belong to a *different* repository and
+    // a live sibling row in the *requesting* repository does NOT prove ownership
+    // of the flat key, so the sibling anchor is unsafe there. Instead serve the
+    // object only when the catalog attributes the exact key to this repository
+    // (#2504, #2574 — the same ownership rule as the write guard). A database
+    // error fails closed (404) rather than risking a foreign read.
+    if !crate::storage::backend_is_repo_isolated(&location.backend) {
+        // Repo-scoped candidate first (#2624): row-less companions written
+        // under the scoped scheme live at `maven/{repo_id}/{path}`. The key
+        // embeds the requesting repository's id, so it is physically owned
+        // and needs no catalog attribution.
+        if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env().scoped_read_key(
+            &location.backend,
+            "maven",
+            repo_id,
+            artifact_path,
+        ) {
+            let storage = state.storage_for_repo_or_500(location)?;
+            if let Ok(stream) = storage.get_stream(&scoped_key).await {
+                return Ok(StreamingFetchResult {
+                    commit_sha: None,
+                    content_encoding: None,
+                    body: stream,
+                    content_type: None,
+                    content_length: None,
+                    // Row-less companion object: not anchored to an artifact row.
+                    artifact_id: None,
+                    etag: None,
+                });
+            }
+        }
+        let flat_key = format!("maven/{}", artifact_path);
+        let owned = crate::services::maven_flat_attribution::attributed_owner(
+            db,
+            &location.backend,
+            &flat_key,
+        )
+        .await
+        .ok()
+        .flatten()
+            == Some(repo_id);
+        if !owned {
+            return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
+        }
+        let storage = state.storage_for_repo_or_500(location)?;
+        let stream = storage.get_stream(&flat_key).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.to_ascii_lowercase().contains("not found") {
+                (StatusCode::NOT_FOUND, "Artifact not found").into_response()
+            } else {
+                internal_error("Storage", e)
+            }
+        })?;
+        return Ok(StreamingFetchResult {
+            commit_sha: None,
+            content_encoding: None,
+            body: stream,
+            content_type: None,
+            content_length: None,
+            // Cloud flat-key legacy object: not anchored to our artifact row.
+            artifact_id: None,
+            etag: None,
+        });
+    }
+
     // Gate 1: Only secondaries and bare primaries are eligible; anything else is 404.
     // Compute is_secondary once — is_maven_primary_path_given_not_secondary takes the
     // pre-computed flag so parse_coordinates is only called once per request.
@@ -279,9 +349,14 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
         }
     })?;
     Ok(StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
         body: stream,
         content_type: None,
         content_length: None,
+        // Remote proxy-cache stream: not our artifact row (#1278), unrecorded.
+        artifact_id: None,
+        etag: None,
     })
 }
 
@@ -491,6 +566,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         Some((pool, state, repo_id, repo, user_id))
     }

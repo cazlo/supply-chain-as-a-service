@@ -149,6 +149,24 @@ async fn download_by_path(
         .await
         .map_err(|e| e.into_response())?;
 
+    // #1945: offload eligible hosted Ivy/sbt blob binaries (.jar/.war/.aar/.zip/
+    // .tar.gz/.jmod) to a presigned S3 redirect instead of streaming them
+    // through the backend process. ivy.xml/POM/checksum files and filesystem
+    // backends fall through to the inline stream below. The helper records the
+    // download before issuing the 302 (count-at-redirect, #2260).
+    if let Some(redirect) = proxy_helpers::try_hosted_blob_redirect(
+        &state,
+        storage.as_ref(),
+        artifact_path,
+        &artifact.storage_key,
+        artifact.id,
+        &ctx,
+    )
+    .await
+    {
+        return Ok(redirect);
+    }
+
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
@@ -193,7 +211,7 @@ async fn upload_artifact(
     Path((repo_key, artifact_path)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "ivy", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "ivy", "write:artifacts")?.user_id;
     let repo = resolve_sbt_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -250,8 +268,19 @@ async fn upload_artifact(
         "application/java-archive"
     };
 
-    // Store the file
-    let storage_key = format!("sbt/{}", artifact_path);
+    // Store the file. #2624: on shared cloud namespaces new objects embed the
+    // repository id (`sbt/{repository_id}/{path}`) so keys can never collide
+    // across repositories; filesystem backends and STORAGE_KEY_SCHEME=flat
+    // keep the legacy `sbt/{path}` shape. Downloads read the row-recorded
+    // storage_key, so objects written under either scheme stay readable.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "sbt",
+        repo.id,
+        &artifact_path,
+    );
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;

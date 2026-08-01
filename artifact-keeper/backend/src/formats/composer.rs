@@ -96,31 +96,23 @@ impl ComposerHandler {
     }
 
     /// Parse composer.json from a package archive to extract metadata.
+    ///
+    /// The uploaded zip's `composer.json` is read through the shared bounded
+    /// extractor (#2556): the entry-count cap + per-metadata-entry cap bound the
+    /// read so a crafted package cannot inflate the entry unbounded during
+    /// metadata parsing (previously an unbounded `read_to_string`).
     pub fn parse_composer_json(content: &[u8]) -> Result<ComposerJson> {
-        // Try to read as zip and find composer.json
-        let reader = std::io::Cursor::new(content);
-        let mut archive = zip::ZipArchive::new(reader)
-            .map_err(|e| AppError::Validation(format!("Invalid zip archive: {}", e)))?;
+        let bytes = crate::util::bounded_archive::read_metadata_from_zip(
+            std::io::Cursor::new(content),
+            |name| name.ends_with("composer.json"),
+        )?
+        .ok_or_else(|| AppError::Validation("composer.json not found in archive".to_string()))?;
 
-        for i in 0..archive.len() {
-            let mut file = archive
-                .by_index(i)
-                .map_err(|e| AppError::Validation(format!("Invalid zip entry: {}", e)))?;
+        let content = String::from_utf8(bytes)
+            .map_err(|e| AppError::Validation(format!("Failed to read composer.json: {}", e)))?;
 
-            if file.name().ends_with("composer.json") {
-                let mut content = String::new();
-                std::io::Read::read_to_string(&mut file, &mut content).map_err(|e| {
-                    AppError::Validation(format!("Failed to read composer.json: {}", e))
-                })?;
-
-                return serde_json::from_str(&content)
-                    .map_err(|e| AppError::Validation(format!("Invalid composer.json: {}", e)));
-            }
-        }
-
-        Err(AppError::Validation(
-            "composer.json not found in archive".to_string(),
-        ))
+        serde_json::from_str(&content)
+            .map_err(|e| AppError::Validation(format!("Invalid composer.json: {}", e)))
     }
 }
 
@@ -164,7 +156,13 @@ impl FormatHandler for ComposerHandler {
 
         // Extract composer.json from archive packages
         if matches!(info.kind, ComposerPathKind::Archive) && !content.is_empty() {
-            if let Ok(composer_json) = Self::parse_composer_json(content) {
+            // #2561: permit-scoped decode; on saturation skip this best-effort
+            // metadata enrichment rather than blocking/queueing.
+            if let Ok(Ok(composer_json)) =
+                crate::util::bounded_archive::with_ingest_extraction(|| {
+                    Self::parse_composer_json(content)
+                })
+            {
                 metadata["composer"] = serde_json::to_value(&composer_json)?;
             }
         }
@@ -229,6 +227,16 @@ pub struct ComposerJson {
     pub keywords: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
+    /// Every other valid composer.json property not modelled by an explicit
+    /// field above (e.g. `bin`, `extra`, `scripts`, `conflict`, `replace`,
+    /// `provide`, `suggest`, `support`, `funding`, `minimum-stability`,
+    /// `prefer-stable`, ...). Captured verbatim via `#[serde(flatten)]` so an
+    /// upload preserves the FULL Composer schema through the
+    /// parse -> stored-metadata round-trip. Previously any unmodelled field was
+    /// silently dropped, which broke composer-plugin installs (missing `extra`)
+    /// and vendor/bin symlinks (missing `bin`) (#2846).
+    #[serde(flatten, default)]
+    pub additional: HashMap<String, serde_json::Value>,
 }
 
 /// Composer package author
@@ -395,6 +403,56 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Build a composer package zip carrying `composer.json` with `body`.
+    fn composer_zip(body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            w.start_file("vendor/pkg/composer.json", opts).unwrap();
+            w.write_all(body).unwrap();
+            w.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn test_parse_composer_json_normal_2556() {
+        let zip = composer_zip(br#"{"name":"vendor/pkg","version":"1.2.3"}"#);
+        let parsed = ComposerHandler::parse_composer_json(&zip).expect("normal package parses");
+        assert_eq!(parsed.name, "vendor/pkg");
+    }
+
+    /// #2556: a `composer.json` entry that inflates past the 8 MiB per-metadata
+    /// cap is rejected (bounded memory), while the compressed zip stays tiny.
+    /// #2561: the archive branch of `parse_metadata` still enriches the
+    /// metadata through the permit-scoped decode (uncontended path).
+    #[tokio::test]
+    async fn test_parse_metadata_archive_enriches_composer_2561() {
+        let handler = ComposerHandler::new();
+        let zip = composer_zip(br#"{"name":"vendor/pkg","version":"1.2.3"}"#);
+        let meta = handler
+            .parse_metadata("dist/vendor/pkg/1.2.3/abc123.zip", &Bytes::from(zip))
+            .await
+            .expect("archive parse_metadata succeeds");
+        assert_eq!(meta["composer"]["name"], "vendor/pkg");
+    }
+
+    #[test]
+    fn test_parse_composer_json_bomb_rejected_2556() {
+        let mut body = br#"{"name":"vendor/bomb","description":""#.to_vec();
+        body.extend(std::iter::repeat(b'A').take(9 * 1024 * 1024));
+        body.extend_from_slice(br#""}"#);
+        let zip = composer_zip(&body);
+        assert!(zip.len() < 256 * 1024, "compressed composer zip stays tiny");
+        assert!(
+            ComposerHandler::parse_composer_json(&zip).is_err(),
+            "oversized composer.json must be rejected"
+        );
+    }
+
     // ---- ComposerJson serde ----
 
     #[test]
@@ -542,6 +600,7 @@ mod tests {
             }]),
             keywords: Some(vec!["test".to_string()]),
             homepage: Some("https://example.com".to_string()),
+            additional: HashMap::new(),
         };
         let json = serde_json::to_string(&cj).unwrap();
         let parsed: ComposerJson = serde_json::from_str(&json).unwrap();
@@ -567,6 +626,7 @@ mod tests {
             authors: None,
             keywords: None,
             homepage: None,
+            additional: HashMap::new(),
         };
         let value = serde_json::to_value(&cj).unwrap();
         let obj = value.as_object().unwrap();
@@ -591,5 +651,56 @@ mod tests {
                 absent
             );
         }
+    }
+
+    // #2846: valid composer.json properties not modelled by an explicit field
+    // (here `bin` and `extra`) must survive the parse -> serialize round-trip
+    // via `#[serde(flatten)]` instead of being silently stripped.
+    #[test]
+    fn test_composer_json_preserves_unmodelled_properties() {
+        let json = r#"{
+            "name": "snsconsulting/dummy-package",
+            "type": "composer-plugin",
+            "version": "1.0.0",
+            "bin": ["bin/dummy"],
+            "extra": {"class": "SNSConsulting\\DummyPackage\\Plugin"},
+            "scripts": {"post-install-cmd": "echo hi"},
+            "minimum-stability": "dev",
+            "prefer-stable": true
+        }"#;
+        let cj: ComposerJson = serde_json::from_str(json).unwrap();
+        // Explicitly modelled fields still land in their typed slots.
+        assert_eq!(cj.name, "snsconsulting/dummy-package");
+        assert_eq!(cj.package_type, Some("composer-plugin".to_string()));
+        // Unmodelled properties are captured in `additional`, not dropped.
+        assert_eq!(
+            cj.additional.get("bin"),
+            Some(&serde_json::json!(["bin/dummy"]))
+        );
+        assert_eq!(
+            cj.additional.get("extra"),
+            Some(&serde_json::json!({"class": "SNSConsulting\\DummyPackage\\Plugin"}))
+        );
+        assert!(cj.additional.contains_key("scripts"));
+        assert_eq!(
+            cj.additional.get("prefer-stable"),
+            Some(&serde_json::json!(true))
+        );
+
+        // ...and they re-emit at the top level on serialize (what gets stored
+        // in artifact_metadata and later merged into the served packages.json).
+        let value = serde_json::to_value(&cj).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("bin"), Some(&serde_json::json!(["bin/dummy"])));
+        assert_eq!(
+            obj.get("extra"),
+            Some(&serde_json::json!({"class": "SNSConsulting\\DummyPackage\\Plugin"}))
+        );
+        assert_eq!(
+            obj.get("minimum-stability"),
+            Some(&serde_json::json!("dev"))
+        );
+        // The flattened map must NOT nest under an `additional` key.
+        assert!(obj.get("additional").is_none());
     }
 }

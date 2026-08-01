@@ -41,6 +41,13 @@ pub struct DownloadContext {
     pub user_id: Option<Uuid>,
     /// The request's `User-Agent` header, when present and valid UTF-8.
     pub user_agent: Option<String>,
+    /// True when the request method is `HEAD`. axum's `get(handler)` auto-
+    /// dispatches `HEAD` to the same GET handler, which then runs its full
+    /// serve path (including the shared recorders) even though no body is
+    /// returned. Recording keys off this flag so a `HEAD` — a metadata probe
+    /// that serves no bytes — never writes a `download_statistics` row
+    /// (#2260 §5). Synthesized (non-request) contexts leave this `false`.
+    pub is_head: bool,
 }
 
 impl DownloadContext {
@@ -55,10 +62,22 @@ impl DownloadContext {
         Self {
             client_ip: resolve_client_ip_addr(headers, peer, trusted_proxies),
             user_id: auth.map(|a| a.user_id),
+            // The User-Agent header is the ONLY attacker-controlled free string
+            // that flows from this context into the `download_statistics` row;
+            // clamp it to the column width (VARCHAR(512), mig 004) at capture
+            // so an oversized value can never fail the (batched) INSERT
+            // downstream. The other recorded fields are structurally bounded:
+            // `client_ip` is a parsed `IpAddr` (<= 45 chars textual) and
+            // `user_id` is a UUID. See #2522 batching.
             user_agent: headers
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
-                .map(str::to_string),
+                .map(|ua| {
+                    crate::services::download_event_dispatch::clamp_user_agent(ua.to_string())
+                }),
+            // Method-agnostic constructor: callers that care about HEAD set the
+            // flag from the request method (see the `FromRequestParts` impl).
+            is_head: false,
         }
     }
 }
@@ -83,12 +102,16 @@ impl FromRequestParts<SharedState> for DownloadContext {
             .get::<Option<AuthExtension>>()
             .and_then(|opt| opt.as_ref())
             .or_else(|| parts.extensions.get::<AuthExtension>());
-        Ok(Self::from_parts_inner(
+        let mut ctx = Self::from_parts_inner(
             &parts.headers,
             peer,
             auth,
             &state.config.rate_limit_trusted_proxy_cidrs,
-        ))
+        );
+        // A HEAD served through an axum `get()` route runs the GET handler and
+        // its recorders; flag it so `record_download` skips the write (#2260).
+        ctx.is_head = parts.method == axum::http::Method::HEAD;
+        Ok(ctx)
     }
 }
 
@@ -128,6 +151,21 @@ mod tests {
         );
         assert_eq!(ctx.client_ip, Some("203.0.113.9".parse().unwrap()));
         assert_eq!(ctx.user_agent.as_deref(), Some("npm/10.2.0"));
+    }
+
+    /// An oversized User-Agent is clamped to the `download_statistics`
+    /// column width (VARCHAR(512)) at capture, so one crafted request can
+    /// never make the batched stats INSERT fail and take co-batched rows
+    /// with it (#2522 batching hardening).
+    #[test]
+    fn test_context_oversized_user_agent_is_clamped_to_column_width() {
+        let mut headers = HeaderMap::new();
+        let long_ua = "u".repeat(601);
+        headers.insert(header::USER_AGENT, long_ua.parse().unwrap());
+        let ctx = DownloadContext::from_parts_inner(&headers, None, None, &[]);
+        let ua = ctx.user_agent.expect("user agent captured");
+        assert_eq!(ua.chars().count(), 512);
+        assert!(long_ua.starts_with(&ua));
     }
 
     #[test]

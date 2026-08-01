@@ -576,6 +576,8 @@ async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
         format: "generic".to_string(),
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
+        curation_enabled: false,
+        curation_default_action: "allow".to_string(),
     })
 }
 
@@ -723,7 +725,9 @@ async fn streams_images(
 
 async fn download_image(
     State(state): State<SharedState>,
+    method: axum::http::Method,
     headers: HeaderMap,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
@@ -756,6 +760,15 @@ async fn download_image(
     crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id)
         .await
         .map_err(|e| e.into_response())?;
+
+    // Record the download exactly once for a real GET (#2260). A HEAD request
+    // returns identical headers but serves no body — axum routes HEAD to this
+    // GET handler — so it must NOT write a download row (guard against the
+    // HEAD over-count in §5). Inline-awaited so the row is committed before the
+    // response is built.
+    if method != axum::http::Method::HEAD {
+        crate::services::artifact_service::record_download(&state.db, artifact_id, &ctx).await;
+    }
 
     // Pull the artifact through the repo's configured StorageBackend via
     // `get_stream`. Pre-#1471 the upload path wrote to local disk on the
@@ -831,7 +844,7 @@ async fn upload_image(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "incus", "write:artifacts")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -867,9 +880,15 @@ async fn upload_image(
     let mut staged = StagedTempFile::new(temp_path.clone());
     let (size_bytes, checksum) = stream_body_to_file(body, &temp_path).await?;
 
-    // Extract metadata from the file on disk
-    let metadata = IncusHandler::parse_metadata_from_file(&artifact_path, &temp_path)
-        .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
+    // Extract metadata from the file on disk. #2561: permit-scoped decode; the
+    // artifact is already staged, so a saturated server skips this best-effort
+    // extraction rather than shedding the upload.
+    let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
+        IncusHandler::parse_metadata_from_file(&artifact_path, &temp_path).ok()
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}));
 
     // Record an upload session in `finalizing` state, then push to the
     // StorageBackend on a background task and return 202. Doing the
@@ -957,7 +976,7 @@ async fn delete_image(
     AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "incus", "delete")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "incus", "delete:artifacts")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1048,7 +1067,7 @@ async fn start_chunked_upload(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "incus", "write:artifacts")?.user_id;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
     let prefix = mount_prefix_from_uri(&original_uri);
 
@@ -1137,7 +1156,7 @@ async fn upload_chunk(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "incus", "write:artifacts")?.user_id;
     // Issue #1317: scope the session lookup to the URL repo so a session
     // created in repo A cannot be driven via repo B's URL.
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
@@ -1190,7 +1209,7 @@ async fn complete_chunked_upload(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "incus", "write")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "incus", "write:artifacts")?.user_id;
     // Issue #1317: scope the session lookup to the URL repo so a session
     // created in repo A cannot be finalized via repo B's URL.
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
@@ -1225,9 +1244,15 @@ async fn complete_chunked_upload(
         }
     }
 
-    // Extract metadata from the file on disk
-    let metadata = IncusHandler::parse_metadata_from_file(&session.artifact_path, &temp_path)
-        .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
+    // Extract metadata from the file on disk. #2561: permit-scoped decode; the
+    // artifact is already staged, so a saturated server skips this best-effort
+    // extraction rather than shedding the upload.
+    let metadata = crate::util::bounded_archive::with_ingest_extraction(|| {
+        IncusHandler::parse_metadata_from_file(&session.artifact_path, &temp_path).ok()
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| serde_json::json!({"file_type": "unknown"}));
 
     // Finalize asynchronously: mark the session `finalizing`, push to the
     // StorageBackend on a background task, and return 202. The assembled
@@ -1304,7 +1329,7 @@ async fn cancel_chunked_upload(
     AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let _user_id = require_auth_basic_scope(auth, "incus", "delete")?.user_id;
+    let _user_id = require_auth_basic_scope(auth, "incus", "delete:artifacts")?.user_id;
     // Issue #1317: scope the session lookup to the URL repo so a session
     // created in repo A cannot be cancelled via repo B's URL.
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
@@ -2375,6 +2400,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.repo_type, "hosted");
         assert_eq!(info.storage_path, "/data/incus");
@@ -2394,6 +2421,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(info.repo_type, "remote");
         assert_eq!(
@@ -3675,6 +3704,8 @@ mod streaming_pipeline_regression_tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
 
         finalize_upload(

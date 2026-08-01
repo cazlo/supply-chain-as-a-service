@@ -20,6 +20,7 @@ use crate::services::plugin_registry::PluginRegistry;
 use crate::services::proxy_service::ProxyService;
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
+use crate::services::rpm_repodata_cache::RpmRepodataCache;
 use crate::services::scanner_service::ScannerService;
 use crate::services::smtp_service::SmtpService;
 use crate::services::wasm_plugin_service::WasmPluginService;
@@ -139,6 +140,12 @@ pub struct AppState {
     /// can evict just the entries belonging to a specific
     /// `(repo_key, distribution)` when the underlying Release flips.
     pub signed_release_cache_index: SignedReleaseCacheIndex,
+    /// Fingerprint-validated cache of rendered RPM repodata sets (#2521):
+    /// warm `repomd.xml` / `primary.xml.gz` / `filelists.xml.gz` /
+    /// `other.xml.gz` requests serve prebuilt bytes validated by one cheap
+    /// aggregate query instead of refetching every artifact row and
+    /// regenerating + recompressing the whole document set per request.
+    pub rpm_repodata_cache: Arc<RpmRepodataCache>,
     /// Concurrency cap for bcrypt-bound auth work (login, password verify,
     /// API token verify). `None` when `auth_max_concurrency == 0`, in which
     /// case auth runs without a process-wide cap (legacy behaviour).
@@ -205,6 +212,7 @@ impl AppState {
             npm_packument_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
+            rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
         }
     }
@@ -250,7 +258,57 @@ impl AppState {
             npm_packument_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
+            rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
             auth_semaphore,
+        }
+    }
+
+    /// Return whether initial setup (the forced admin password change) is
+    /// still required, re-checking the database when the process-local flag
+    /// says it is.
+    ///
+    /// `setup_required` is per-process state: it is seeded from the DB once
+    /// at startup and cleared by the change-password handler — but only on
+    /// the replica that served that request. In a multi-replica deployment
+    /// every OTHER replica kept blocking the API (and reporting setup mode)
+    /// until it was restarted (#2492). This method makes the DB row the
+    /// authority: while the local flag is still `true`, consult
+    /// `users.must_change_password` for the admin account and latch the flag
+    /// to `false` once the DB confirms setup completed. The flag never flips
+    /// back to `true` at runtime, so after the first confirmation no further
+    /// queries are issued.
+    ///
+    /// Fails closed: if the DB cannot be reached the setup lock is kept.
+    pub async fn setup_still_required(&self) -> bool {
+        if !self
+            .setup_required
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = true AND must_change_password = true)",
+        )
+        .fetch_one(&self.db)
+        .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                self.setup_required
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    "Setup completed (admin password was changed, possibly on another replica). \
+                     API unlocked without restart."
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Could not re-check setup state in the database; keeping the setup lock"
+                );
+                true
+            }
         }
     }
 

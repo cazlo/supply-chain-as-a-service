@@ -84,6 +84,17 @@ fn extract_manifest_from_zip(zip_bytes: &[u8]) -> Option<String> {
         }
     };
 
+    // Defence-in-depth entry-count cap (#2556): the per-entry byte cap already
+    // bounds memory, but reject entry-count bombs before walking the archive.
+    if archive.len() as u64 > crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES {
+        tracing::debug!(
+            entries = archive.len(),
+            cap = crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES,
+            "swift manifest extraction: too many zip entries"
+        );
+        return None;
+    }
+
     // Pass 1: top-level Package.swift wins. This is the layout produced by
     // `swift package archive-source` and most CI helpers.
     // Pass 2: any `<single-prefix>/Package.swift` (one directory deep).
@@ -741,7 +752,12 @@ async fn fetch_manifest(
                     &format!("Storage error: {}", e),
                 )
             })?;
-            extract_manifest_from_zip(&zip_bytes).ok_or_else(|| {
+            // #2561: permit-scoped decode, fast-fail 503 on saturation.
+            crate::util::bounded_archive::with_ingest_extraction(|| {
+                extract_manifest_from_zip(&zip_bytes)
+            })
+            .map_err(|e| e.into_response())?
+            .ok_or_else(|| {
                 swift_error_response(StatusCode::NOT_FOUND, "Manifest not found for this release")
             })?
         }
@@ -768,7 +784,7 @@ async fn publish_release_from_wildcard(
 ) -> Result<Response, Response> {
     let version = version_path.trim_start_matches('/').to_string();
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "swift", "write")?.user_id;
+    let user_id = require_auth_basic_scope(auth, "swift", "write:artifacts")?.user_id;
     publish_release(
         state, repo_key, scope, name, version, user_id, headers, body,
     )
@@ -842,6 +858,8 @@ async fn publish_release(
 
     // Store the file
     let storage_key = format!("swift/{}/{}/{}/{}.zip", scope, name, version, name);
+    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
@@ -858,11 +876,19 @@ async fn publish_release(
     // `PUT ... application/zip` uploads fail SwiftPM dependency resolution
     // because the manifest endpoint returns 404 even though the archive is
     // perfectly valid (issue #1100).
-    let manifest = headers
+    let manifest = match headers
         .get("X-Swift-Package-Manifest")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .or_else(|| extract_manifest_from_zip(&body));
+    {
+        Some(m) => Some(m),
+        // #2561: permit-scoped decode, fast-fail 503 on saturation. Only taken
+        // when the header fallback actually needs to decode the uploaded zip.
+        None => crate::util::bounded_archive::with_ingest_extraction(|| {
+            extract_manifest_from_zip(&body)
+        })
+        .map_err(|e| e.into_response())?,
+    };
 
     let swift_metadata = serde_json::json!({
         "scope": scope,
@@ -1160,6 +1186,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.storage_path, "/data/swift-repo");
@@ -1180,6 +1208,8 @@ mod tests {
             promotion_only: false,
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(

@@ -565,10 +565,12 @@ fn spawn_migration_worker(
 
     let db = state.db.clone();
     let storage_registry = state.storage_registry.clone();
+    let search_service = state.search_service.clone();
     let fail_db = state.db.clone();
     let job_id = job.id;
     tokio::spawn(async move {
-        let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token);
+        let worker = MigrationWorker::new(db, storage_registry, worker_config, cancel_token)
+            .with_search_service(search_service);
         let outcome = if resume {
             worker
                 .resume_job(job_id, client, conflict_resolution, None)
@@ -1469,7 +1471,7 @@ async fn stream_migration_progress(
         // Send initial connection event
         yield Ok(Event::default().event("connected").data(format!(r#"{{"job_id":"{}"}}"#, id)));
 
-        let terminal_statuses = ["completed", "failed", "cancelled"];
+        let terminal_statuses = ["completed", "completed_with_errors", "failed", "cancelled"];
 
         loop {
             // Fetch current progress
@@ -1605,7 +1607,10 @@ async fn list_migration_items(
 /// audit report is meaningful. Mirrors the terminal set used by the progress
 /// stream loop.
 fn is_terminal_status(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled")
+    matches!(
+        status,
+        "completed" | "completed_with_errors" | "failed" | "cancelled"
+    )
 }
 
 /// Fetch the persisted report row for a job, if one exists.

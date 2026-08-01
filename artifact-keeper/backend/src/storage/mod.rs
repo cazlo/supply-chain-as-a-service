@@ -8,8 +8,9 @@ pub mod path_format;
 pub mod registry;
 pub mod s3;
 
+pub use keys::StorageKeyScheme;
 pub use path_format::StoragePathFormat;
-pub use registry::{StorageLocation, StorageRegistry};
+pub use registry::{backend_is_repo_isolated, StorageLocation, StorageRegistry};
 
 use async_trait::async_trait;
 use bytes::Bytes;

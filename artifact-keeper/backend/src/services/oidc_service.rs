@@ -855,6 +855,7 @@ mod tests {
             environment: "development".into(),
             storage_path: "/tmp/artifacts".into(),
             s3_bucket: None,
+            backup_s3_bucket: None,
             gcs_bucket: None,
             s3_region: None,
             s3_endpoint: None,
@@ -879,6 +880,7 @@ mod tests {
             demo_mode: false,
             guest_access_enabled: true,
             expose_detailed_health: false,
+            setup_password_hint: None,
             grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
@@ -890,6 +892,7 @@ mod tests {
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".into(),
             gc_schedule: "0 0 * * * *".into(),
+            storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
@@ -954,6 +957,9 @@ mod tests {
             npm_packument_cache_fresh_ttl_secs: 300,
             npm_packument_cache_stale_max_secs: 86_400,
             npm_packument_cache_redis_url: None,
+            npm_upstream_feed_enabled: false,
+            npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
+                .into(),
             scan_token_ttl_seconds: 300,
         };
 
@@ -973,6 +979,7 @@ mod tests {
             environment: "development".into(),
             storage_path: "/tmp/artifacts".into(),
             s3_bucket: None,
+            backup_s3_bucket: None,
             gcs_bucket: None,
             s3_region: None,
             s3_endpoint: None,
@@ -997,6 +1004,7 @@ mod tests {
             demo_mode: false,
             guest_access_enabled: true,
             expose_detailed_health: false,
+            setup_password_hint: None,
             grpc_reflection_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
@@ -1008,6 +1016,7 @@ mod tests {
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".into(),
             gc_schedule: "0 0 * * * *".into(),
+            storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
@@ -1072,6 +1081,9 @@ mod tests {
             npm_packument_cache_fresh_ttl_secs: 300,
             npm_packument_cache_stale_max_secs: 86_400,
             npm_packument_cache_redis_url: None,
+            npm_upstream_feed_enabled: false,
+            npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
+                .into(),
             scan_token_ttl_seconds: 300,
         }
     }

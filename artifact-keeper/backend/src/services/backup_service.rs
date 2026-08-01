@@ -87,13 +87,44 @@ pub struct BackupManifest {
 pub struct CreateBackupRequest {
     pub backup_type: BackupType,
     pub repository_ids: Option<Vec<Uuid>>,
+    /// Optional list of repository ids to exclude from the backup (#2772).
+    ///
+    /// Airgapped/bandwidth-limited deployments use this to keep specific
+    /// repositories out of full and incremental backups. When `None` or
+    /// empty no repositories are excluded, so existing behavior is unchanged.
+    /// When an explicit include list is also supplied the excluded ids are
+    /// removed from it; otherwise every repository except the excluded ones
+    /// is backed up.
+    pub exclude_repository_ids: Option<Vec<Uuid>>,
+    /// Optional lower bound on artifact modification time (#2789).
+    ///
+    /// When set, only artifacts whose `updated_at >= since` are included in the
+    /// backup, letting operators capture just the changes made from a given
+    /// date/timestamp to now (an incremental "since this point" backup). When
+    /// `None` every artifact is included, so full and incremental backups behave
+    /// exactly as before.
+    pub since: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,
+    /// Optional operator-supplied name/label for the archive (#2790).
+    ///
+    /// When set it becomes the identifying part of the archive filename;
+    /// when `None` the historical `{uuid}` name is used, so existing
+    /// deployments are unaffected.
+    pub name: Option<String>,
 }
 
 /// Backup service
 pub struct BackupService {
     db: PgPool,
+    /// Primary storage: where source artifacts are read from during a backup
+    /// and restored to during a restore. Always the deployment's main storage
+    /// bucket.
     storage: Arc<StorageService>,
+    /// Storage for backup **archives** (`.tar.gz`). Defaults to `storage`, but
+    /// points at a separate bucket when `BACKUP_S3_BUCKET` is configured
+    /// (#2507). Only the archive read/write path uses this handle, so a
+    /// dedicated backup bucket never changes where artifacts live.
+    archive_storage: Arc<StorageService>,
     active_backup: Arc<Mutex<Option<Uuid>>>,
 }
 
@@ -173,6 +204,93 @@ fn build_backup_tar(
     Ok(tar_buffer)
 }
 
+/// Normalize the operator-supplied backup key prefix (`BACKUP_S3_PREFIX`).
+///
+/// Splits on `/` and drops empty, `.`, and `..` segments — the storage key
+/// is joined into a filesystem path on the filesystem backend, so traversal
+/// segments must never survive — then rejoins. Returns `None` when nothing
+/// usable remains, so `BACKUP_S3_PREFIX=""` or `"/"` behaves like unset.
+fn normalize_backup_prefix(raw: &str) -> Option<String> {
+    let cleaned: Vec<&str> = raw
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.join("/"))
+    }
+}
+
+/// Storage key for a new backup archive (#2508).
+///
+/// The relative key always keeps the `backups/` root; when a prefix is
+/// configured via `BACKUP_S3_PREFIX` it is prepended, mirroring how
+/// `S3_PREFIX` prepends to artifact keys:
+/// `{BACKUP_S3_PREFIX}/backups/YYYY/MM/DD/{uuid}.tar.gz`.
+///
+/// Back-compat: reads, restores, and deletes always resolve through the
+/// `backups.storage_path` recorded at creation time, so changing (or
+/// unsetting) the prefix later never strands existing archives.
+fn backup_storage_key(raw_prefix: Option<&str>, relative: &str) -> String {
+    match raw_prefix.and_then(normalize_backup_prefix) {
+        Some(prefix) => format!("{}/{}", prefix, relative),
+        None => relative.to_string(),
+    }
+}
+
+/// Maximum length of an operator-supplied backup name (before extension).
+const MAX_BACKUP_NAME_LEN: usize = 128;
+
+/// Resolve the base filename (including the `.tar.gz` extension) for a new
+/// backup archive (#2790).
+///
+/// When an operator supplies a custom `name` it is sanitized and used as the
+/// archive's identifying label, with a short unique suffix derived from
+/// `file_id` appended so two backups sharing a name can never resolve to the
+/// same storage key (which would silently overwrite the older archive). When
+/// no name is given the historical `{uuid}.tar.gz` name is preserved, so
+/// existing deployments are unaffected.
+///
+/// The custom name is restricted to `[A-Za-z0-9._-]`; anything containing a
+/// path separator, `..`, whitespace, or any other character is rejected
+/// rather than silently rewritten, so the name can never escape the
+/// `backups/` prefix or smuggle in a traversal sequence.
+fn resolve_backup_filename(name: Option<&str>, file_id: Uuid) -> Result<String> {
+    let Some(raw) = name else {
+        return Ok(format!("{}.tar.gz", file_id));
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation(
+            "Backup name must not be empty".to_string(),
+        ));
+    }
+    if trimmed.len() > MAX_BACKUP_NAME_LEN {
+        return Err(AppError::Validation(format!(
+            "Backup name must be at most {} characters",
+            MAX_BACKUP_NAME_LEN
+        )));
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err(AppError::Validation(
+            "Backup name must not be '.' or '..'".to_string(),
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(AppError::Validation(
+            "Backup name may only contain letters, digits, '.', '_', and '-'".to_string(),
+        ));
+    }
+
+    let suffix = file_id.simple().to_string();
+    Ok(format!("{}-{}.tar.gz", trimmed, &suffix[..8]))
+}
+
 /// Count entries under the `artifacts/` prefix in a tar.gz archive.
 fn count_artifacts_in_tar(tar_data: &[u8]) -> Result<i64> {
     let decoder = GzDecoder::new(tar_data);
@@ -195,21 +313,104 @@ fn count_artifacts_in_tar(tar_data: &[u8]) -> Result<i64> {
     Ok(count)
 }
 
+/// Resolve the effective set of repository ids to back up given an optional
+/// include-list and an optional exclude-list (#2772).
+///
+/// Returns `None` to mean "every repository" (no row filtering), matching the
+/// historical default when neither list is supplied. This keeps the default
+/// backup path byte-for-byte identical to before the exclude feature.
+///
+/// Semantics:
+/// * No exclude list (or an empty one): the include list is returned as-is.
+/// * Include + exclude: excluded ids are removed from the include list.
+/// * Exclude only: every repository in `all_repository_ids` except the
+///   excluded ones is returned.
+fn resolve_effective_repository_ids(
+    include: Option<Vec<Uuid>>,
+    exclude: Option<Vec<Uuid>>,
+    all_repository_ids: &[Uuid],
+) -> Option<Vec<Uuid>> {
+    // An empty exclude list is a no-op, indistinguishable from "no exclusions".
+    let exclude = exclude.filter(|ex| !ex.is_empty());
+
+    match (include, exclude) {
+        (include, None) => include,
+        (Some(include), Some(exclude)) => {
+            let excluded: std::collections::HashSet<Uuid> = exclude.into_iter().collect();
+            Some(
+                include
+                    .into_iter()
+                    .filter(|id| !excluded.contains(id))
+                    .collect(),
+            )
+        }
+        (None, Some(exclude)) => {
+            let excluded: std::collections::HashSet<Uuid> = exclude.into_iter().collect();
+            Some(
+                all_repository_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !excluded.contains(id))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Read the optional `since` cutoff (#2789) from a backup's stored metadata.
+///
+/// Returns `None` when no cutoff was recorded (the key is absent or JSON null),
+/// which preserves the historical "every artifact" behavior. A malformed value
+/// is treated as no cutoff rather than failing the backup.
+fn parse_since_filter(metadata: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
+    metadata
+        .and_then(|m| m.get("since"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).ok())
+}
+
 impl BackupService {
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
+        // Default: backup archives live in the same bucket as artifacts, so
+        // the archive handle is just a clone of primary storage. This keeps
+        // behavior byte-identical when `BACKUP_S3_BUCKET` is unset (#2507).
+        let archive_storage = storage.clone();
         Self {
             db,
             storage,
+            archive_storage,
+            active_backup: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Construct a backup service whose **archives** are read from/written to a
+    /// dedicated storage handle, separate from the artifact storage (#2507).
+    ///
+    /// Callers resolve `archive_storage` via
+    /// [`StorageService::backup_archive_from_config`]; when `BACKUP_S3_BUCKET`
+    /// is unset it is a clone of `storage`, so this is equivalent to
+    /// [`BackupService::new`].
+    pub fn with_archive_storage(
+        db: PgPool,
+        storage: Arc<StorageService>,
+        archive_storage: Arc<StorageService>,
+    ) -> Self {
+        Self {
+            db,
+            storage,
+            archive_storage,
             active_backup: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Create a new backup job
     pub async fn create(&self, req: CreateBackupRequest) -> Result<Backup> {
-        let storage_path = format!(
-            "backups/{}/{}.tar.gz",
-            Utc::now().format("%Y/%m/%d"),
-            Uuid::new_v4()
+        let prefix = std::env::var("BACKUP_S3_PREFIX").ok();
+        let file_id = Uuid::new_v4();
+        let filename = resolve_backup_filename(req.name.as_deref(), file_id)?;
+        let storage_path = backup_storage_key(
+            prefix.as_deref(),
+            &format!("backups/{}/{}", Utc::now().format("%Y/%m/%d"), filename),
         );
 
         let backup = sqlx::query_as!(
@@ -229,6 +430,9 @@ impl BackupService {
             req.created_by,
             serde_json::json!({
                 "repository_ids": req.repository_ids,
+                "exclude_repository_ids": req.exclude_repository_ids,
+                "since": req.since,
+                "name": req.name,
             })
         )
         .fetch_one(&self.db)
@@ -366,16 +570,36 @@ impl BackupService {
             "permission_grants",
         ];
 
+        // Resolve which repositories this backup covers (#2772). `None` means
+        // "every repository" and preserves the historical, unfiltered dump.
+        let repository_filter = self
+            .effective_repository_filter(backup.metadata.as_ref())
+            .await?;
+
+        // Optional "changes since" cutoff (#2789). When present only artifacts
+        // modified at-or-after this timestamp are dumped, so an incremental
+        // backup can capture just the delta from a given date to now. `None`
+        // keeps every artifact, preserving the historical behavior.
+        let since_filter = parse_since_filter(backup.metadata.as_ref());
+
         let mut table_data: Vec<(String, Vec<u8>)> = Vec::new();
         for table in &table_names {
-            let json_data = self.export_table(table).await?;
+            // The `artifacts` table is the only per-repository table exported,
+            // so when a repository filter is in effect an excluded repository's
+            // artifact rows are kept out of the dump too (not just its bytes).
+            let json_data = if *table == "artifacts" {
+                self.export_artifacts(repository_filter.as_deref(), since_filter)
+                    .await?
+            } else {
+                self.export_table(table).await?
+            };
             let json_bytes = serde_json::to_vec_pretty(&json_data)?;
             table_data.push((table.to_string(), json_bytes));
         }
 
         // Fetch artifact storage keys and content
         let storage_keys = self
-            .get_artifact_storage_keys(backup.metadata.as_ref())
+            .artifact_storage_keys(repository_filter.as_deref(), since_filter)
             .await?;
         let mut artifact_data: Vec<(String, Vec<u8>)> = Vec::new();
         for key in storage_keys {
@@ -413,7 +637,9 @@ impl BackupService {
             .storage_path
             .as_ref()
             .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
-        self.storage
+        // The archive itself is written to the (optionally separate) backup
+        // bucket; the source artifacts read above stay on primary storage.
+        self.archive_storage
             .put(storage_path, Bytes::from(tar_buffer.clone()))
             .await?;
 
@@ -449,30 +675,105 @@ impl BackupService {
         Ok(serde_json::Value::Array(rows))
     }
 
-    async fn get_artifact_storage_keys(
+    /// Resolve the effective set of repository ids covered by a backup from its
+    /// stored metadata (#2772).
+    ///
+    /// Reads the optional `repository_ids` (include) and `exclude_repository_ids`
+    /// (exclude) lists and combines them via [`resolve_effective_repository_ids`].
+    /// Returns `None` when no filtering applies (no include list and no
+    /// exclusions), so full backups keep dumping every repository exactly as
+    /// before. The complete repository set is only queried for the exclude-only
+    /// case, where it is needed to compute "everything except the excluded ids".
+    async fn effective_repository_filter(
         &self,
         metadata: Option<&serde_json::Value>,
-    ) -> Result<Vec<String>> {
-        let repository_filter: Option<Vec<Uuid>> = metadata
+    ) -> Result<Option<Vec<Uuid>>> {
+        let include_filter: Option<Vec<Uuid>> = metadata
             .and_then(|m| m.get("repository_ids"))
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let exclude_filter: Option<Vec<Uuid>> = metadata
+            .and_then(|m| m.get("exclude_repository_ids"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-        let keys: Vec<String> = if let Some(repo_ids) = repository_filter {
-            sqlx::query_scalar!(
-                "SELECT storage_key FROM artifacts WHERE repository_id = ANY($1)",
-                &repo_ids
-            )
-            .fetch_all(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-        } else {
-            sqlx::query_scalar!("SELECT storage_key FROM artifacts")
+        let needs_all_repositories = include_filter.is_none()
+            && exclude_filter
+                .as_ref()
+                .is_some_and(|ex: &Vec<Uuid>| !ex.is_empty());
+        let all_repository_ids: Vec<Uuid> = if needs_all_repositories {
+            sqlx::query_scalar("SELECT id FROM repositories")
                 .fetch_all(&self.db)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?
+        } else {
+            Vec::new()
         };
 
+        Ok(resolve_effective_repository_ids(
+            include_filter,
+            exclude_filter,
+            &all_repository_ids,
+        ))
+    }
+
+    /// List the artifact storage keys to include in a backup, honoring the
+    /// resolved repository filter (`None` => every repository) and the optional
+    /// `since` cutoff (#2789; `None` => every modification time). Both
+    /// predicates are null-guarded so passing `None`/`None` returns every
+    /// artifact exactly as before.
+    async fn artifact_storage_keys(
+        &self,
+        repository_filter: Option<&[Uuid]>,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<String>> {
+        // Runtime (non-macro) query so no offline `.sqlx` prepare is needed and
+        // both optional predicates live in a single statement.
+        let repo_ids: Option<Vec<Uuid>> = repository_filter.map(|r| r.to_vec());
+        let keys: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT storage_key FROM artifacts
+            WHERE ($1::uuid[] IS NULL OR repository_id = ANY($1))
+              AND ($2::timestamptz IS NULL OR updated_at >= $2)
+            "#,
+        )
+        .bind(repo_ids)
+        .bind(since)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
         Ok(keys)
+    }
+
+    /// Export the `artifacts` table as a JSON array, honoring the resolved
+    /// repository filter (#2772) and the optional `since` cutoff (#2789).
+    ///
+    /// When both filters are `None` this returns every artifact row, identical
+    /// to `export_table("artifacts")`, so unfiltered backups are unchanged. A
+    /// repository filter keeps only the covered repositories' rows; a `since`
+    /// cutoff keeps only rows with `updated_at >= since`, so an incremental
+    /// backup dumps just the metadata changed after the given timestamp.
+    async fn export_artifacts(
+        &self,
+        repository_filter: Option<&[Uuid]>,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<serde_json::Value> {
+        // Runtime (non-macro) query so no offline `.sqlx` prepare is needed and
+        // both optional predicates live in a single statement.
+        let repo_ids: Option<Vec<Uuid>> = repository_filter.map(|r| r.to_vec());
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            r#"
+            SELECT row_to_json(t) FROM artifacts t
+            WHERE ($1::uuid[] IS NULL OR repository_id = ANY($1))
+              AND ($2::timestamptz IS NULL OR updated_at >= $2)
+            "#,
+        )
+        .bind(repo_ids)
+        .bind(since)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(serde_json::Value::Array(rows))
     }
 
     async fn update_status(
@@ -537,7 +838,8 @@ impl BackupService {
             .storage_path
             .as_ref()
             .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
-        let tar_data = self.storage.get(storage_path).await?;
+        // Read the archive back from the (optionally separate) backup bucket.
+        let tar_data = self.archive_storage.get(storage_path).await?;
 
         // Phase 1: Extract all entries synchronously (tar::Archive is !Send)
         let entries = Self::extract_entries(&tar_data)?;
@@ -706,10 +1008,10 @@ impl BackupService {
     pub async fn delete(&self, backup_id: Uuid) -> Result<()> {
         let backup = self.get_by_id(backup_id).await?;
 
-        // Delete from storage if path exists
+        // Delete the archive from the (optionally separate) backup bucket.
         if let Some(storage_path) = &backup.storage_path {
-            if self.storage.exists(storage_path).await? {
-                self.storage.delete(storage_path).await?;
+            if self.archive_storage.exists(storage_path).await? {
+                self.archive_storage.delete(storage_path).await?;
             }
         }
 
@@ -746,12 +1048,20 @@ impl BackupService {
         Ok(())
     }
 
-    /// Clean up old backups based on retention policy
+    /// Clean up old backups based on retention policy.
+    ///
+    /// Removes the backup archive from storage in addition to the database row.
+    /// Selecting the eligible rows first (rather than issuing a bare `DELETE`)
+    /// is deliberate: once the row is gone its `storage_path` — the only handle
+    /// to the archive — is lost, so a row-only delete would strand the
+    /// `.tar.gz` in object storage forever, the opposite of what a
+    /// space-reclaiming retention job should do (#2787).
     pub async fn cleanup(&self, keep_count: i32, keep_days: i32) -> Result<u64> {
-        // Keep the most recent N backups
-        let result = sqlx::query(
+        // Keep the most recent N completed backups; among the rest, remove those
+        // older than the retention window.
+        let doomed: Vec<(Uuid, Option<String>)> = sqlx::query_as(
             r#"
-            DELETE FROM backups
+            SELECT id, storage_path FROM backups
             WHERE id NOT IN (
                 SELECT id FROM backups
                 WHERE status = 'completed'
@@ -764,11 +1074,50 @@ impl BackupService {
         )
         .bind(keep_count as i64)
         .bind(keep_days)
-        .execute(&self.db)
+        .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(result.rows_affected())
+        let mut deleted = 0u64;
+        for (id, storage_path) in doomed {
+            // Best-effort delete the archive before dropping the row. If storage
+            // removal fails, keep the row so a later retention run retries
+            // rather than silently orphaning the archive.
+            if let Some(path) = storage_path.as_deref() {
+                match self.archive_storage.exists(path).await {
+                    Ok(true) => {
+                        if let Err(e) = self.archive_storage.delete(path).await {
+                            tracing::warn!(
+                                backup_id = %id,
+                                storage_path = path,
+                                "backup retention: failed to delete archive, retaining row for retry: {}",
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            backup_id = %id,
+                            storage_path = path,
+                            "backup retention: failed to stat archive, retaining row for retry: {}",
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            sqlx::query("DELETE FROM backups WHERE id = $1")
+                .bind(id)
+                .execute(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            deleted += 1;
+        }
+
+        Ok(deleted)
     }
 }
 
@@ -799,6 +1148,80 @@ mod tests {
     use flate2::Compression;
     #[allow(unused_imports)]
     use tar::Builder;
+
+    // -----------------------------------------------------------------------
+    // Backup storage key / BACKUP_S3_PREFIX tests (#2508)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backup_key_without_prefix_keeps_legacy_root() {
+        // Existing deployments (no BACKUP_S3_PREFIX) must keep writing the
+        // exact key shape they always have.
+        assert_eq!(
+            backup_storage_key(None, "backups/2026/07/20/abc.tar.gz"),
+            "backups/2026/07/20/abc.tar.gz"
+        );
+    }
+
+    #[test]
+    fn backup_key_prepends_configured_prefix() {
+        assert_eq!(
+            backup_storage_key(Some("team-a/registry"), "backups/2026/07/20/abc.tar.gz"),
+            "team-a/registry/backups/2026/07/20/abc.tar.gz"
+        );
+    }
+
+    #[test]
+    fn backup_prefix_is_normalized() {
+        // Leading/trailing/duplicate slashes collapse.
+        assert_eq!(
+            normalize_backup_prefix("/team-a//registry/").as_deref(),
+            Some("team-a/registry")
+        );
+        // Dot and traversal segments are dropped: the key is joined into a
+        // filesystem path on the filesystem backend, so `..` must not survive.
+        assert_eq!(
+            normalize_backup_prefix("../escape/./x").as_deref(),
+            Some("escape/x")
+        );
+    }
+
+    #[test]
+    fn empty_or_degenerate_prefix_behaves_like_unset() {
+        for raw in ["", "/", "//", ".", "..", "././.."] {
+            assert!(normalize_backup_prefix(raw).is_none(), "raw = {raw:?}");
+            assert_eq!(
+                backup_storage_key(Some(raw), "backups/x.tar.gz"),
+                "backups/x.tar.gz",
+                "raw = {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefixed_backup_key_cannot_collide_with_repo_scoped_artifact_keys() {
+        // #2624/#2728 artifact keys on shared cloud namespaces are
+        // `{format}/{repository_uuid}/{path}`. Even with an adversarial
+        // BACKUP_S3_PREFIX that mimics a format/repo segment, the backup key
+        // always continues with the `backups/` root plus a fresh UUIDv4
+        // archive name, so it can never equal a scoped artifact key for any
+        // artifact path an existing repository has recorded.
+        let repo = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let scoped = crate::storage::StorageKeyScheme::RepoScoped.write_key(
+            "s3",
+            "maven",
+            repo,
+            "backups/2026/07/20/abc.tar.gz",
+        );
+        let backup = backup_storage_key(
+            Some(&format!("maven/{repo}")),
+            &format!("backups/2026/07/20/{}.tar.gz", Uuid::new_v4()),
+        );
+        assert_ne!(scoped, backup);
+        // The repo-scoped segment stays intact in artifact keys regardless of
+        // any backup prefix configuration.
+        assert!(scoped.starts_with(&format!("maven/{repo}/")));
+    }
 
     // -----------------------------------------------------------------------
     // BackupStatus Display tests
@@ -1277,11 +1700,15 @@ mod tests {
         let req = CreateBackupRequest {
             backup_type: BackupType::Full,
             repository_ids: Some(vec![Uuid::new_v4()]),
+            exclude_repository_ids: None,
+            since: None,
             created_by: Some(Uuid::new_v4()),
+            name: None,
         };
         assert_eq!(req.backup_type, BackupType::Full);
         assert!(req.repository_ids.is_some());
         assert!(req.created_by.is_some());
+        assert!(req.since.is_none());
     }
 
     #[test]
@@ -1289,11 +1716,112 @@ mod tests {
         let req = CreateBackupRequest {
             backup_type: BackupType::Metadata,
             repository_ids: None,
+            exclude_repository_ids: None,
+            since: None,
             created_by: None,
+            name: None,
         };
         assert_eq!(req.backup_type, BackupType::Metadata);
         assert!(req.repository_ids.is_none());
         assert!(req.created_by.is_none());
+    }
+
+    #[test]
+    fn test_create_backup_request_with_since_cutoff() {
+        // #2789: an incremental "changes since" backup carries an RFC3339 cutoff.
+        let cutoff = DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let req = CreateBackupRequest {
+            backup_type: BackupType::Incremental,
+            repository_ids: None,
+            exclude_repository_ids: None,
+            since: Some(cutoff),
+            created_by: None,
+            name: None,
+        };
+        assert_eq!(req.backup_type, BackupType::Incremental);
+        assert_eq!(req.since, Some(cutoff));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_backup_filename tests (#2790)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_backup_filename_default_preserves_uuid_name() {
+        let id = Uuid::new_v4();
+        let name = resolve_backup_filename(None, id).unwrap();
+        // Default (no custom name) preserves the historical `{uuid}.tar.gz`.
+        assert_eq!(name, format!("{}.tar.gz", id));
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_custom_name_honored() {
+        let id = Uuid::new_v4();
+        let name = resolve_backup_filename(Some("nightly-prod"), id).unwrap();
+        assert!(
+            name.starts_with("nightly-prod-"),
+            "custom label should lead the filename: {name}"
+        );
+        assert!(name.ends_with(".tar.gz"), "must keep the extension: {name}");
+        // A unique suffix is appended so distinct backups never collide.
+        let suffix = id.simple().to_string();
+        assert_eq!(name, format!("nightly-prod-{}.tar.gz", &suffix[..8]));
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_trims_whitespace() {
+        let id = Uuid::new_v4();
+        let name = resolve_backup_filename(Some("  release  "), id).unwrap();
+        assert!(name.starts_with("release-"), "should be trimmed: {name}");
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_unique_per_id() {
+        let a = resolve_backup_filename(Some("weekly"), Uuid::new_v4()).unwrap();
+        let b = resolve_backup_filename(Some("weekly"), Uuid::new_v4()).unwrap();
+        assert_ne!(a, b, "same label + different id must not collide");
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_path_separator() {
+        let id = Uuid::new_v4();
+        assert!(resolve_backup_filename(Some("a/b"), id).is_err());
+        assert!(resolve_backup_filename(Some("a\\b"), id).is_err());
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_traversal() {
+        let id = Uuid::new_v4();
+        assert!(resolve_backup_filename(Some(".."), id).is_err());
+        assert!(resolve_backup_filename(Some("../etc/passwd"), id).is_err());
+        assert!(resolve_backup_filename(Some("."), id).is_err());
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_empty_and_blank() {
+        let id = Uuid::new_v4();
+        assert!(resolve_backup_filename(Some(""), id).is_err());
+        assert!(resolve_backup_filename(Some("   "), id).is_err());
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_unsafe_chars() {
+        let id = Uuid::new_v4();
+        // Spaces, control chars, and shell/path metacharacters are rejected.
+        assert!(resolve_backup_filename(Some("my backup"), id).is_err());
+        assert!(resolve_backup_filename(Some("name;rm -rf"), id).is_err());
+        assert!(resolve_backup_filename(Some("null\0byte"), id).is_err());
+    }
+
+    #[test]
+    fn test_resolve_backup_filename_rejects_overlong() {
+        let id = Uuid::new_v4();
+        let long = "a".repeat(MAX_BACKUP_NAME_LEN + 1);
+        assert!(resolve_backup_filename(Some(&long), id).is_err());
+        let ok = "a".repeat(MAX_BACKUP_NAME_LEN);
+        assert!(resolve_backup_filename(Some(&ok), id).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -1381,6 +1909,130 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // resolve_effective_repository_ids tests (#2772 exclude repositories)
+    // -----------------------------------------------------------------------
+
+    /// Sort a repository-id vec so set comparisons are order-independent.
+    fn sorted(mut v: Vec<Uuid>) -> Vec<Uuid> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_effective_repos_default_is_none() {
+        // No include and no exclude: back up everything (None => no filter),
+        // identical to pre-#2772 behavior.
+        assert!(resolve_effective_repository_ids(None, None, &[]).is_none());
+    }
+
+    #[test]
+    fn test_effective_repos_empty_exclude_is_noop() {
+        // An empty exclude list must behave exactly like "no exclusions".
+        let all = vec![Uuid::new_v4(), Uuid::new_v4()];
+        assert!(resolve_effective_repository_ids(None, Some(vec![]), &all).is_none());
+
+        let include = vec![all[0]];
+        let out = resolve_effective_repository_ids(Some(include.clone()), Some(vec![]), &all);
+        assert_eq!(out, Some(include));
+    }
+
+    #[test]
+    fn test_effective_repos_include_only_passthrough() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let out = resolve_effective_repository_ids(Some(vec![a, b]), None, &[]);
+        assert_eq!(out, Some(vec![a, b]));
+    }
+
+    #[test]
+    fn test_effective_repos_exclude_only_removes_from_all() {
+        let keep = Uuid::new_v4();
+        let drop = Uuid::new_v4();
+        let all = vec![keep, drop];
+        let out = resolve_effective_repository_ids(None, Some(vec![drop]), &all);
+        // The excluded repo is absent, the other repo is present.
+        assert_eq!(out, Some(vec![keep]));
+        let out = out.unwrap();
+        assert!(!out.contains(&drop));
+        assert!(out.contains(&keep));
+    }
+
+    #[test]
+    fn test_effective_repos_include_minus_exclude() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        // Explicit include of {a,b,c}, exclude {b}: result is {a,c}.
+        let out = resolve_effective_repository_ids(Some(vec![a, b, c]), Some(vec![b]), &[]);
+        assert_eq!(sorted(out.unwrap()), sorted(vec![a, c]));
+    }
+
+    #[test]
+    fn test_effective_repos_exclude_non_member_is_noop() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+        // Excluding an id that is not in the include list changes nothing.
+        let out = resolve_effective_repository_ids(Some(vec![a, b]), Some(vec![stranger]), &[]);
+        assert_eq!(sorted(out.unwrap()), sorted(vec![a, b]));
+    }
+
+    #[test]
+    fn test_effective_repos_exclude_all_yields_empty_set() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let all = vec![a, b];
+        // Excluding every repository yields an explicit empty set (Some([]))
+        // -> the `= ANY(empty)` query backs up no artifacts, NOT all of them.
+        let out = resolve_effective_repository_ids(None, Some(all.clone()), &all);
+        assert_eq!(out, Some(vec![]));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_since_filter tests (#2789 incremental "changes since" cutoff)
+    // -----------------------------------------------------------------------
+
+    /// Build the same metadata JSON that `create()` persists for a backup.
+    fn backup_metadata(since: Option<DateTime<Utc>>) -> serde_json::Value {
+        serde_json::json!({
+            "repository_ids": Option::<Vec<Uuid>>::None,
+            "exclude_repository_ids": Option::<Vec<Uuid>>::None,
+            "since": since,
+            "name": Option::<String>::None,
+        })
+    }
+
+    #[test]
+    fn test_parse_since_absent_metadata_is_none() {
+        // No metadata at all => no cutoff, back up every artifact (unchanged).
+        assert!(parse_since_filter(None).is_none());
+    }
+
+    #[test]
+    fn test_parse_since_unset_is_none() {
+        // A backup created without `since` stores JSON null => no cutoff.
+        let meta = backup_metadata(None);
+        assert!(parse_since_filter(Some(&meta)).is_none());
+    }
+
+    #[test]
+    fn test_parse_since_roundtrips_through_create_metadata() {
+        // The cutoff persisted by create() is read back verbatim by do_backup.
+        let cutoff = DateTime::parse_from_rfc3339("2026-01-15T12:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let meta = backup_metadata(Some(cutoff));
+        assert_eq!(parse_since_filter(Some(&meta)), Some(cutoff));
+    }
+
+    #[test]
+    fn test_parse_since_malformed_is_treated_as_none() {
+        // A non-timestamp value must not fail the backup; it means "no cutoff".
+        let meta = serde_json::json!({ "since": "not-a-timestamp" });
+        assert!(parse_since_filter(Some(&meta)).is_none());
+    }
+
     /// Verify every table in ALLOWED_EXPORT_TABLES is a known migration table.
     /// This prevents future mismatches by listing all valid tables.
     #[test]
@@ -1412,5 +2064,124 @@ mod tests {
                 table
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #2789: end-to-end "changes since" filtering against a real database.
+    // Skips cleanly when `DATABASE_URL` is unset (the CI coverage job seeds
+    // Postgres, so it is exercised there). Everything is scoped to a unique
+    // repository id so parallel test processes never see each other's rows.
+    // -----------------------------------------------------------------------
+
+    /// Build a backup service backed by `pool` with a throwaway filesystem
+    /// storage handle (the artifact-enumeration paths under test never read
+    /// bytes, so the backend is only needed to satisfy the constructor).
+    fn service_for(pool: PgPool) -> BackupService {
+        use crate::services::storage_service::FilesystemBackend;
+        let dir = std::env::temp_dir().join(format!("bk-since-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp storage dir");
+        let backend = Arc::new(FilesystemBackend::new(dir));
+        let storage = Arc::new(StorageService::new(backend));
+        BackupService::new(pool, storage)
+    }
+
+    /// Insert an artifact row with an explicit `updated_at` and return its key.
+    async fn insert_artifact_at(
+        pool: &PgPool,
+        repo_id: Uuid,
+        label: &str,
+        updated_at: DateTime<Utc>,
+    ) -> String {
+        let key = format!("since-test/{}-{}", label, Uuid::new_v4());
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (repository_id, path, name, size_bytes, checksum_sha256,
+                 content_type, storage_key, updated_at)
+            VALUES ($1, $2, $3, 10, $4, 'application/octet-stream', $5, $6)
+            "#,
+        )
+        .bind(repo_id)
+        .bind(format!("path/{}", key))
+        .bind(label)
+        .bind("0".repeat(64))
+        .bind(&key)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .expect("insert artifact");
+        key
+    }
+
+    #[tokio::test]
+    async fn test_since_filter_excludes_older_includes_newer_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let old_at = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let new_at = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cutoff = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let old_key = insert_artifact_at(&pool, repo_id, "old", old_at).await;
+        let new_key = insert_artifact_at(&pool, repo_id, "new", new_at).await;
+
+        let service = service_for(pool.clone());
+        let repo_filter = [repo_id];
+
+        // With a `since` cutoff only the artifact modified after it is included.
+        let keys = service
+            .artifact_storage_keys(Some(&repo_filter), Some(cutoff))
+            .await
+            .expect("storage keys with since");
+        assert_eq!(
+            keys,
+            vec![new_key.clone()],
+            "since keeps only the newer key"
+        );
+        assert!(!keys.contains(&old_key), "older artifact is excluded");
+
+        // The exported metadata rows honor the same cutoff.
+        let exported = service
+            .export_artifacts(Some(&repo_filter), Some(cutoff))
+            .await
+            .expect("export with since");
+        let rows = exported.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "only the newer artifact row is exported");
+        assert_eq!(rows[0]["storage_key"], serde_json::json!(new_key));
+
+        // Boundary: an artifact modified exactly at the cutoff is included
+        // (predicate is `updated_at >= since`).
+        let edge_key = insert_artifact_at(&pool, repo_id, "edge", cutoff).await;
+        let keys_edge = service
+            .artifact_storage_keys(Some(&repo_filter), Some(cutoff))
+            .await
+            .expect("storage keys with since (edge)");
+        assert!(
+            keys_edge.contains(&edge_key),
+            "artifact at exactly the cutoff is included"
+        );
+
+        // No cutoff (`None`) => every artifact in the repo, unchanged behavior.
+        let keys_all = service
+            .artifact_storage_keys(Some(&repo_filter), None)
+            .await
+            .expect("storage keys without since");
+        assert_eq!(keys_all.len(), 3, "unset since includes every artifact");
+
+        // Cleanup: dropping the repo cascades to its artifacts.
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

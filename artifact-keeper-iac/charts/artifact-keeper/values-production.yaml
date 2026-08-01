@@ -11,7 +11,9 @@
 backend:
   replicaCount: 3
   image:
-    tag: "1.2.0"
+    # Tracks the latest published backend release (see the IMAGE TAGS note in
+    # values.yaml — backend and web release on independent cadences).
+    tag: "1.6.0"
   env:
     RUST_LOG: "info"
     ENVIRONMENT: "production"
@@ -49,7 +51,7 @@ backend:
 web:
   replicaCount: 3
   image:
-    tag: "1.2.0"
+    tag: "1.5.8"
   resources:
     requests:
       cpu: 500m
@@ -171,7 +173,9 @@ ingress:
     nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
-    nginx.ingress.kubernetes.io/enable-cors: "true"
+    # CORS is handled by the backend (backend.env.CORS_ORIGINS). Opt into
+    # controller-level CORS explicitly if you want it, with a restricted
+    # origin — see the annotations note in values.yaml.
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
   host: ""  # Set to production domain
   tls:

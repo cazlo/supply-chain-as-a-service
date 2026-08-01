@@ -1,0 +1,188 @@
+{{/*
+=============================================================================
+Fleet mode: shared-database bootstrap Job
+=============================================================================
+Renders only in fleet mode (fleet.enabled) with the bootstrap enabled. Runs as
+a pre-install/pre-upgrade Helm hook: connects to the shared PostgreSQL server
+with the superuser credentials from fleet.externalDatabaseBootstrap.adminSecret
+and creates the instance role and database (named ak_<instanceId>) if they are
+absent. Schema migrations are NOT run here; the backend runs its own migrations
+on startup, so this Job only has to guarantee the role and empty database exist
+before the backend pod connects.
+
+The instance role password is read from fleet.externalDatabaseBootstrap.existingSecret
+so it matches the DATABASE_URL the backend consumes from the same Secret.
+=============================================================================
+*/}}
+{{- if and (eq (include "artifact-keeper.fleet.enabled" .) "true") .Values.fleet.externalDatabaseBootstrap.enabled }}
+{{- $ident := include "artifact-keeper.fleet.dbIdentifier" . }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-db-bootstrap
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fleet-db-bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "artifact-keeper.labels" . | nindent 8 }}
+        app.kubernetes.io/component: fleet-db-bootstrap
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      {{- with (.Values.backend.tolerations | default .Values.global.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (.Values.backend.nodeSelector | default .Values.global.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        fsGroup: 70
+      containers:
+        - name: db-bootstrap
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+              ephemeral-storage: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+          env:
+            - name: HOME
+              value: /tmp
+            - name: PGHOST
+              value: {{ .Values.fleet.externalDatabaseBootstrap.host | quote }}
+            - name: PGPORT
+              value: {{ .Values.fleet.externalDatabaseBootstrap.port | quote }}
+            # Privileged connection to the shared server, used ONLY when this
+            # instance still needs provisioning. Marked optional so that
+            # removing the credential after provisioning (which is the desired
+            # end state: it should not live in an instance namespace any longer
+            # than it must) does not wedge every later sync in
+            # CreateContainerConfigError. When the secret is absent and the
+            # instance is already provisioned, the Job exits cleanly.
+            - name: ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.fleet.externalDatabaseBootstrap.adminSecret }}
+                  key: username
+                  optional: true
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.fleet.externalDatabaseBootstrap.adminSecret }}
+                  key: password
+                  optional: true
+            # Instance role password, kept in sync with the instance DATABASE_URL.
+            - name: INSTANCE_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.fleet.externalDatabaseBootstrap.existingSecret }}
+                  key: {{ .Values.fleet.externalDatabaseBootstrap.passwordKey }}
+            - name: INSTANCE_IDENT
+              value: {{ $ident | quote }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "[db-bootstrap] Waiting for shared PostgreSQL at ${PGHOST}:${PGPORT} ..."
+              for i in $(seq 1 60); do
+                if pg_isready -h "$PGHOST" -p "$PGPORT" >/dev/null 2>&1; then break; fi
+                if [ "$i" -eq 60 ]; then echo "[db-bootstrap] ERROR: database not reachable"; exit 1; fi
+                sleep 3
+              done
+
+              # Already provisioned? Ask the server rather than assuming. The
+              # instance role's own password is available here, so a successful
+              # login to the instance database proves both the role and the
+              # database exist and the password matches what the application
+              # will use. This runs first so that a provisioned instance never
+              # touches the privileged credential, which is what lets that
+              # credential be removed from the namespace after provisioning.
+              if PGPASSWORD="$INSTANCE_DB_PASSWORD" psql -q -w \
+                   -h "$PGHOST" -p "$PGPORT" \
+                   -U "$INSTANCE_IDENT" -d "$INSTANCE_IDENT" \
+                   -c 'SELECT 1' >/dev/null 2>&1; then
+                echo "[db-bootstrap] ${INSTANCE_IDENT} is already provisioned, nothing to do"
+                exit 0
+              fi
+
+              # Provisioning is required, so the privileged credential must be
+              # present. Say so precisely: the most likely cause is that it was
+              # removed after an earlier provisioning run and this instance has
+              # since lost its role, database, or password.
+              if [ -z "${ADMIN_USER:-}" ] || [ -z "${ADMIN_PASSWORD:-}" ]; then
+                echo "[db-bootstrap] ERROR: ${INSTANCE_IDENT} is not reachable with its own credentials and no admin credential is available." >&2
+                echo "[db-bootstrap] Expected secret '{{ .Values.fleet.externalDatabaseBootstrap.adminSecret }}' with keys username and password in this namespace." >&2
+                echo "[db-bootstrap] Restore it to let this Job provision the role and database, then remove it again." >&2
+                exit 1
+              fi
+
+              PGUSER="$ADMIN_USER"
+              PGPASSWORD="$ADMIN_PASSWORD"
+              export PGUSER PGPASSWORD
+
+              echo "[db-bootstrap] Provisioning role and database ${INSTANCE_IDENT}"
+
+              # Create or update the instance role (idempotent). The identifier is
+              # derived from the instance id (alphanumerics and underscores only),
+              # so it is safe to interpolate. The password is passed as a parameter.
+              psql -v ON_ERROR_STOP=1 -d postgres \
+                -v ident="$INSTANCE_IDENT" -v pw="$INSTANCE_DB_PASSWORD" <<'SQL'
+              SELECT format('CREATE ROLE %I LOGIN', :'ident')
+              WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'ident')
+              \gexec
+              SELECT format('ALTER ROLE %I WITH LOGIN PASSWORD %L', :'ident', :'pw')
+              \gexec
+              SQL
+
+              # Create the instance database owned by the role if it does not
+              # exist. CREATE DATABASE cannot run inside a transaction/DO block,
+              # so use the \gexec conditional-create pattern.
+              psql -v ON_ERROR_STOP=1 -d postgres \
+                -v ident="$INSTANCE_IDENT" <<'SQL'
+              SELECT format('CREATE DATABASE %I OWNER %I', :'ident', :'ident')
+              WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'ident')
+              \gexec
+              SQL
+
+              # Verify the end state the same way the check above does, so a
+              # silent partial provision cannot report success.
+              if ! PGPASSWORD="$INSTANCE_DB_PASSWORD" psql -q -w \
+                     -h "$PGHOST" -p "$PGPORT" \
+                     -U "$INSTANCE_IDENT" -d "$INSTANCE_IDENT" \
+                     -c 'SELECT 1' >/dev/null 2>&1; then
+                echo "[db-bootstrap] ERROR: provisioning ran but ${INSTANCE_IDENT} still cannot authenticate to its own database" >&2
+                exit 1
+              fi
+
+              echo "[db-bootstrap] Role and database ${INSTANCE_IDENT} ready"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+{{- end }}

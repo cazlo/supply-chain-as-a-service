@@ -23,20 +23,28 @@
 #
 # IMAGE TAGS
 # ----------
-# The backend/web/edge image tag is load-bearing: when image.tag is left
-# empty (""), the chart falls back to the chart's appVersion, so a given
-# chart release is reproducible. `helm install foo --version 1.2.3` then
-# pulls image tag 1.2.3 without any extra wiring. Bumping appVersion in
-# Chart.yaml auto-pins any component whose tag is left empty.
+# The backend and web images release on independent cadences. They are
+# decoupled at runtime through the versioned REST API, so only the MAJOR
+# version has to align for compatibility; minor and patch drift on purpose
+# (a backend-only release does not force a no-op web rebuild). Because of
+# that drift there is no single number that names both, so each component
+# pins its own default tag: backend.image.tag and web.image.tag each track
+# that component's latest published release.
 #
-# This development profile keeps an explicit floating tag instead:
-#   - "dev" follows the latest build from main (backend/web/edge here)
-#   - values-production.yaml pins "latest" (the most recent release)
-# An explicit tag always wins over the appVersion fallback. Leave a tag
-# empty only when you want it to track appVersion (handy for tagged
-# chart releases). ArgoCD Image Updater pins floating tags to specific
-# digests so rollouts stay deterministic. For manual deploys with a
-# floating tag, set imagePullPolicy: Always so restarts pick up new builds.
+# appVersion (Chart.yaml) describes the application generation the chart
+# ships, which tracks the backend. The image tag is still load-bearing:
+# when a component's image.tag is left empty (""), the chart falls back to
+# appVersion. That fallback is kept for operators who deliberately want a
+# tagged chart release to drive the image tag (`helm install foo --version
+# 1.6.0` then pulls the backend at 1.6.0 without extra wiring). Leave web's
+# tag empty only when the web image actually publishes at appVersion;
+# otherwise the fallback resolves to a tag web has not built.
+#
+# An explicit tag always wins over the appVersion fallback. Overlays pin
+# their own tags (values-production.yaml, values-staging.yaml, etc.).
+# ArgoCD Image Updater pins tags to specific digests so rollouts stay
+# deterministic. For a floating tag such as "dev", set imagePullPolicy:
+# Always so restarts pick up new builds.
 #
 # RESOURCE SIZING
 # ---------------
@@ -94,15 +102,21 @@ cosign:
 # and artifact storage. It runs as a single Rust binary (Axum).
 backend:
   enabled: true
+  # -- Additional envFrom sources (Secrets/ConfigMaps) for the backend container,
+  # rendered verbatim. Use for credentials that must come from existing Secrets.
+  extraEnvFrom: []
   replicaCount: 1
   image:
     repository: ghcr.io/artifact-keeper/artifact-keeper-backend  # Docker Hub: artifactkeeper/backend
-    # -- "dev" is a floating tag built from main. Leave this empty ("") to
-    # inherit the chart's appVersion instead (see the IMAGE TAGS note at the
-    # top of this file). ArgoCD Image Updater pins floating tags to a digest
-    # automatically. For manual deploys with a floating tag, consider a
-    # specific version tag (e.g. 1.1.0) or set pullPolicy: Always.
-    tag: dev
+    # -- Backend image tag. Defaults to the backend's latest published release.
+    # The backend and web images release on independent cadences (see the IMAGE
+    # TAGS note at the top of this file), so each pins its own default here
+    # rather than sharing one number. Leave this empty ("") to fall back to the
+    # chart's appVersion instead, which is handy when you deliberately want a
+    # tagged chart release to drive the image tag. ArgoCD Image Updater pins
+    # tags to a digest automatically. For a floating tag such as "dev", set
+    # pullPolicy: Always so restarts pick up new builds.
+    tag: "1.6.0"
     pullPolicy: Always
   # -- Pod-level securityContext. Defaults are image-native: the backend
   # image bakes the Grype vulnerability DB at /home/artifact/.cache/grype
@@ -318,6 +332,21 @@ backend:
     # SMTP_USERNAME: ""
     # SMTP_FROM_ADDRESS: "noreply@artifact-keeper.local"
     # SMTP_TLS_MODE: "starttls"
+  # -- Controls whether the backend may make plain-HTTP outbound integration
+  # calls (the ALLOW_HTTP_INTEGRATIONS env var). This weakens outbound TLS
+  # posture for EVERY integration the backend talks to, not just the bundled
+  # Dependency-Track, so think of it as a cluster-wide relaxation.
+  #   "auto"  (default): set ALLOW_HTTP_INTEGRATIONS=1 only when
+  #           dependencyTrack.enabled is true, because the bundled
+  #           Dependency-Track is reached over plain HTTP in-cluster and the
+  #           integration fails without it. A warning is printed in the
+  #           install notes whenever the variable is active.
+  #   "true":  always set ALLOW_HTTP_INTEGRATIONS=1.
+  #   "false": never set it. Note the bundled Dependency-Track integration
+  #           will not work unless you put TLS in front of it.
+  # An explicit ALLOW_HTTP_INTEGRATIONS entry in backend.env above overrides
+  # this setting entirely.
+  allowHttpIntegrations: auto
   resources:
     requests:
       cpu: 250m
@@ -359,9 +388,13 @@ web:
   replicaCount: 1
   image:
     repository: ghcr.io/artifact-keeper/artifact-keeper-web  # Docker Hub: artifactkeeper/web
-    # -- "dev" floating tag for the development profile. Leave empty ("") to
-    # inherit the chart's appVersion (see backend.image.tag).
-    tag: dev
+    # -- Web image tag. Defaults to the web frontend's latest published release,
+    # which drifts from the backend's version because the two release
+    # independently (only the major must align for API compatibility). Leave
+    # empty ("") to fall back to the chart's appVersion (see backend.image.tag).
+    # Note the appVersion tracks the backend generation, so an empty web tag can
+    # resolve to a version the web image has not published; pin it here instead.
+    tag: "1.5.8"
     pullPolicy: Always
   podSecurityContext:
     runAsNonRoot: true
@@ -463,7 +496,20 @@ postgres:
     runAsNonRoot: true
     runAsUser: 999
     fsGroup: 999
-  containerSecurityContext: {}
+  # -- Container-level securityContext. Drops all capabilities and disables
+  # privilege escalation; the pod already runs as non-root UID 999
+  # (podSecurityContext above), so the postgres entrypoint takes its non-root
+  # path and never needs CHOWN/FOWNER on the data directory.
+  #
+  # readOnlyRootFilesystem is intentionally NOT set: postgres writes its unix
+  # socket, lock files, and initdb artifacts outside the data volume
+  # (/var/run/postgresql, /tmp), so a read-only rootfs prevents the pod from
+  # starting. To enable it, also mount emptyDir volumes at those paths.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
   auth:
     username: registry
     password: ""
@@ -520,6 +566,12 @@ externalDatabase:
 #   into production by accident.
 opensearch:
   enabled: true
+  # -- Seconds the backend's wait-for-opensearch init container waits for
+  # OpenSearch to reach green/yellow before proceeding on the Postgres-native
+  # search fallback. OpenSearch is an optional accelerator (the backend boots
+  # without it), so an unbounded wait turns a slow/degraded OpenSearch into a
+  # backend-that-never-starts. 0 restores the legacy wait-forever behavior.
+  waitTimeoutSeconds: 180
   replicaCount: 1
   clusterName: artifact-keeper
   image:
@@ -576,7 +628,11 @@ opensearch:
   auth:
     username: "admin"
     # -- OpenSearch 2.12+ requires a strong initial admin password.
-    password: "ArtifactKeeper2026!Strong"
+    # The chart ships none: with the Security plugin enabled
+    # (disableSecurityPlugin: false) an empty value fails the render with a
+    # validation error. Never commit a real credential here; use --set, an
+    # existingSecret, or externalSecrets instead.
+    password: ""
   persistence:
     # -- When false and replicaCount == 1, data lives in an emptyDir
     # sized according to `size`. Set to true (and configure storageClass)
@@ -741,6 +797,12 @@ dependencyTrack:
   enabled: true
   image:
     repository: dependencytrack/apiserver
+    # UPGRADE LANDMINE: keep this below 4.13.0 until the bootstrap changes.
+    # Dependency-Track 4.13 started hashing API keys, so GET /api/v1/team no
+    # longer returns them in plaintext and the bootstrap Job's key extraction
+    # (templates/dtrack-deployment.yaml) stops working. The script fails
+    # loudly rather than writing a bad key, but the integration stays broken
+    # until the bootstrap is reworked for the 4.13+ key model.
     tag: "4.11.4"
   podSecurityContext:
     runAsNonRoot: true
@@ -758,6 +820,16 @@ dependencyTrack:
     capabilities:
       drop:
         - ALL
+  # -- Dependency-Track admin password. Leave empty and the chart generates a
+  # strong one on first install and keeps it stable across upgrades by reading
+  # the value back out of its own Secret. Set it explicitly if you want to know
+  # the password (to log into the Dependency-Track UI yourself) or if you
+  # manage the Secret externally, in which case this key must be present there.
+  # Stability relies on Helm's lookup, which only works when Helm talks to a
+  # live cluster. GitOps engines that render with "helm template" (ArgoCD,
+  # Flux) never see the stored value; this repo's ApplicationSet compensates
+  # with ignoreDifferences + RespectIgnoreDifferences on this Secret key. Other
+  # template-mode consumers should replicate that or set the password here.
   adminPassword: ""
   # -- Size limit for the `/tmp` emptyDir volume. DependencyTrack writes
   # ~1-2Gi into /tmp during startup (NVD mirror sync, DB migrations, JVM
@@ -779,6 +851,14 @@ dependencyTrack:
       ephemeral-storage: 1Gi
   bootstrap:
     enabled: true
+    # -- Image for the one-shot bootstrap Job. It needs curl and nothing else.
+    # The job installs no packages at runtime, so this works on clusters with
+    # no egress to a package mirror; point the repository at your own registry
+    # for air-gapped installs.
+    image:
+      repository: curlimages/curl
+      tag: "8.11.1"
+      pullPolicy: IfNotPresent
     podSecurityContext:
       runAsNonRoot: true
       runAsUser: 1000
@@ -798,11 +878,49 @@ dependencyTrack:
 ingress:
   enabled: true
   className: nginx
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
-    nginx.ingress.kubernetes.io/enable-cors: "true"
+  # Extra annotations for the Ingress object. These are merged with the nginx
+  # proxy annotations derived from maxBodySize / proxyReadTimeoutSeconds /
+  # proxySendTimeoutSeconds below. Any key set here takes precedence over the
+  # derived value, so you can raise a single timeout through the dedicated value
+  # without restating the whole annotation block, or override an annotation
+  # outright by setting it here.
+  #
+  # CORS: the backend handles CORS itself (backend.env.CORS_ORIGINS), so no
+  # controller-level CORS annotation is set by default. If you want the nginx
+  # ingress controller to handle CORS instead, opt in explicitly and restrict
+  # the origin, e.g.:
+  #   annotations:
+  #     nginx.ingress.kubernetes.io/enable-cors: "true"
+  #     nginx.ingress.kubernetes.io/cors-allow-origin: "https://your-ui.example.com"
+  annotations: {}
+  # -- Exposure of the bundled Dependency-Track UI/API on the public ingress.
+  # Default false: Dependency-Track ships its own admin console and API with
+  # separate credentials, so the chart does not route it publicly. The backend
+  # reaches it in-cluster, and operators can reach the UI with
+  # `kubectl port-forward svc/<release>-dtrack 8092:8080` (see NOTES).
+  # Enable only behind authentication you control.
+  dtrack:
+    # -- Route /<host>/dtrack to the bundled Dependency-Track service.
+    # Only has an effect when dependencyTrack.enabled is true.
+    enabled: false
+    # -- Value for Dependency-Track's ALPINE_CORS_ALLOW_ORIGIN, applied only
+    # when ingress.dtrack.enabled is true (otherwise CORS is disabled
+    # entirely). "*" preserves the chart's previous behavior; restrict it to
+    # the origin(s) that should call the Dependency-Track API cross-origin.
+    corsAllowOrigin: "*"
+  # Maximum client request body size, rendered as the nginx `proxy-body-size`
+  # annotation when className is `nginx`. Registries host large artifacts, so
+  # this defaults high; "0" disables the limit entirely. Set to "" to omit the
+  # annotation (for example when a non-nginx controller manages it elsewhere).
+  maxBodySize: "1024m"
+  # Proxy read timeout in seconds, rendered as the nginx `proxy-read-timeout`
+  # annotation when className is `nginx`. Raise this for multi-GiB uploads over
+  # slow links, where the default 300 can be too short. Set to null to omit the
+  # annotation.
+  proxyReadTimeoutSeconds: 300
+  # Proxy send timeout in seconds, rendered as the nginx `proxy-send-timeout`
+  # annotation when className is `nginx`. Set to null to omit the annotation.
+  proxySendTimeoutSeconds: 300
   host: artifacts.example.com
   tls:
     enabled: true
@@ -812,7 +930,18 @@ ingress:
 # These are development defaults. For production, override via --set or
 # use existingSecret references. Never commit real credentials here.
 secrets:
+  # -- Name of an existing Secret that already holds the core application
+  # credentials (JWT_SECRET, and DATABASE_URL/POSTGRES_PASSWORD when the chart
+  # would otherwise manage them). When set, the chart does not render its own
+  # Secret and all workloads read from this Secret instead, so the values under
+  # `secrets` and `postgres.auth.password` are not required. Useful for GitOps
+  # and secret-manager workflows where the Secret is provisioned out of band.
+  existingSecret: ""
   jwtSecret: ""
+  # S3-compatible object storage credentials. Injected into the backend as
+  # S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY when backend.env.STORAGE_BACKEND is
+  # "s3" and the fleet object-storage Secret is not in use. Leave empty for
+  # filesystem storage or when using IAM roles (IRSA) for credentials.
   s3AccessKey: ""
   s3SecretKey: ""
   # SMTP password (only used when backend.env.SMTP_HOST is set)
@@ -867,6 +996,17 @@ externalSecrets:
 # -- Network policies
 networkPolicy:
   enabled: true
+  # -- Namespace the ingress controller pods run in. The backend and web
+  # policies admit pods labeled `app.kubernetes.io/name: ingress-nginx`, and
+  # this pins WHICH namespace those pods may come from. An empty value renders
+  # `namespaceSelector: {}`, which admits pods carrying that label from ANY
+  # namespace — on a shared cluster that lets any workload that can set its
+  # own pod labels reach the backend and web ports directly, bypassing the
+  # ingress controller and everything enforced there (TLS, rate limiting,
+  # allowlist annotations). The default matches the conventional namespace of
+  # the community ingress-nginx controller chart; set it to the namespace your
+  # controller actually runs in. Set to "" only if you understand the above.
+  ingressNamespace: ingress-nginx
 
 # -- Prometheus ServiceMonitor
 serviceMonitor:
@@ -888,3 +1028,116 @@ gke:
     dependencyTrack:
       # -- Health-check path for the DependencyTrack BackendService.
       requestPath: /api/version
+  backendPolicies:
+    # -- Render a `networking.gke.io/v1` GCPBackendPolicy for the backend
+    # Service so a GKE Gateway BackendService uses `timeoutSec` below instead of
+    # the ~30s default, which makes multi-GiB uploads 504 before the backend
+    # finishes reading and checksumming the body. Leave disabled on non-GKE
+    # installs and on nginx Ingress (tune ingress.proxyReadTimeoutSeconds there).
+    enabled: false
+    backend:
+      # -- Backend BackendService request timeout in seconds. Mirrors the
+      # nginx proxy-read-timeout default so both ingress paths behave the same.
+      timeoutSec: 300
+
+# -- Fleet mode: many instances per cluster sharing external services.
+# Opt-in and off by default. When fleet.enabled is false none of the fleet
+# templates render and backend/web sizing and replica counts come from the
+# per-component values above, so a standard single-instance install is
+# unaffected. When enabled, one release is one instance: sizing comes from a
+# preset, the ingress serves a single host, and the instance uses a shared
+# PostgreSQL server and shared object storage instead of in-release services.
+# See templates/_helpers.tpl for the preset tables.
+fleet:
+  # -- Enable fleet mode. Master switch for every fleet template and helper.
+  enabled: false
+  # -- Stable identifier for this instance. Drives the derived database role and
+  # database name (ak_<instanceId>, with dashes normalized to underscores) and
+  # the object storage key prefix.
+  instanceId: ""
+  # -- Public hostname for this instance, used as the single ingress host. When
+  # set, TLS for the host is expected to be terminated upstream (for example by
+  # a shared wildcard certificate on the ingress controller), so the chart does
+  # not emit a per-release ingress TLS block.
+  host: ""
+  # -- Sizing preset: small, medium, or large. Selects chart-owned backend and
+  # web replica counts and resource requests/limits (see _helpers.tpl). An empty
+  # value falls back to small; any other value fails the render.
+  preset: ""
+  # -- Hibernate this instance by scaling backend and web to zero replicas. The
+  # release and its data stay in place; set back to false to resume.
+  hibernate: false
+  # -- Object storage credentials for the shared S3-compatible backend. The
+  # non-secret settings (endpoint, bucket, region) are supplied through
+  # backend.env; the access keys are read from an existing Secret referenced
+  # here and injected into the backend as S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY.
+  #
+  # !!! WARNING — ISOLATION IS BY CONVENTION, NOT ENFORCEMENT !!!
+  # All fleet instances share ONE bucket, separated only by the per-instance
+  # S3_PREFIX key prefix. Object storage has no notion of per-prefix access
+  # control by itself: any credentials that can write to the bucket can read
+  # and overwrite EVERY instance's prefix. Isolation therefore depends entirely
+  # on you provisioning PER-INSTANCE credentials (one Secret per instance,
+  # each backed by an IAM/user policy scoped to that instance's prefix, e.g.
+  # an s3:prefix condition on "<instanceId>/*"). If two instances reference
+  # the same Secret — or one set of credentials with bucket-wide access —
+  # either instance can read, modify, or delete the other's artifacts.
+  # Do NOT reuse one Secret across fleet releases.
+  storage:
+    # -- Name of an existing Secret holding the object storage access keys.
+    # MUST be unique per fleet instance (see the WARNING above): scope the
+    # underlying credentials to this instance's S3_PREFIX so a compromised or
+    # misbehaving instance cannot reach other instances' artifacts.
+    existingSecret: ""
+    # -- Key in the Secret holding the access key id.
+    accessKeyIdKey: S3_ACCESS_KEY_ID
+    # -- Key in the Secret holding the secret access key.
+    secretAccessKeyKey: S3_SECRET_ACCESS_KEY
+  # -- Bootstrap of the instance role and database on a shared PostgreSQL server.
+  # Runs as a pre-install/pre-upgrade hook Job that creates the role and database
+  # (named ak_<instanceId>) if they are absent. The backend runs its own schema
+  # migrations on startup, so the Job only guarantees the empty database and its
+  # owning role exist before the backend connects.
+  externalDatabaseBootstrap:
+    # -- Run the bootstrap Job.
+    enabled: true
+    # -- Host of the shared PostgreSQL read-write service.
+    host: ""
+    # -- Port of the shared PostgreSQL read-write service.
+    port: 5432
+    # -- Name of an existing Secret holding the instance role password. The same
+    # Secret is expected to hold the DATABASE_URL the backend consumes.
+    existingSecret: ""
+    # -- Key in existingSecret holding the instance role password.
+    passwordKey: password
+    # -- Name of an existing Secret holding superuser credentials for the shared
+    # server, used only by the bootstrap Job. Expected keys: username, password.
+    adminSecret: ""
+  # -- Per-namespace guardrails. Each toggle is independent and off by default.
+  # ResourceQuota and LimitRange are sized from the preset; the NetworkPolicy
+  # restricts ingress to the named ingress-controller namespace and egress to
+  # the named shared-service namespaces plus DNS and outbound HTTPS.
+  guardrails:
+    # -- Emit a ResourceQuota sized from the preset.
+    resourceQuota: false
+    # -- Emit a LimitRange sized from the preset.
+    limitRange: false
+    # -- Emit a NetworkPolicy scoping ingress and egress.
+    networkPolicy: false
+    # -- Namespace of the ingress controller allowed to reach the instance
+    # (NetworkPolicy ingress).
+    ingressNamespace: ingress-nginx
+    # -- Namespace of the shared PostgreSQL server (NetworkPolicy egress).
+    databaseNamespace: ""
+    # -- Namespace of the shared search service (NetworkPolicy egress).
+    searchNamespace: ""
+    # -- Namespace of the shared scanner service (NetworkPolicy egress).
+    scannerNamespace: ""
+    # -- Explicit ResourceQuota overrides. By default the quota is sized from the
+    # preset and grows to account for each enabled optional component (trivy,
+    # scannerAdapter, opensearch, dependencyTrack). Set any of these keys to
+    # replace the corresponding computed total outright; unset keys stay
+    # component-aware. Values are used verbatim as Kubernetes quantities, for
+    # example limitsMemory: 32Gi or pods: 40. Keys: requestsCpu, requestsMemory,
+    # limitsCpu, limitsMemory, pods, pvcs.
+    quotaOverrides: {}

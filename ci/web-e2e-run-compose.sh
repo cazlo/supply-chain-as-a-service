@@ -75,6 +75,10 @@ awk '$1 == 0 && $2 > 65535 && $3 >= 65536 { ok=1 } END { exit !ok }' \
   /proc/self/uid_map || { echo "Compose runner lacks the expected Pod user namespace" >&2; exit 1; }
 
 compose_runtime_snapshot "${results_dir}/runtime-before.txt"
+# A hard-killed predecessor (Pod restart, SIGKILL past the traps) cannot run
+# its own prune; reclaim its image layers here so one crash does not fail
+# every later job on this runner. runtime-before.txt keeps the leak evidence.
+compose_runtime_prune_images "${results_dir}/image-prune-before.log"
 compose_runtime_assert_clean "before startup"
 compose_runtime_compose config --format json >"${results_dir}/compose-config.json"
 compose_runtime_require_digest_images "${results_dir}/compose-config.json"

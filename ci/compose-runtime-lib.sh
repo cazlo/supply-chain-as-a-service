@@ -17,6 +17,13 @@ compose_runtime_bounded_compose() {
     "${COMPOSE_RUNTIME_COMPOSE_ARGS[@]}" "$@"
 }
 
+# Pruning tens of GiB of overlay layers can exceed the per-command cleanup
+# bound, so image removal gets its own, longer timeout.
+compose_runtime_bounded_prune() {
+  timeout -s TERM -k 5 \
+    "${COMPOSE_RUNTIME_IMAGE_PRUNE_TIMEOUT_SECONDS:-120}" "$@"
+}
+
 compose_runtime_registry_login() {
   local runtime_registry="$1"
   local runtime_registry_username="$2"
@@ -40,6 +47,10 @@ compose_runtime_init() {
   }
   [[ "${COMPOSE_RUNTIME_CLEANUP_COMMAND_TIMEOUT_SECONDS:-30}" =~ ^[1-9][0-9]*$ ]] || {
     echo "COMPOSE_CLEANUP_COMMAND_TIMEOUT_SECONDS must be a positive integer" >&2
+    return 1
+  }
+  [[ "${COMPOSE_RUNTIME_IMAGE_PRUNE_TIMEOUT_SECONDS:-120}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "COMPOSE_IMAGE_PRUNE_TIMEOUT_SECONDS must be a positive integer" >&2
     return 1
   }
 
@@ -66,22 +77,25 @@ compose_runtime_init() {
 }
 
 compose_runtime_collect_state() {
-  local container_ids volume_names network_names
-  local containers volumes project_networks
+  local container_ids volume_names network_names image_ids
+  local containers volumes project_networks images
 
   container_ids="$(compose_runtime_bounded docker ps -aq)" || return 1
   volume_names="$(compose_runtime_bounded docker volume ls -q)" || return 1
   network_names="$(compose_runtime_bounded docker network ls --format '{{.Name}}')" || return 1
+  image_ids="$(compose_runtime_bounded docker image ls -aq)" || return 1
 
   containers="$(awk 'NF { count++ } END { print count + 0 }' <<<"${container_ids}")"
   volumes="$(awk 'NF { count++ } END { print count + 0 }' <<<"${volume_names}")"
   project_networks="$(awk -v pattern="${COMPOSE_RUNTIME_NETWORK_PATTERN}" \
     '$0 ~ pattern { count++ } END { print count + 0 }' <<<"${network_names}")"
+  images="$(awk 'NF { count++ } END { print count + 0 }' <<<"${image_ids}")"
 
   printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'containers=%s\n' "${containers}"
   printf 'volumes=%s\n' "${volumes}"
   printf 'project_networks=%s\n' "${project_networks}"
+  printf 'images=%s\n' "${images}"
 }
 
 compose_runtime_snapshot() {
@@ -94,7 +108,7 @@ compose_runtime_snapshot() {
 
 compose_runtime_assert_clean() {
   local context="$1"
-  local state containers volumes project_networks
+  local state containers volumes project_networks images
 
   state="$(compose_runtime_collect_state)" || {
     echo "Unable to inspect the Podman engine ${context}" >&2
@@ -103,11 +117,23 @@ compose_runtime_assert_clean() {
   containers="$(awk -F= '$1 == "containers" { print $2 }' <<<"${state}")"
   volumes="$(awk -F= '$1 == "volumes" { print $2 }' <<<"${state}")"
   project_networks="$(awk -F= '$1 == "project_networks" { print $2 }' <<<"${state}")"
+  images="$(awk -F= '$1 == "images" { print $2 }' <<<"${state}")"
 
-  if [[ "${containers}" != 0 || "${volumes}" != 0 || "${project_networks}" != 0 ]]; then
-    echo "Compose engine is not clean ${context}: containers=${containers}, volumes=${volumes}, project_networks=${project_networks}" >&2
+  if [[ "${containers}" != 0 || "${volumes}" != 0 || "${project_networks}" != 0 || "${images}" != 0 ]]; then
+    echo "Compose engine is not clean ${context}: containers=${containers}, volumes=${volumes}, project_networks=${project_networks}, images=${images}" >&2
     return 1
   fi
+}
+
+# Podman keeps image layers after `compose down`, and on a long-lived
+# capacity-one runner the per-PR digests accumulate until the podman-graph
+# EmptyDir breaches its limit and the kubelet evicts the Pod mid-job (the
+# Gitea job then hangs server-side, because job timeouts are runner-enforced).
+# Every job therefore starts from and returns to an empty image store; the
+# re-pull cost is repo-local Harbor traffic and is recorded in timings.env.
+compose_runtime_prune_images() {
+  local log_file="$1"
+  compose_runtime_bounded_prune docker image prune -af >"${log_file}" 2>&1
 }
 
 compose_runtime_require_digest_images() {
@@ -189,10 +215,20 @@ compose_runtime_finalize() {
   compose_runtime_bounded_compose logs --no-color \
     >"${COMPOSE_RUNTIME_RESULTS_DIR}/compose.log" 2>&1 || true
 
+  # Peak graph usage for this job: the EmptyDir sizing evidence the runner
+  # limits are derived from lives here, not in the post-cleanup snapshot.
+  compose_runtime_snapshot \
+    "${COMPOSE_RUNTIME_RESULTS_DIR}/runtime-peak.txt" || true
+
   down_started="$(date +%s)"
   if ! compose_runtime_bounded_compose down --volumes --remove-orphans \
     >"${COMPOSE_RUNTIME_RESULTS_DIR}/compose-down.log" 2>&1; then
     echo "Bounded Compose teardown failed" >&2
+    cleanup_failed=1
+  fi
+  if ! compose_runtime_prune_images \
+    "${COMPOSE_RUNTIME_RESULTS_DIR}/image-prune.log"; then
+    echo "Bounded image prune failed" >&2
     cleanup_failed=1
   fi
   down_finished="$(date +%s)"

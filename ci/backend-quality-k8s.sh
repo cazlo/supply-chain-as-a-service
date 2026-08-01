@@ -119,7 +119,7 @@ build_args=(
   --build-arg "NEW_CODE_MIN=${NEW_CODE_MIN:-70}"
   --build-arg "TOTAL_MIN=${TOTAL_MIN:-50}"
   --build-arg "COVERAGE_TEST_THREADS=${COVERAGE_TEST_THREADS:-8}"
-  --build-arg "COVERAGE_NO_CLEAN=${COVERAGE_NO_CLEAN:-1}"
+  --build-arg "COVERAGE_NO_CLEAN=${COVERAGE_NO_CLEAN:-0}"
 )
 if [[ "${mode}" == "integration" ]]; then
   build_args+=(--build-arg "TEST=${test_target}")

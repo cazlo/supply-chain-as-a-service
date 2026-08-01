@@ -51,13 +51,17 @@ import { PackagesTabContent } from "./packages-tab-content";
 import {
   ArtifactBrowserToggle,
   supportsGrouping,
+  supportsTree,
   type ArtifactViewMode,
 } from "./artifact-browser-toggle";
 import { MavenComponentList } from "./maven-component-list";
 import { DockerTagList } from "./docker-tag-list";
+import { ArtifactFolderTree } from "./artifact-folder-tree";
 import { QuarantineBadge } from "@/components/common/quarantine-badge";
 import { QuarantineBanner } from "@/components/common/quarantine-banner";
 import { RepoSettingsTab } from "./repo-settings-tab";
+import { RepoStoragePanel } from "./repo-storage-panel";
+import { RepoFolderStoragePanel } from "./repo-folder-storage-panel";
 import { formatBytes, REPO_TYPE_COLORS } from "@/lib/utils";
 import { useAuth } from "@/providers/auth-provider";
 import { useSystemConfig } from "@/providers/system-config-provider";
@@ -130,13 +134,15 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
 
-  // Grouped vs flat artifact-browser view (issues #254, #330).  The URL
-  // `?view=flat|grouped` query param is the source of truth so the choice
-  // survives a refresh and is shareable.  Absence falls back to the
+  // Grouped vs flat vs tree artifact-browser view (issues #254, #330, #2791).
+  // The URL `?view=flat|grouped|tree` query param is the source of truth so the
+  // choice survives a refresh and is shareable.  Absence falls back to the
   // per-format default.
   const urlView = searchParams.get("view");
   const viewModeOverride: ArtifactViewMode | null =
-    urlView === "flat" || urlView === "grouped" ? urlView : null;
+    urlView === "flat" || urlView === "grouped" || urlView === "tree"
+      ? urlView
+      : null;
 
   // artifact detail dialog
   const [detailOpen, setDetailOpen] = useState(false);
@@ -170,6 +176,11 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
     viewMode === "grouped" &&
     (repoFormat === "maven" || repoFormat === "gradle");
   const isDockerGrouped = viewMode === "grouped" && repoFormat === "docker";
+  // Folder-tree view for RAW/Generic repos (#2791): the tree is grouped
+  // client-side from the flat artifact list, so — like Docker grouping — it
+  // needs the whole listing on one page (bounded) rather than a paginated slice.
+  const isTreeView =
+    viewMode === "tree" && !!repoFormat && supportsTree(repoFormat);
   // First-class version history (#571, backend artifact-keeper#2367): only
   // repositories that opted in via `versioning_enabled` AND whose format
   // participates (Generic/Mlmodel) get the Versions tab in the artifact
@@ -181,8 +192,9 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
   // For Docker grouping we need all artifacts on one page so the client
   // aggregation sees everything.  Bound by a high cap to avoid runaway
   // responses on huge registries.
-  const effectivePageSize = isDockerGrouped ? 500 : pageSize;
-  const effectivePage = isDockerGrouped ? 1 : page;
+  const loadAllOnePage = isDockerGrouped || isTreeView;
+  const effectivePageSize = loadAllOnePage ? 500 : pageSize;
+  const effectivePage = loadAllOnePage ? 1 : page;
 
   const handleViewModeChange = useCallback(
     (next: ArtifactViewMode) => {
@@ -647,6 +659,27 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
         </div>
       )}
 
+      {/* Deduplicated storage usage (epic artifact-keeper#2056). Renders the
+          real physical/logical footprint, dedup savings, and — for admins —
+          the instance total and reclaimable estimate. Field visibility for
+          non-admins on instance-scope backends is enforced by the backend and
+          handled gracefully by the panel. */}
+      <RepoStoragePanel
+        repository={repository}
+        isAdmin={!!user?.is_admin}
+      />
+
+      {/* Per-folder deduplicated storage (epic artifact-keeper#2056, sub-task
+          4). Lists each top-level folder's real physical footprint and dedup
+          split. The folder-level figures are not yet part of the generated SDK,
+          so the panel reads them from the tree response via a validated
+          trust-boundary adapter and renders nothing until a backend reports
+          them — no empty panel on backends that predate the folder API. */}
+      <RepoFolderStoragePanel
+        repository={repository}
+        isAdmin={!!user?.is_admin}
+      />
+
       {/* Tabs */}
       <Tabs defaultValue="artifacts">
         <TabsList variant="line">
@@ -719,13 +752,14 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
                 }}
               />
             </div>
-            {repoFormat && supportsGrouping(repoFormat) && (
-              <ArtifactBrowserToggle
-                value={viewMode}
-                onChange={handleViewModeChange}
-                format={repoFormat}
-              />
-            )}
+            {repoFormat &&
+              (supportsGrouping(repoFormat) || supportsTree(repoFormat)) && (
+                <ArtifactBrowserToggle
+                  value={viewMode}
+                  onChange={handleViewModeChange}
+                  format={repoFormat}
+                />
+              )}
             {user?.is_admin && (
               <Button
                 variant="outline"
@@ -748,7 +782,9 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
           <div role="status" aria-live="polite" className="sr-only">
             {viewMode === "grouped"
               ? `Showing grouped ${repoFormat === "docker" ? "tag" : "component"} view`
-              : "Showing flat list view"}
+              : viewMode === "tree"
+                ? "Showing folder tree view"
+                : "Showing flat list view"}
           </div>
 
           {/* Outcome announcements for destructive actions (delete / cache
@@ -772,6 +808,14 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
               }}
               onFileSelect={showDetailByPath}
               emptyMessage="No Maven components could be grouped — switch to flat view to see raw files."
+            />
+          ) : isTreeView ? (
+            <ArtifactFolderTree
+              artifacts={artifactsData?.items ?? []}
+              loading={artifactsLoading}
+              onFileSelect={showDetail}
+              selectedPath={selectedArtifact?.path ?? null}
+              emptyMessage="No artifacts in this repository."
             />
           ) : isDockerGrouped ? (
             <DockerTagList

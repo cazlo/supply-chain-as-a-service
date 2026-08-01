@@ -78,6 +78,15 @@ ARG TOTAL_MIN=50
 # build-arg (ci/backend-quality-k8s.sh forwards it). Default matches the
 # proven 8-thread soak configuration.
 ARG COVERAGE_TEST_THREADS=8
+# Reusing the instrumented target dir across runs is the wall-clock lever, but
+# the shared `ak-quality-target` cache mount accumulates object files from
+# earlier builds and `cargo llvm-cov report` sums them: on this branch the
+# overall-floor denominator grew 531,770 -> 597,649 -> 599,611 lines across
+# three runs of byte-identical source while the covered-line count stayed at
+# ~286,690, dropping the reported total from 53.91% to 47.81% and tripping the
+# >= 50% floor. Make the reuse overridable so a run can force
+# `cargo llvm-cov clean --workspace` and report only its own objects.
+ARG COVERAGE_NO_CLEAN=1
 ENV DATABASE_URL=${DATABASE_URL} \
     COVERAGE_BASE=${COVERAGE_BASE} \
     NEW_CODE_MIN=${NEW_CODE_MIN} \
@@ -92,7 +101,7 @@ ENV DATABASE_URL=${DATABASE_URL} \
     CARGO_PROFILE_TEST_DEBUG=0 \
     CARGO_TERM_COLOR=always \
     COVERAGE_TEST_THREADS=${COVERAGE_TEST_THREADS} \
-    COVERAGE_NO_CLEAN=1
+    COVERAGE_NO_CLEAN=${COVERAGE_NO_CLEAN}
 
 # These pre-existing tests are environment-sensitive in BuildKit: the OTLP
 # constructor rejects its hard-coded localhost URI, and the filesystem

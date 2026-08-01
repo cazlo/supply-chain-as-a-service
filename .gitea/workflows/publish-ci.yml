@@ -154,6 +154,10 @@ jobs:
     needs: [gate, backend-build]
     if: needs.gate.outputs.run == 'true' && needs.gate.outputs.publish == 'true'
     runs-on: artifact-keeper-compose
+    # Above the 1200s script watchdog, below the runner's 45m task timeout.
+    # Runner-enforced, so it bounds in-runner hangs only; a runner Pod evicted
+    # mid-job still leaves the job running server-side until cancelled.
+    timeout-minutes: 30
     steps:
       - name: Check out the vendored sources
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -326,6 +330,9 @@ jobs:
     needs: [gate, backend-integration-build]
     if: needs.gate.outputs.run == 'true' && needs.gate.outputs.publish == 'true'
     runs-on: artifact-keeper-compose
+    # Above the 600s script watchdog plus per-leg image pulls; see
+    # backend-smoke-compose for what runner-enforced timeouts do not cover.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       # Four capacity-one Compose runners are balanced across worker nodes.
@@ -505,6 +512,9 @@ jobs:
     needs: [gate, backend-build, backend-smoke-compose, web-build, web-e2e-build]
     if: needs.gate.outputs.run == 'true' && needs.gate.outputs.publish == 'true'
     runs-on: artifact-keeper-compose
+    # Above the 1500s script watchdog; see backend-smoke-compose for what
+    # runner-enforced timeouts do not cover.
+    timeout-minutes: 35
     steps:
       - name: Check out the vendored sources
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

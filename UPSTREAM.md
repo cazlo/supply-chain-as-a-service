@@ -1,8 +1,11 @@
 # Vendored upstream sources
 
-The three Artifact Keeper repositories are imported as full-history Git
-subtrees. Do not use the `--squash` option when adding or updating them; keeping
-the upstream ancestry makes later synchronization and contribution work easier.
+The three Artifact Keeper repositories are imported content-only: each vendored
+prefix holds the exact tree of one reviewed upstream commit, imported as an
+ordinary single-parent commit. Upstream ancestry is deliberately kept out of
+this history, so `main` stays linear and the public mirror carries no upstream
+commit graph. The recorded revision identifies the imported commit; it is not
+reachable from `HEAD`.
 
 ## Current imports
 
@@ -11,13 +14,31 @@ The machine-readable source of truth is
 reviewed commit had no containing release tag at import time. Each vendored
 prefix retains its upstream `LICENSE` file.
 
-Local build identities and image digests will be recorded when reproducible CI
-is introduced. There are currently no local behavioral patches, related
-upstream issues, or pull requests.
+| prefix | tag | revision | imported |
+| --- | --- | --- | --- |
+| `artifact-keeper/` | `v1.7.0` | `13b28fc7049a634efcae99884d761641151ef538` | 2026-08-01 |
+| `artifact-keeper-web/` | `v1.6.0` | `e86b5ff4f990a15150e5585c21d0b0345fa54ec3` | 2026-08-01 |
+| `artifact-keeper-iac/` | `artifact-keeper-1.9.4` | `6339c005d9a732576f975be07cf39f02ee6135ef` | 2026-08-01 |
+
+The backend `v1.7.0` tag differs from the upstream main tip `9cbd7efc` only in
+`.github/workflows/release.yml`. There is no web `v1.7.0` release; `v1.6.0` is
+the newest web tag. The IaC pin carries chart version `1.9.4` with `appVersion`
+`1.6.0`.
+
+## Local patches
+
+| prefix | patch | upstream issue or PR | disposition |
+| --- | --- | --- | --- |
+
+None. Every vendored prefix is byte-identical to its upstream tag; `make
+vendor-check` proves it. Local build identities and image digests will be
+recorded when reproducible CI is introduced.
 
 ## Clean snapshot validation
 
-The pinned snapshots passed the following unmodified-source gates on 2026-06-27:
+The gates below are the standing unmodified-source gates. They last recorded a
+full pass on 2026-06-27, against the original `ea6f5ed` / `3cfc8dd` snapshots;
+the results have not been re-recorded for the current pins:
 
 - backend Docker `builder` target with identity
   `artifact-keeper-backend:source-check-ea6f5ed` and application version
@@ -59,8 +80,10 @@ evaluation and disposition belong to the reproducible CI milestone.
 
 ## Verify the pinned snapshots
 
-The imported upstream commits remain reachable through the subtree merge
-parents. This check requires no network access:
+The check compares each vendored prefix with the tree of its recorded revision
+and fails on any byte of drift. It requires no network access, but it does need
+the recorded commits present locally — fetch them into `refs/vendor/*` on a
+fresh clone, since content-only imports leave them unreachable from `HEAD`:
 
 ```sh
 make vendor-check
@@ -82,12 +105,13 @@ the exact update commit. Inspect one fetched range with:
 git log --oneline <recorded-revision>..refs/vendor-sync/<name>/latest
 ```
 
-## Update a subtree
+## Re-pin a vendored prefix
 
-Start from a clean worktree. The update command fetches the reviewed ref, rejects
-non-fast-forward history, performs a non-squashed subtree merge, explicitly
-signs that merge, updates the lock file, and creates a second signed provenance
-commit:
+Start from a clean worktree. The update command fetches the reviewed ref,
+verifies that the release tag resolves to it, replaces the prefix with that
+commit's tree, signs the re-pin commit, updates the lock file, and creates a
+second signed provenance commit. The reviewed revision does not have to be a
+fast-forward from the current pin, and no merge commit is created:
 
 ```sh
 make vendor-update NAME=artifact-keeper REF=<reviewed-ref> TAG=<release-tag-or-dash>
@@ -95,5 +119,5 @@ make vendor-update NAME=artifact-keeper REF=<reviewed-ref> TAG=<release-tag-or-d
 
 Review both commits and run `make vendor-check` before pushing. Never edit an
 imported tree anonymously. Make a behavioral change in an upstream fork/branch,
-record its issue or pull request and disposition here, and then import that
-exact commit through the subtree.
+record its issue or pull request and disposition in the local-patches table
+above, and then import that exact commit as its own content-only re-pin.

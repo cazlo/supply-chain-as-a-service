@@ -27,6 +27,11 @@ cleanup() {
   set +e
   if [[ -n "${watchdog_pid}" ]]; then
     kill "${watchdog_pid}" >/dev/null 2>&1 || true
+    # Runner 3 bounds how long it waits for descendant-held stdout/stderr
+    # pipes. Reap the watchdog after terminating it so its sleep process cannot
+    # retain the step's output descriptors and trigger exec.ErrWaitDelay.
+    wait "${watchdog_pid}" >/dev/null 2>&1 || true
+    watchdog_pid=""
   fi
   docker rm -f ak-compose-canary-playwright >/dev/null 2>&1 || true
   if [[ "${mode}" != "--cleanup-only" || ! -e "${results_dir}/compose.log" ]]; then
@@ -93,7 +98,7 @@ readonly canary_timeout_seconds="${COMPOSE_CANARY_TIMEOUT_SECONDS:-1500}"
   sleep "${canary_timeout_seconds}"
   echo "Canary watchdog reached ${canary_timeout_seconds}s; requesting cleanup" >&2
   kill -TERM "$$"
-) &
+) >"${results_dir}/watchdog.log" 2>&1 &
 watchdog_pid=$!
 
 [[ "$(id -u)" -ne 0 ]] || {

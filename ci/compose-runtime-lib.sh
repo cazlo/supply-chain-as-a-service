@@ -158,7 +158,7 @@ compose_runtime_start_watchdog() {
     sleep "${runtime_watchdog_seconds}"
     echo "${runtime_watchdog_description} watchdog reached ${runtime_watchdog_seconds}s; requesting cleanup" >&2
     kill -TERM "$$"
-  ) &
+  ) >"${COMPOSE_RUNTIME_RESULTS_DIR}/watchdog.log" 2>&1 &
   COMPOSE_RUNTIME_WATCHDOG_PID=$!
 }
 

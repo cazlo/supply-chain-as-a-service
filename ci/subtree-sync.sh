@@ -14,11 +14,16 @@ Usage:
 Commands:
   check   Compare each vendored tree with its recorded commit; no network.
   status  Fetch each default branch and report commits available upstream.
-  update  Merge one reviewed ref as a full-history subtree and update its lock.
+  update  Replace one prefix with the reviewed ref's tree and update its lock.
 
-The update command requires a clean worktree and a fast-forward upstream
-revision. It signs the subtree merge and provenance commits. Pass '-' when the
-reviewed revision has no release tag.
+Imports are content-only: a vendored prefix holds the exact tree of the
+reviewed upstream commit, but that commit never becomes an ancestor of this
+history. The update command therefore requires a clean worktree but accepts a
+non-fast-forward revision. It signs the re-pin and provenance commits. Pass '-'
+when the reviewed revision has no release tag.
+
+check needs the recorded commits present locally (for example under
+refs/vendor/); fetch them before running it on a fresh clone.
 EOF
 }
 
@@ -66,9 +71,7 @@ selected_names() {
 check_one() {
   load_upstream "$1"
   git cat-file -e "${upstream_revision}^{commit}" 2>/dev/null ||
-    die "${upstream_name}: recorded commit is missing from local history"
-  git merge-base --is-ancestor "${upstream_revision}" HEAD ||
-    die "${upstream_name}: recorded commit is not reachable from HEAD"
+    die "${upstream_name}: recorded commit ${upstream_revision} is not present locally; fetch it first"
   [[ -f "${upstream_prefix}/LICENSE" ]] || die "${upstream_name}: LICENSE is missing"
 
   if ! git diff --quiet "${upstream_revision}^{tree}" "HEAD:${upstream_prefix}"; then
@@ -143,11 +146,10 @@ update_one() {
     echo "${upstream_name}: already pinned at ${candidate}"
     return
   fi
-  git merge-base --is-ancestor "${upstream_revision}" "${candidate}" ||
-    die "${upstream_name}: ${candidate} is not a fast-forward from ${upstream_revision}"
-
-  git subtree merge --prefix="${upstream_prefix}" -m "chore(vendor): sync ${upstream_name} to ${candidate:0:12}" "${candidate}"
-  git commit --amend --no-edit -S
+  git rm -rq --cached "${upstream_prefix}"
+  rm -rf "${upstream_prefix}"
+  git read-tree --prefix="${upstream_prefix}/" -u "${candidate}^{tree}"
+  git commit -S -m "chore(vendor): re-pin ${upstream_name} to ${candidate:0:12} (content-only)"
 
   update_metadata "${upstream_name}" "${candidate}" "${reviewed_tag}" "$(date -u +%F)"
   git add "${metadata}"

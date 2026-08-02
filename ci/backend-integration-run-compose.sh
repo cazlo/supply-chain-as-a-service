@@ -70,6 +70,11 @@ trap 'compose_runtime_on_signal TERM "integration command"' TERM
 }
 
 compose_runtime_snapshot "${results_dir}/runtime-before.txt"
+# A hard-killed predecessor (Pod restart, SIGKILL past the traps) cannot run
+# its own cleanup; re-enforce the image budget here so one crash does not
+# fail every later job on this runner. Warm images within budget are kept —
+# runtime-before.txt records what was found either way.
+compose_runtime_enforce_image_budget "${results_dir}/image-budget-before.log"
 compose_runtime_assert_clean "before startup"
 compose_runtime_compose config --format json >"${results_dir}/compose-config.json"
 compose_runtime_require_digest_images "${results_dir}/compose-config.json"

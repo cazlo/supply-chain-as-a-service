@@ -17,9 +17,9 @@ compose_runtime_bounded_compose() {
     "${COMPOSE_RUNTIME_COMPOSE_ARGS[@]}" "$@"
 }
 
-# Pruning tens of GiB of overlay layers can exceed the per-command cleanup
-# bound, so image removal gets its own, longer timeout.
-compose_runtime_bounded_prune() {
+# Removing tens of GiB of overlay layers can exceed the per-command cleanup
+# bound, so image eviction gets its own, longer timeout.
+compose_runtime_bounded_evict() {
   timeout -s TERM -k 5 \
     "${COMPOSE_RUNTIME_IMAGE_PRUNE_TIMEOUT_SECONDS:-120}" "$@"
 }
@@ -53,6 +53,10 @@ compose_runtime_init() {
     echo "COMPOSE_IMAGE_PRUNE_TIMEOUT_SECONDS must be a positive integer" >&2
     return 1
   }
+  [[ "${COMPOSE_RUNTIME_IMAGE_BUDGET_GB:-10}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "COMPOSE_IMAGE_BUDGET_GB must be a positive integer" >&2
+    return 1
+  }
 
   COMPOSE_RUNTIME_CHILD_PID=""
   COMPOSE_RUNTIME_WATCHDOG_PID=""
@@ -76,14 +80,30 @@ compose_runtime_init() {
   export DOCKER_CONFIG="${COMPOSE_RUNTIME_DOCKER_CONFIG}"
 }
 
+# Sum of every image's reported size. Shared layers are counted once per
+# image, so this overstates true graph usage — a conservative bias in the
+# safe direction for budget enforcement.
+compose_runtime_image_usage_bytes() {
+  local image_ids
+  image_ids="$(compose_runtime_bounded docker image ls -q | sort -u)" || return 1
+  if [[ -z "${image_ids}" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  compose_runtime_bounded docker image inspect --format '{{.Size}}' ${image_ids} |
+    awk '{ total += $1 } END { printf "%.0f\n", total + 0 }'
+}
+
 compose_runtime_collect_state() {
   local container_ids volume_names network_names image_ids
-  local containers volumes project_networks images
+  local containers volumes project_networks images image_bytes
 
   container_ids="$(compose_runtime_bounded docker ps -aq)" || return 1
   volume_names="$(compose_runtime_bounded docker volume ls -q)" || return 1
   network_names="$(compose_runtime_bounded docker network ls --format '{{.Name}}')" || return 1
   image_ids="$(compose_runtime_bounded docker image ls -aq)" || return 1
+  image_bytes="$(compose_runtime_image_usage_bytes)" || return 1
 
   containers="$(awk 'NF { count++ } END { print count + 0 }' <<<"${container_ids}")"
   volumes="$(awk 'NF { count++ } END { print count + 0 }' <<<"${volume_names}")"
@@ -96,6 +116,7 @@ compose_runtime_collect_state() {
   printf 'volumes=%s\n' "${volumes}"
   printf 'project_networks=%s\n' "${project_networks}"
   printf 'images=%s\n' "${images}"
+  printf 'image_bytes=%s\n' "${image_bytes}"
 }
 
 compose_runtime_snapshot() {
@@ -108,7 +129,8 @@ compose_runtime_snapshot() {
 
 compose_runtime_assert_clean() {
   local context="$1"
-  local state containers volumes project_networks images
+  local budget_bytes=$(( ${COMPOSE_RUNTIME_IMAGE_BUDGET_GB:-10} * 1024 * 1024 * 1024 ))
+  local state containers volumes project_networks image_bytes
 
   state="$(compose_runtime_collect_state)" || {
     echo "Unable to inspect the Podman engine ${context}" >&2
@@ -117,10 +139,11 @@ compose_runtime_assert_clean() {
   containers="$(awk -F= '$1 == "containers" { print $2 }' <<<"${state}")"
   volumes="$(awk -F= '$1 == "volumes" { print $2 }' <<<"${state}")"
   project_networks="$(awk -F= '$1 == "project_networks" { print $2 }' <<<"${state}")"
-  images="$(awk -F= '$1 == "images" { print $2 }' <<<"${state}")"
+  image_bytes="$(awk -F= '$1 == "image_bytes" { print $2 }' <<<"${state}")"
 
-  if [[ "${containers}" != 0 || "${volumes}" != 0 || "${project_networks}" != 0 || "${images}" != 0 ]]; then
-    echo "Compose engine is not clean ${context}: containers=${containers}, volumes=${volumes}, project_networks=${project_networks}, images=${images}" >&2
+  if [[ "${containers}" != 0 || "${volumes}" != 0 || "${project_networks}" != 0 ]] ||
+    (( image_bytes > budget_bytes )); then
+    echo "Compose engine is not clean ${context}: containers=${containers}, volumes=${volumes}, project_networks=${project_networks}, image_bytes=${image_bytes} (budget ${budget_bytes})" >&2
     return 1
   fi
 }
@@ -129,11 +152,53 @@ compose_runtime_assert_clean() {
 # capacity-one runner the per-PR digests accumulate until the podman-graph
 # EmptyDir breaches its limit and the kubelet evicts the Pod mid-job (the
 # Gitea job then hangs server-side, because job timeouts are runner-enforced).
-# Every job therefore starts from and returns to an empty image store; the
-# re-pull cost is repo-local Harbor traffic and is recorded in timings.env.
-compose_runtime_prune_images() {
+#
+# Growth, not caching, is the enemy: warm images are the point of a
+# long-lived runner (same-digest soak reruns, back-to-back matrix legs, and
+# the docker.io postgres pin, whose per-leg re-pull would burn through the
+# anonymous Docker Hub rate limit during soaks). So instead of pruning to
+# zero, evict unused images oldest-first until total usage fits
+# COMPOSE_RUNTIME_IMAGE_BUDGET_GB (default 10, well under the 24 GiB
+# podman-graph EmptyDir), never evicting the digest-pinned stable images in
+# COMPOSE_RUNTIME_PROTECTED_IMAGE_PATTERN. Cleanup asserts the budget, so
+# unexpected growth fails the job instead of the node.
+compose_runtime_enforce_image_budget() {
   local log_file="$1"
-  compose_runtime_bounded_prune docker image prune -af >"${log_file}" 2>&1
+  local budget_bytes=$(( ${COMPOSE_RUNTIME_IMAGE_BUDGET_GB:-10} * 1024 * 1024 * 1024 ))
+  local protected="${COMPOSE_RUNTIME_PROTECTED_IMAGE_PATTERN:-docker\.io/library/postgres[@:]|mcr\.microsoft\.com/playwright[@:]}"
+  local total image_ids inventory created image_id refs evicted
+
+  {
+    while :; do
+      total="$(compose_runtime_image_usage_bytes)" || return 1
+      printf 'image_bytes=%s budget_bytes=%s\n' "${total}" "${budget_bytes}"
+      (( total > budget_bytes )) || break
+
+      image_ids="$(compose_runtime_bounded docker image ls -q | sort -u)" || return 1
+      # shellcheck disable=SC2086
+      inventory="$(compose_runtime_bounded docker image inspect \
+        --format '{{.Created}}|{{.Id}}|{{join .RepoTags ","}},{{join .RepoDigests ","}}' \
+        ${image_ids} | sort)" || return 1
+
+      evicted=0
+      while IFS='|' read -r created image_id refs; do
+        [[ -n "${image_id}" ]] || continue
+        if grep -qE "${protected}" <<<"${refs}"; then
+          printf 'protect %s (%s) %s\n' "${image_id}" "${created}" "${refs}"
+          continue
+        fi
+        printf 'evict %s (%s) %s\n' "${image_id}" "${created}" "${refs}"
+        compose_runtime_bounded_evict docker rmi -f "${image_id}" || return 1
+        evicted=1
+        break
+      done <<<"${inventory}"
+
+      if (( !evicted )); then
+        echo "Image store exceeds budget but only protected images remain" >&2
+        return 1
+      fi
+    done
+  } >"${log_file}" 2>&1
 }
 
 compose_runtime_require_digest_images() {
@@ -226,9 +291,9 @@ compose_runtime_finalize() {
     echo "Bounded Compose teardown failed" >&2
     cleanup_failed=1
   fi
-  if ! compose_runtime_prune_images \
-    "${COMPOSE_RUNTIME_RESULTS_DIR}/image-prune.log"; then
-    echo "Bounded image prune failed" >&2
+  if ! compose_runtime_enforce_image_budget \
+    "${COMPOSE_RUNTIME_RESULTS_DIR}/image-budget.log"; then
+    echo "Bounded image-budget enforcement failed" >&2
     cleanup_failed=1
   fi
   down_finished="$(date +%s)"
